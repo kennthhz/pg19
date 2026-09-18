@@ -29,6 +29,7 @@ tests += {
   'tap': {
     'tests': [
       't/001_auto_explain.pl',
+      't/002_redact.pl',
     ],
   },
 }
