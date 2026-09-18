@@ -2566,6 +2566,14 @@ RecursionContext
 RecursiveUnion
 RecursiveUnionPath
 RecursiveUnionState
+RedactColEntry
+RedactColKey
+RedactCtx
+RedactKind
+RedactLocalEntry
+RedactLocalKey
+RedactOidEntry
+RedactOidKey
 RefetchForeignRow_function
 RefreshMatViewStmt
 RegProcedure

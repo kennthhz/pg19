@@ -30,6 +30,7 @@ SUBDIRS = \
 		  test_dsa \
 		  test_dsm_registry \
 		  test_escape \
+		  test_explain_redact \
 		  test_extensible \
 		  test_extensions \
 		  test_ginpostinglist \
