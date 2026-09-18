@@ -1,31 +1,121 @@
 
 # Copyright (c) 2021-2026, PostgreSQL Global Development Group
 
-# Leak-detection harness for auto_explain redaction, log side.
+# 002_redact.pl -- log-side leak detection for auto_explain output redaction.
 #
-# Task T01 of the auto-explain redaction plan.  No product code is exercised
-# here: auto_explain.log_redact does not exist yet.  This file is the positive
-# control for the paths that are only reachable through auto_explain's own log
-# record, and therefore cannot be covered by src/test/regress/explain_redact:
 #
-#   FR-22  parameter VALUES        -- the Query Parameters property
-#   FR-23  the query text itself   -- the Query Text property
-#   FR-17  the trigger section     -- needs ANALYZE *and* log_triggers, so a
-#                                     matrix of non-ANALYZE plans never
-#                                     reaches report_triggers() at all
-#   FR-26  the Settings section    -- needs log_settings
-#   FR-37  Query Identifier        -- needs VERBOSE and compute_query_id
-#   FR-29  extension output        -- pg_overexplain via log_extension_options
+# PURPOSE OF THIS FILE
 #
-# It also covers the fixtures that depend on optional build features (libxml,
-# ICU).  Those are skipped rather than failed when the feature is absent, which
-# is why they live in a TAP test: a regression file would need alternative
-# expected outputs for every combination.
+# This test establishes, and then guards, exactly which parts of auto_explain's
+# log output disclose an application's schema and data.
 #
-# Every assertion here is "the identifier IS present".  Once T04 lands, the
-# same fixtures run with auto_explain.log_redact = on and the assertions
-# invert.  Proving the detector fires first is the whole point: an assertion
-# that never had the chance to fail would pass for the rest of the project.
+# It works by running ordinary queries against a live cluster with auto_explain
+# enabled, capturing the log records they produce, and searching those records
+# for the fixture's deliberately marked object names and values.  Every name in
+# the fixture schema begins with "zsec_" and every stored value with
+# "zsecdata-", so a leak of any kind reduces to one question: did either marker
+# reach the log?
+#
+# It serves two purposes in sequence.  Today, before any redaction code exists,
+# it is an executable inventory of the leaks -- each assertion names a property
+# of the log output and the identifier that property discloses -- and it proves
+# the detector can actually find them.  Once the redaction GUC lands, the same
+# fixtures run with it enabled and the assertions invert, at which point this
+# file becomes the regression test that the leaks stay closed.
+#
+# Its scope is the log specifically.  Properties that a client-side EXPLAIN can
+# produce are tested in src/test/regress/sql/explain_redact.sql; what remains
+# here is output that only auto_explain emits, only emits under one of its GUCs,
+# or that depends on an optional build feature.  The division is spelled out
+# under WHY A TAP TEST below.
+#
+# Run it with:  make -C contrib/auto_explain check
+#
+#
+# WHAT THE FEATURE IS
+#
+# auto_explain writes query plans to the server log, and those plans contain the
+# application's schema and data verbatim: table and column names, function names,
+# literal values, bind parameter values, and the full text of the query.  Anything
+# that can read the log -- a log shipper, an observability vendor, a support
+# ticket -- therefore sees all of it.  Organisations that cannot allow that today
+# have no option but to switch auto_explain off entirely.
+#
+# The feature under construction adds a mode in which those names and values are
+# replaced by opaque pseudonyms ("t1", "f2", "?"), while everything needed for
+# performance diagnosis -- plan shape, costs, row counts, timings, buffer usage --
+# is preserved.  See design/auto-explain-redaction-requirements.md for the
+# contract and design/auto-explain-redaction-task-plan.md for the build order.
+#
+#
+# WHY THIS TEST ASSERTS THAT SECRETS *ARE* PRESENT
+#
+# This is the part that looks wrong at first glance, so it is worth stating
+# plainly: every assertion below checks that a sensitive identifier IS in the log.
+# That is deliberate, and it is the reason this file exists before the feature
+# does.
+#
+# Redaction is verified by absence, and absence is treacherous to test.  An
+# assertion that "the table name does not appear" passes when redaction works --
+# and equally when the test looks in the wrong place, greps for the wrong string,
+# or examines output that never contained the name to begin with.  A broken
+# detector reports success forever and nobody finds out until a customer reads a
+# log file.
+#
+# So the detector is built first and proved against unredacted output, where the
+# secrets are known to be present.  If it can find them now, it can be trusted to
+# report their absence later.  When the redaction GUC lands, these same fixtures
+# run with it enabled and the assertions inverted.
+#
+#
+# HOW LEAKS ARE DETECTED
+#
+# Every object in the fixture schema is named with the prefix "zsec_", and every
+# stored value with "zsecdata-".  Detection is then a single question -- does
+# either marker appear anywhere in the log? -- with no need to enumerate which
+# property a name might surface in.
+#
+# Both markers are needed.  An identifier-only pattern is structurally blind to
+# leaked *data*: a real value is not an identifier and matches nothing.  Marking
+# the values makes them self-identifying, which covers that class without needing
+# a classifier for arbitrary sensitive data.
+#
+# The prefix is four characters rather than a bare "z" because "timestamp with
+# time zone" contains "zone", which a /z[a-z_]+/ detector reports as a leak on
+# every timestamptz column.
+#
+#
+# WHY A TAP TEST AND NOT A REGRESSION FILE
+#
+# Most of the redaction contract is checked by src/test/regress/sql/
+# explain_redact.sql, which runs EXPLAIN and inspects the result rows.  This file
+# covers what that one structurally cannot: output that exists only in the server
+# log, or only under an auto_explain GUC.
+#
+#   FR-23  Query Text          the whole statement, emitted by auto_explain only;
+#                              no client EXPLAIN produces this property
+#   FR-22  Query Parameters    bind parameter VALUES -- the one leak class that is
+#                              data rather than schema
+#   FR-17  the trigger section reachable only with log_analyze AND log_triggers,
+#                              so a matrix of non-ANALYZE plans never executes
+#                              report_triggers() at all
+#   FR-26  the Settings block  needs log_settings; discloses search_path
+#   FR-37  Query Identifier    needs log_verbose and compute_query_id; its value
+#                              varies per build, so an expected-output file
+#                              cannot match it but a regex can
+#   FR-29  extension output    pg_overexplain via log_extension_options, which
+#                              dumps the entire range table including every
+#                              column name of every relation
+#
+# It also holds the fixtures that depend on optional build features, because TAP
+# can skip them on a capability probe.  A regression file would need alternative
+# expected-output files for every combination of libxml and ICU.
+#
+# Lastly, this file asserts that the diagnostic content SURVIVES redaction
+# (actual rows, loops, timings, buffers).  Those assertions must hold unchanged
+# at every stage of the project, before and after the feature exists: without
+# them, a redaction implementation that emitted an empty record would pass a
+# suite made entirely of absence checks.
 
 use strict;
 use warnings FATAL => 'all';
@@ -34,7 +124,16 @@ use PostgreSQL::Test::Cluster;
 use PostgreSQL::Test::Utils;
 use Test::More;
 
-# Runs the specified query and returns the emitted server log.
+# Runs one or more statements and returns only the log output they produced.
+#
+# The byte offset taken before the statement runs is what makes each assertion
+# independent: it yields exactly the log this call appended, not the whole file.
+#
+# $params is an optional hash of GUC name => value, passed to the backend through
+# PGOPTIONS.  Several of the properties tested here appear only under a specific
+# auto_explain setting, so the same statement is often run more than once with
+# different GUCs -- that is how the trigger section is shown to be absent without
+# log_triggers and present with it.
 sub query_log
 {
 	my ($node, $sql, $params) = @_;
@@ -51,17 +150,17 @@ sub query_log
 	return slurp_file($log, $offset);
 }
 
-# Returns the sorted, de-duplicated list of fixture identifiers found in $log.
-# Mirrors zsec_leaks() in src/test/regress/sql/explain_redact.sql, including
-# the marker prefix: "zsec_" is four characters because a bare "z" prefix
-# collides with "zone" in "timestamp with time zone".
-# Strips the Query Text property from a log chunk.
+# Removes the Query Text property from a log chunk.
 #
-# auto_explain emits Query Text in every record, so the statement's own text is
-# in the log before any plan property is considered.  Any assertion of the form
-# "this identifier appears in the log" is therefore satisfied by the query text
-# alone, whether or not the plan property under test was emitted at all.  Three
-# assertions in this file were written that way.
+# auto_explain emits Query Text in every record, so the statement's own text
+# reaches the log before any plan property is considered.  An assertion of the
+# form "this identifier appears somewhere in the log" is therefore satisfied by
+# the query text alone -- whether or not the plan property under test was emitted
+# at all.  Three assertions in this file were written that way and passed for
+# that reason.
+#
+# Callers testing a plan property should strip the query text first, or anchor
+# their regex on the specific property line.
 sub without_query_text
 {
 	my ($log) = @_;
@@ -69,23 +168,44 @@ sub without_query_text
 	return $log;
 }
 
+# Returns the sorted, de-duplicated marker strings found in $log -- that is, the
+# fixture identifiers and values that leaked.  An empty list means no leak.
+#
+# Returning the names rather than a count is what makes a failure diagnosable,
+# and it matters for a second reason: an assertion that merely counts leaks
+# passes as long as SOMETHING leaked, which in a schema where every fixture
+# touches zsec_customers.zsec_ssn is nearly always true.  Callers should check
+# for the specific identifier their fixture exists to produce.
+#
+# This mirrors zsec_leaks() in src/test/regress/sql/explain_redact.sql; the two
+# must stay in step, since a leak found by one should be reproducible by the
+# other.
+#
+# Matching is case-insensitive and results are lower-cased.  A marked name routed
+# through upper() arrives as ZSEC_CUSTOMERS, and a case-sensitive pattern would
+# read that as clean -- harmless while these assertions are positive, exactly
+# wrong once they invert.
 sub leaked
 {
 	my ($log) = @_;
 	my %seen;
-	# Two markers: zsec_ on identifiers, zsecdata- on stored values.  Values
-	# need their own alternative because a leaked value is not an identifier and
-	# would otherwise be invisible to this grep.
-	#
-	# Case-insensitive, mirroring the SQL detector: a marked name routed
-	# through upper() arrives as ZSEC_CUSTOMERS, which a case-sensitive
-	# pattern reads as clean.  Results are lower-cased so callers compare
-	# exactly.
+
 	$seen{ lc($1) } = 1
 	  while $log =~ /(zsec_[a-z0-9_]*|zsecdata-[a-z0-9-]*)/gi;
 	return sort keys %seen;
 }
 
+# A dedicated cluster, configured so that every statement produces a log record.
+#
+#   log_min_duration = 0   log every statement regardless of how fast it was;
+#                          the default of -1 disables auto_explain entirely
+#   compute_query_id = on  without it queryId stays 0 and the Query Identifier
+#                          property is never emitted, so FR-37 could not be tested
+#   pg_overexplain         an in-tree extension that registers EXPLAIN options and
+#                          prints the whole range table.  Loaded because FR-29 is
+#                          about exactly that: extension output that the redaction
+#                          contract has to suppress.  It is inert unless one of
+#                          its options is enabled.
 my $node = PostgreSQL::Test::Cluster->new('redact');
 $node->init;
 $node->append_conf('postgresql.conf',
@@ -189,7 +309,15 @@ SELECT coalesce(string_agg(kind || ':' || name, ', '), '') FROM (
 is($unmarked, '', 'every fixture object and stored value carries the marker');
 
 # ---------------------------------------------------------------------------
-# FR-23: Query Text carries the whole statement verbatim.
+# FR-23: the Query Text property.
+#
+# auto_explain prints the statement verbatim, so this single property discloses
+# every name and literal the query mentions -- schema, tables, columns, and any
+# inlined values -- regardless of what the plan itself reveals.  The redaction
+# contract omits it outright rather than trying to sanitise it.
+#
+# This property comes from auto_explain, not from core EXPLAIN, which is why it
+# cannot be tested from the regression file.
 # ---------------------------------------------------------------------------
 my $log = query_log($node,
 	"SET search_path = zsec_ns, public; SELECT * FROM zsec_customers;");
@@ -200,9 +328,17 @@ like(
 	'FR-23: query text is logged verbatim today');
 
 # ---------------------------------------------------------------------------
-# FR-22: Query Parameters carries parameter VALUES, which are user data rather
-# than schema.  Note the value below is not an identifier, so the "zsec_"
-# detector would not catch it -- parameter values need their own assertion.
+# FR-22: the Query Parameters property.
+#
+# This is the one place where what leaks is DATA rather than schema: the actual
+# values a client bound to a prepared statement.  A real deployment would have
+# social security numbers or card numbers here.
+#
+# It is also why the fixture data carries its own marker.  An identifier-shaped
+# detector cannot see a leaked value -- a value is not an identifier and matches
+# no naming pattern -- so the stored values are made self-identifying instead,
+# and the generic detector then finds them like any other leak.  The assertion
+# below checks both: the literal string, and that the detector sees it.
 # ---------------------------------------------------------------------------
 $log = query_log(
 	$node,
@@ -223,9 +359,17 @@ ok( scalar(grep { /^zsecdata-ssn-0007$/ } @param_leaks) > 0,
 	'FR-22: marked parameter VALUE is visible to the generic detector');
 
 # ---------------------------------------------------------------------------
-# FR-17: the trigger section.  Reachable only with log_analyze AND
-# log_triggers; this is the assertion that would silently never run if the
-# test matrix omitted ANALYZE.
+# FR-17: the trigger section.
+#
+# report_triggers() prints the trigger name, the constraint name, and the
+# relation the trigger is on.  Reaching it needs log_analyze AND log_triggers
+# together, which makes it the clearest example of a leak that a plausible test
+# matrix misses completely: with either GUC off the section is not emitted at
+# all, so a suite of non-ANALYZE plans would report full coverage while these
+# three names went entirely untested.
+#
+# The two names are also disclosed under DIFFERENT conditions, which is why there
+# are two triggers here and two verbosity settings below.
 # ---------------------------------------------------------------------------
 $log = query_log(
 	$node,
@@ -350,7 +494,16 @@ unlike(
 	'FR-36: auto_explain does not emit the Execution Time property at all');
 
 # ---------------------------------------------------------------------------
-# FR-26 / FR-37: the Settings section and Query Identifier.
+# FR-26 and FR-37: the Settings section, and Query Identifier.
+#
+# Settings lists every planner GUC whose value differs from the built-in default
+# -- including search_path, which names schemas directly.  Note the property NAME
+# is itself a GUC name here, the one place in EXPLAIN output where that is true.
+#
+# Query Identifier is a hash rather than a name, which sounds safe and is not:
+# the algorithm is deterministic and public, so anyone holding a guess at the
+# query text can confirm it offline.  That makes it a membership oracle, and the
+# contract omits it for that reason rather than pseudonymising it.
 # ---------------------------------------------------------------------------
 $log = query_log(
 	$node,
