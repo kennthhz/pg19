@@ -242,5 +242,11 @@ SELECT test_redact_destroy_roundtrip() AS destroy_is_safe;
 SELECT test_redact_oid_seq(ARRAY['relation', NULL], ARRAY[1, 2]::oid[]);
 SELECT test_redact_local_seq(ARRAY['alias', NULL], ARRAY[1, 1], ARRAY[0, 0]);
 
+--
+-- T03: the ExplainState fields that will carry redaction.  Nothing consumes
+-- them yet, so what is pinned here is the default: a state that has not opted
+-- in redacts nothing and holds no pseudonym map.
+--
+SELECT test_explain_state_redact_defaults() AS fresh_state;
 DROP SCHEMA zsec_t02 CASCADE;
 DROP EXTENSION test_explain_redact;

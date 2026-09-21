@@ -24,6 +24,7 @@
 
 #include "catalog/pg_type.h"
 #include "commands/explain_redact.h"
+#include "commands/explain_state.h"
 #include "fmgr.h"
 #include "utils/array.h"
 #include "utils/builtins.h"
@@ -370,6 +371,33 @@ test_redact_destroy_roundtrip(PG_FUNCTION_ARGS)
 	explain_redact_destroy(ctx);
 
 	PG_RETURN_BOOL(strcmp(before, "t1") == 0 && strcmp(after, "t2") == 0);
+}
+
+/*
+ * test_explain_state_redact_defaults() returns text
+ *
+ * A fresh ExplainState must have redaction off and no pseudonym map.
+ *
+ * The assertion is trivial to read and that is the point: the entire plan rests
+ * on redaction being opt-in, and both ways of breaking it are silent.  A default
+ * flipped to true would redact output nobody asked to have redacted, and a map
+ * allocated eagerly would put a per-record object on every EXPLAIN in the
+ * system, including the overwhelming majority that never redact anything.
+ * Neither shows up as a failure near the line that caused it.
+ *
+ * Reported as text rather than a boolean so that a failure says which of the two
+ * fields is wrong.
+ */
+PG_FUNCTION_INFO_V1(test_explain_state_redact_defaults);
+Datum
+test_explain_state_redact_defaults(PG_FUNCTION_ARGS)
+{
+	ExplainState *es = NewExplainState();
+
+	PG_RETURN_TEXT_P(cstring_to_text(psprintf("redact=%s redact_ctx=%s",
+											  es->redact ? "on" : "off",
+											  es->redact_ctx == NULL ?
+											  "null" : "allocated")));
 }
 
 /*

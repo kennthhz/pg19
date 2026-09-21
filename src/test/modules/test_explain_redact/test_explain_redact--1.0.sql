@@ -37,3 +37,7 @@ CREATE FUNCTION test_redact_destroy_roundtrip()
 RETURNS boolean
 AS 'MODULE_PATHNAME', 'test_redact_destroy_roundtrip'
 LANGUAGE C STRICT;
+CREATE FUNCTION test_explain_state_redact_defaults()
+RETURNS text
+AS 'MODULE_PATHNAME', 'test_explain_state_redact_defaults'
+LANGUAGE C STRICT;
