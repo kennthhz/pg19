@@ -503,7 +503,55 @@ removes).
 
 **Revert.** Independent and additive.
 
-#### T04a — Catalog-based leak scan over the whole regression suite
+#### T04a — Catalog-based leak scan over the whole regression suite — **DONE**
+
+**Result.** Landed as `contrib/auto_explain/t/003_redact_scan.pl`, gated behind
+`PG_TEST_EXTRA=redact_scan`. All 241 core regression tests pass with
+`auto_explain.log_redact = on`, `log_min_duration = 0` and `log_analyze = on`;
+the run produces 164,397 lines of redacted plan records, the catalog yields 3,914
+distinct user-defined names, and **none of them appears in any record**. Runtime
+is about 13 seconds, far cheaper than the plan assumed, because `--use-existing`
+avoids a second initdb and the suite's own parallel groups are left intact.
+
+**Deviations from the plan, all verified rather than assumed.**
+
+- `--use-existing` does **not** create the test database: pg_regress skips both
+  the drop and the create in that mode, so the test creates `regression` itself
+  along with the locale settings pg_regress would have applied.
+- `--max-concurrent-tests=1` is not a way to serialise the run. It caps how many
+  tests one schedule line may list, so pg_regress rejects the core schedule at its
+  first parallel group. No concurrency limit is passed.
+- `top_srcdir` is not exported to TAP tests; only `top_builddir` and
+  `PG_REGRESS` are.
+- The scan reads **only** auto_explain's plan records, not the log file. Three
+  other things put user names into the same file: `PostgreSQL::Test::Cluster`
+  defaults (`log_statement = all` and a `%q` prefix, both overridden here and the
+  override asserted), the error messages the suite provokes on purpose, and T05's
+  companion entries.
+
+**The allowlist stayed empty**, which was the point. One false positive appeared
+and was fixed without weakening the oracle: `Conflict Resolution` can print
+`SELECT FOR KEY SHARE`, and the suite contains an object named `key`. Adding
+`key` to the vocabulary would have blinded the scan to that name everywhere, so
+instead the handful of properties whose values are closed sets of code constants
+are skipped as whole lines. A line that can only contain code constants cannot
+contain a leak.
+
+The test reports how many catalog names it cannot distinguish from plan
+vocabulary — currently 8 of 3,922 (`original percent result sample sorted tid
+time usage`). That number is the honest measure of what a pass is worth, and a
+jump in it means the vocabulary is being grown to keep the test quiet.
+
+**Known limits, both recorded in the file.** The catalog is read after the suite
+finishes, so objects created and dropped during the run are not searched for —
+a coverage reduction rather than a blind spot, since what is under test is
+emission paths and a path that leaks a dropped table's name would leak a
+surviving one's. And a leak reachable only by a plan shape absent from every test
+suite remains unfalsifiable and accepted.
+
+---
+
+#### T04a — original plan
 
 Numbered `T04a` rather than inserted as `T05` to avoid renumbering 87 existing
 cross-references; its position in the sequence is exactly what the name says,
