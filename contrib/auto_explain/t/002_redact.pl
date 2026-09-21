@@ -168,6 +168,51 @@ sub without_query_text
 	return $log;
 }
 
+# Returns only the auto_explain plan records from a log chunk.
+#
+# Needed because this cluster -- like every cluster PostgreSQL::Test::Cluster
+# creates -- runs with "log_statement = all" and a log_line_prefix containing
+# "%q" (Cluster.pm:713-714).  Both put the verbatim statement into the same log
+# file, so a chunk always contains the marked names whatever auto_explain did
+# with them.  "No marker appears in this log" is therefore not a provable
+# assertion, and a claim about redaction has to be scoped to the record
+# redaction is responsible for.
+#
+# That the standard test harness is configured this way is not incidental: it is
+# the very hazard FR-75 warns operators about, reproduced by the framework's own
+# defaults.
+#
+# Relies on how a multi-line ereport is written: the first line carries the
+# log_line_prefix and the remainder are tab-indented continuations.  The first
+# line is kept because the duration prefix is asserted on.
+sub plan_record
+{
+	my ($log) = @_;
+	my @kept;
+	my $in_record = 0;
+
+	foreach my $line (split /\n/, $log)
+	{
+		if ($line =~ /duration: [\d.]+ ms  plan:/)
+		{
+			$in_record = 1;
+			push @kept, $line;
+			next;
+		}
+		if ($in_record)
+		{
+			if ($line =~ /^\t/)
+			{
+				push @kept, $line;
+				next;
+			}
+			$in_record = 0;
+		}
+	}
+
+	return join("\n", @kept) . "\n";
+}
+
 # Returns the sorted, de-duplicated marker strings found in $log -- that is, the
 # fixture identifiers and values that leaked.  An empty list means no leak.
 #
@@ -619,5 +664,169 @@ my @false_positives = leaked($log);
 is(scalar(@false_positives), 0,
 	'detector reports nothing for a query with no fixture objects, including "time zone"'
 );
+
+# ---------------------------------------------------------------------------
+# PHASE 2 (T04): the same channels with redaction enabled.
+#
+# Everything above ran with auto_explain.log_redact off and asserted that the
+# markers ARE present, which is what proves the detector works.  From here the
+# same detector runs against redacted records and the assertions invert: the
+# markers must be absent.
+#
+# The switch is written to postgresql.conf and applied with a reload rather than
+# passed through PGOPTIONS, because the GUC is PGC_SIGHUP (D9) and a per-session
+# assignment is refused by design -- a superuser session must not be able to turn
+# redaction off for itself.  So this also tests that the GUC has the intended
+# level: were it PGC_SUSET, the reload would be unnecessary and PGOPTIONS would
+# have worked.
+# ---------------------------------------------------------------------------
+$node->append_conf('postgresql.conf', "auto_explain.log_redact = on");
+$node->reload;
+
+# Prove the reload took effect before asserting anything about absence.  Without
+# this, every check below would also pass if the setting had been ignored.
+is( $node->safe_psql('postgres', 'SHOW auto_explain.log_redact'),
+	'on',
+	'T04: auto_explain.log_redact is settable by reload, as PGC_SIGHUP requires'
+);
+
+# FR-23: the query text goes entirely.
+$log = query_log($node,
+	"SET search_path = zsec_ns, public; SELECT * FROM zsec_customers;");
+unlike(
+	$log,
+	qr/Query Text:/,
+	'FR-23 redacted: the Query Text property is omitted, not sanitised');
+is_deeply([ leaked(plan_record($log)) ],
+	[], 'FR-23 redacted: no marker survives anywhere in the record');
+
+# FR-22: parameters go, values and count alike.
+$log = query_log(
+	$node,
+	q{SET search_path = zsec_ns, public;
+	  PREPARE zsec_p2(text) AS SELECT * FROM zsec_customers WHERE zsec_ssn = $1;
+	  EXECUTE zsec_p2('zsecdata-ssn-0007');});
+unlike(
+	$log,
+	qr/Query Parameters/,
+	'FR-22 redacted: the property is omitted outright (D10), not reduced to names'
+);
+is_deeply([ leaked(plan_record($log)) ],
+	[],
+	'FR-22 redacted: the bound parameter value does not reach the record');
+
+# FR-17: the trigger section keeps its counters and loses its three names.
+$log = query_log(
+	$node,
+	"SET search_path = zsec_ns, public; INSERT INTO zsec_customers (zsec_ssn) VALUES ('zsecdata-t04');",
+	{
+		'auto_explain.log_analyze' => 'on',
+		'auto_explain.log_triggers' => 'on'
+	});
+is_deeply(
+	[ leaked(plan_record($log)) ],
+	[],
+	'FR-17 redacted: trigger, constraint and relation names are all withheld'
+);
+like(
+	$log,
+	qr{Trigger: (?:time=[\d.]+ )?calls=\d+},
+	'FR-17 redacted: the firing count still prints -- redaction is not deletion'
+);
+
+# FR-37: queryId goes.  compute_query_id is on for this cluster, so the property
+# would otherwise be emitted whenever log_verbose is.
+$log = query_log(
+	$node,
+	"SET search_path = zsec_ns, public; SELECT zsec_bal FROM zsec_customers;",
+	{ 'auto_explain.log_verbose' => 'on' });
+unlike(
+	$log,
+	qr/Query Identifier/,
+	'FR-37 redacted: queryId is omitted, being a membership oracle (D5)');
+
+# FR-26: the Settings section goes.  search_path carries GUC_EXPLAIN, so this
+# section really does disclose schema names.
+$log = query_log(
+	$node,
+	"SET search_path = zsec_ns, public; SELECT zsec_bal FROM zsec_customers;",
+	{ 'auto_explain.log_settings' => 'on' });
+unlike($log, qr/Settings:/,
+	'FR-26 redacted: the Settings section is omitted');
+is_deeply([ leaked(plan_record($log)) ],
+	[],
+	'FR-26 redacted: search_path does not reach the record by this route');
+
+# FR-29/FR-73: auto_explain ignores extension options rather than failing the
+# statement, and says so once per session.  The interactive path raises an error
+# instead; that asymmetry is deliberate and is tested in the regression file.
+$log = query_log(
+	$node,
+	"SET search_path = zsec_ns, public; SELECT zsec_bal FROM zsec_customers;",
+	{ 'auto_explain.log_extension_options' => 'range_table' });
+unlike(
+	$log,
+	qr/RTI \d+|Eref:/,
+	'FR-73 redacted: pg_overexplain range table is not emitted');
+like(
+	$log,
+	qr/log_redact is enabled, but auto_explain\.log_extension_options is also active/,
+	'FR-73 redacted: skipping the extension output is reported, not silent');
+
+# FR-2: a nested statement is redacted too.  The function body runs below the
+# top-level statement, and log_nested_statements is what makes it logged at all.
+$log = query_log(
+	$node,
+	"SET search_path = zsec_ns, public; DO \$\$ BEGIN PERFORM count(*) FROM zsec_customers WHERE zsec_ssn > 'a'; END \$\$;",
+	{ 'auto_explain.log_nested_statements' => 'on' });
+like(
+	$log,
+	qr/duration: [\d.]+ ms  plan:/,
+	'FR-2 redacted: the nested statement really was logged');
+is_deeply([ leaked(plan_record($log)) ],
+	[], 'FR-2 redacted: nested statements carry no marker either');
+
+# Negative controls.  Without these the phase above passes by deleting the
+# record wholesale, which would satisfy every "absent" assertion at once.
+$log = query_log(
+	$node,
+	"SET search_path = zsec_ns, public; SELECT count(*) FROM zsec_customers WHERE zsec_bal > 0;",
+	{
+		'auto_explain.log_analyze' => 'on',
+		'auto_explain.log_buffers' => 'on'
+	});
+like(
+	$log,
+	qr/duration: [\d.]+ ms/,
+	'negative control: the duration prefix still prints under redaction');
+# log_timing defaults to on, which makes the text "actual time=A..B rows=N"
+# with no "actual rows=" substring anywhere -- the same trap the FR-32
+# assertions above document.
+like(
+	$log,
+	qr/actual (?:time=[\d.]+\.\.[\d.]+ )?rows=[\d.]+ loops=\d+/,
+	'negative control: actual row counts still print under redaction');
+like(
+	$log,
+	qr/Buffers: shared/,
+	'negative control: buffer usage still prints under redaction');
+like($log, qr/Aggregate/,
+	'negative control: node types still print under redaction');
+like(
+	$log,
+	qr/cost=[\d.]+\.\.[\d.]+ rows=\d+ width=\d+/,
+	'negative control: planner estimates still print under redaction');
+
+# FR-75: the envelope warning.  Redaction governs this record only; a setting
+# that logs the statement in full into the same file gives it all back, and the
+# operator is told once per session.
+$log = query_log(
+	$node,
+	"SET search_path = zsec_ns, public; SELECT zsec_bal FROM zsec_customers;",
+	{ 'log_min_duration_statement' => '0' });
+like(
+	$log,
+	qr/log_redact is enabled, but log_min_duration_statement is also active/,
+	'FR-75: a logging setting that bypasses redaction is reported');
 
 done_testing();

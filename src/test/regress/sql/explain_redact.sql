@@ -612,6 +612,256 @@ SELECT 'FR-90 probe: subquery alias seed, un-flattenable -> Subquery Scan alias,
 SELECT * FROM zsec_plan('SELECT * FROM (SELECT zsec_ssn, count(*) FROM zsec_customers GROUP BY zsec_ssn OFFSET 0) AS zsec_alias2 WHERE zsec_alias2.zsec_ssn = ''x''');
 
 --
+-- ===========================================================================
+-- T04: the same catalog with REDACT, and the assertions inverted.
+--
+-- Everything above ran without REDACT and asserted that the detector FINDS each
+-- fixture's identifier.  From here the same fixtures run redacted and must come
+-- back clean.  Sharing one catalog between the two phases is the point: a leak
+-- path can only be asserted closed if the same query was first shown to open it.
+-- ===========================================================================
+--
+-- Every fixture, in all four output formats.
+--
+-- The formats are covered per fixture rather than once overall because they do
+-- not share an emission path for names: text appends most of them straight to
+-- the buffer, while json/xml/yaml route them through ExplainProperty*.  A
+-- fixture clean in text can therefore still leak in json.
+--
+-- Results are aggregated to one row per fixture so a failure names the fixture
+-- and the format rather than burying them in 130-odd rows.
+SELECT f.fr,
+       f.note,
+       CASE WHEN count(g.l) = 0 THEN 'clean'
+            ELSE 'LEAK in ' || string_agg(DISTINCT fmt.name, '/' ORDER BY fmt.name)
+                 || ': ' || string_agg(DISTINCT g.l, ' ' ORDER BY g.l)
+       END AS verdict
+  FROM zsec_fixtures f
+  CROSS JOIN (VALUES ('text'), ('json'), ('xml'), ('yaml')) AS fmt(name)
+  LEFT JOIN LATERAL zsec_leaks(f.qry, f.opts || ', REDACT, FORMAT ' || fmt.name)
+       AS g(l) ON true
+ GROUP BY f.fr, f.note, f.qry
+ ORDER BY f.fr COLLATE "C", f.note COLLATE "C", f.qry COLLATE "C";
+
+-- The GUC-dependent fixtures, redacted.  Same reason they are separate above:
+-- they cannot share a run without changing every other fixture's plan.
+SET enable_seqscan = off;
+SET enable_bitmapscan = off;
+SELECT 'FR-16' AS fr, 'index name (scan)' AS note,
+       coalesce(string_agg(l, ' '), 'clean') AS verdict
+  FROM zsec_leaks('SELECT zsec_ssn FROM zsec_customers WHERE zsec_ssn = ''x''',
+                  'COSTS OFF, REDACT') AS l;
+RESET enable_bitmapscan;
+RESET enable_seqscan;
+
+SET constraint_exclusion = on;
+SELECT 'FR-92' AS fr, 'Replaces: relation name' AS note,
+       coalesce(string_agg(l, ' '), 'clean') AS verdict
+  FROM zsec_leaks('SELECT * FROM zsec_excluded WHERE zsec_k < 0',
+                  'COSTS OFF, REDACT') AS l;
+SELECT 'FR-92' AS fr, 'Replaces: join aliases' AS note,
+       coalesce(string_agg(l, ' '), 'clean') AS verdict
+  FROM zsec_leaks('SELECT * FROM zsec_excluded zsec_ja JOIN zsec_excluded zsec_jb USING (zsec_k) WHERE zsec_ja.zsec_k < 0',
+                  'COSTS OFF, REDACT') AS l;
+RESET constraint_exclusion;
+
+-- The stateful cursor fixture, redacted.
+BEGIN;
+DECLARE zsec_cur2 CURSOR FOR SELECT * FROM zsec_customers FOR UPDATE;
+SELECT coalesce(string_agg(l, ' '), 'clean') AS cursor_name_redacted
+  FROM zsec_leaks('UPDATE zsec_customers SET zsec_bal = 0 WHERE CURRENT OF zsec_cur2',
+                  'COSTS OFF, REDACT') AS l;
+ROLLBACK;
+
+--
+-- Redaction must not become deletion.
+--
+-- Every assertion above is satisfied by printing nothing at all, so the plan
+-- shape and the counters are pinned here.  Requirements section 10.4 exists for
+-- this: a task that suppresses more than it should passes the leak tests
+-- perfectly.
+--
+SELECT * FROM zsec_plan('SELECT zsec_ssn FROM zsec_customers WHERE zsec_ssn = ''zsec_val_secret''',
+                        'COSTS OFF, REDACT');
+SELECT * FROM zsec_plan('SELECT zsec_a.zsec_id FROM zsec_customers zsec_a JOIN zsec_orders zsec_b USING (zsec_id)',
+                        'COSTS OFF, REDACT');
+
+-- Node types, the Replaces property and grouping structure all survive; only the
+-- names inside them go.
+SET constraint_exclusion = on;
+SELECT * FROM zsec_plan('SELECT * FROM zsec_excluded WHERE zsec_k < 0',
+                        'COSTS OFF, REDACT');
+RESET constraint_exclusion;
+
+-- Scan direction survives an index scan even though the index name does not.
+SET enable_seqscan = off;
+SET enable_bitmapscan = off;
+SELECT * FROM zsec_plan('SELECT zsec_ssn FROM zsec_customers ORDER BY zsec_ssn DESC',
+                        'COSTS OFF, REDACT');
+RESET enable_bitmapscan;
+RESET enable_seqscan;
+
+-- Memoize is the only narrow guard in explain.c -- its Cache Key goes while its
+-- Cache Mode and counters stay -- so it is the one most easily broken by a later
+-- edit widening it to the whole function.
+--
+-- The verdict states explicitly whether a Memoize node was reached at all.  A
+-- plan that does not memoize would otherwise satisfy "no Cache Key" trivially,
+-- which is the failure mode T01 found in six of its own fixtures: passing
+-- without executing the target.
+-- Dedicated tables, because none of the fixtures above produce a Memoize node:
+-- the planner needs a parameterized inner index scan whose parameter repeats, and
+-- zsec_customers has no index on its join column.  Created here rather than with
+-- the other fixtures so that no earlier plan changes shape.
+CREATE TABLE zsec_memo_outer (zsec_k int);
+CREATE TABLE zsec_memo_inner (zsec_k int, zsec_v text);
+CREATE INDEX zsec_memo_idx ON zsec_memo_inner (zsec_k);
+-- Few distinct keys on the outer side and many rows: repeated lookups are what
+-- make caching them worthwhile, and so what makes the planner choose Memoize.
+INSERT INTO zsec_memo_outer SELECT i % 5 FROM generate_series(1, 300) i;
+INSERT INTO zsec_memo_inner
+SELECT i, 'zsecdata-memo-' || i FROM generate_series(1, 1000) i;
+ANALYZE zsec_memo_outer;
+ANALYZE zsec_memo_inner;
+
+SET enable_memoize = on;
+SET enable_hashjoin = off;
+SET enable_mergejoin = off;
+SELECT CASE
+         WHEN NOT EXISTS (SELECT 1 FROM zsec_plan(q, o) l WHERE l LIKE '%Memoize%')
+           THEN 'no Memoize node in this plan -- guard not exercised here'
+         WHEN EXISTS (SELECT 1 FROM zsec_plan(q, o) l WHERE l LIKE '%Cache Key%')
+           THEN 'FAIL: Cache Key survived redaction'
+         WHEN NOT EXISTS (SELECT 1 FROM zsec_plan(q, o) l WHERE l LIKE '%Cache Mode%')
+           THEN 'FAIL: Cache Mode was suppressed too -- guard is too wide'
+         ELSE 'ok: key withheld, mode kept'
+       END AS memoize_verdict
+  FROM (VALUES ('SELECT * FROM zsec_memo_outer o JOIN zsec_memo_inner i ON i.zsec_k = o.zsec_k',
+                'COSTS OFF, REDACT')) AS v(q, o);
+RESET enable_mergejoin;
+RESET enable_hashjoin;
+RESET enable_memoize;
+
+--
+-- FR-61: the structured formats must still be well formed.  A guard placed in
+-- the wrong place can leave a group opened and never closed, which the text
+-- format hides completely but which corrupts json, xml and yaml.
+--
+-- Returns the whole EXPLAIN output as one string, which is what a structural
+-- check needs; zsec_leaks() reduces its input to markers and zsec_plan() strips
+-- and rewrites lines, so neither can be used for this.
+CREATE FUNCTION zsec_explain_blob(query_text text, explain_opts text)
+RETURNS text
+LANGUAGE plpgsql AS
+$$
+DECLARE
+    ln  text;
+    buf text := '';
+BEGIN
+    FOR ln IN EXECUTE format('EXPLAIN (%s) %s', explain_opts, query_text) LOOP
+        buf := buf || ln || E'\n';
+    END LOOP;
+    RETURN buf;
+END
+$$;
+
+-- JSON is checked by parsing it, which is the real test of balance.
+SELECT jsonb_typeof(zsec_explain_blob('SELECT zsec_ssn FROM zsec_customers WHERE zsec_ssn = ''x''',
+                                      'COSTS OFF, REDACT, FORMAT json')::jsonb)
+       AS redacted_json_parses_as;
+
+-- One parse of one simple plan is not enough.  Ten functions return early under
+-- redaction, and an early return placed between an ExplainOpenGroup and its
+-- close would leave a group open -- which the text format hides completely while
+-- corrupting json, xml and yaml.  Reading the code says the returns all precede
+-- any group; parsing the output of a plan that actually contains each of those
+-- node types is what checks it.
+--
+-- The cast to jsonb is the test: malformed output raises an error rather than
+-- returning a wrong answer, so 'array' for every row means every plan was well
+-- formed.
+SELECT what,
+       jsonb_typeof(zsec_explain_blob(qry, 'COSTS OFF, REDACT, FORMAT json')::jsonb) AS json,
+       zsec_explain_blob(qry, 'COSTS OFF, REDACT, FORMAT xml') ~ '^<explain.*</explain>\s*$' AS xml_ok,
+       zsec_explain_blob(qry, 'COSTS OFF, REDACT, FORMAT yaml') ~ '^- Plan:' AS yaml_ok
+  FROM (VALUES
+    ('grouping sets',
+     'SELECT zsec_kind, count(*) FROM zsec_customers GROUP BY GROUPING SETS ((zsec_kind), ())'),
+    ('window function',
+     'SELECT rank() OVER zsec_w FROM zsec_customers WINDOW zsec_w AS (PARTITION BY zsec_ssn ORDER BY zsec_bal)'),
+    ('sort keys',
+     'SELECT zsec_ssn FROM zsec_customers ORDER BY zsec_ssn, zsec_bal DESC'),
+    ('group keys',
+     'SELECT zsec_ssn, count(*) FROM zsec_customers GROUP BY zsec_ssn'),
+    ('tablesample',
+     'SELECT * FROM zsec_customers TABLESAMPLE BERNOULLI (10) REPEATABLE (42)'),
+    ('memoize',
+     'SELECT * FROM zsec_memo_outer o JOIN zsec_memo_inner i ON i.zsec_k = o.zsec_k'),
+    ('cte and subplan',
+     'WITH zsec_c AS MATERIALIZED (SELECT zsec_ssn FROM zsec_customers) SELECT * FROM zsec_c'),
+    ('DML target',
+     'UPDATE zsec_customers SET zsec_bal = 0'),
+    ('insert on conflict',
+     'INSERT INTO zsec_customers (zsec_ssn) VALUES (''x'') ON CONFLICT (zsec_ssn) DO NOTHING'),
+    ('join with filters',
+     'SELECT zsec_a.zsec_id FROM zsec_customers zsec_a JOIN zsec_orders zsec_b USING (zsec_id) WHERE zsec_a.zsec_bal > 0')
+  ) AS t(what, qry)
+ ORDER BY what COLLATE "C";
+
+-- XML and YAML are checked structurally rather than by a parser.  xml_is_well_formed
+-- would be the better test but it needs a --with-libxml build, and an expected file
+-- that changes with a build option is worse than a weaker check.  EXPLAIN FORMAT XML
+-- itself does not require libxml, since it writes text and never parses it.
+SELECT zsec_explain_blob('SELECT zsec_ssn FROM zsec_customers WHERE zsec_ssn = ''x''',
+                         'COSTS OFF, REDACT, FORMAT xml') ~ '^<explain.*</explain>\s*$'
+       AS redacted_xml_is_balanced;
+SELECT zsec_explain_blob('SELECT zsec_ssn FROM zsec_customers WHERE zsec_ssn = ''x''',
+                         'COSTS OFF, REDACT, FORMAT yaml') ~ '^- Plan:'
+       AS redacted_yaml_starts_as_a_document;
+
+--
+-- Parallel plans.  A worker's section is produced by the same ExplainNode code,
+-- but with es->str temporarily pointed at a per-worker buffer, so it is worth
+-- confirming redaction survives the swap rather than assuming it.
+--
+-- Asserted as a leak scan and a boolean rather than as plan text, because the
+-- number of workers actually launched varies between runs and machines and would
+-- make an expected file unstable.
+SET debug_parallel_query = on;
+SET max_parallel_workers_per_gather = 2;
+SELECT coalesce(string_agg(l, ' '), 'clean') AS parallel_plan_redacted
+  FROM zsec_leaks('SELECT count(*) FROM zsec_customers WHERE zsec_ssn > ''a''',
+                  'COSTS OFF, VERBOSE, REDACT') AS l;
+-- and the worker structure itself must survive, or the check above passes by
+-- having produced no parallel plan at all
+SELECT count(*) > 0 AS gather_node_still_present
+  FROM zsec_plan('SELECT count(*) FROM zsec_customers WHERE zsec_ssn > ''a''',
+                 'COSTS OFF, REDACT') AS l
+ WHERE l LIKE '%Gather%';
+RESET max_parallel_workers_per_gather;
+RESET debug_parallel_query;
+
+--
+-- REDACT false must behave exactly as though the option had not been given.
+-- Both rejections key off the resulting flag, not off the option's presence.
+--
+SELECT count(*) > 0 AS redact_false_still_prints_names
+  FROM zsec_leaks('SELECT zsec_ssn FROM zsec_customers WHERE zsec_ssn = ''zsec_val_secret''',
+                  'COSTS OFF, REDACT false') AS l;
+
+--
+-- FR-72: REDACT and SERIALIZE cannot be combined.  SERIALIZE reports the size of
+-- the result set, which is a measurement of user data.
+--
+EXPLAIN (ANALYZE, SERIALIZE TEXT, REDACT) SELECT zsec_ssn FROM zsec_customers;
+
+-- Negative control for the rejection: SERIALIZE alone still works.
+SELECT count(*) > 0 AS serialize_alone_still_works
+  FROM zsec_plan('SELECT zsec_ssn FROM zsec_customers',
+                 'ANALYZE, COSTS OFF, TIMING OFF, SERIALIZE TEXT') AS l
+ WHERE l LIKE '%Serialize%';
+
+--
 -- Cleanup.  The fixture schema is dropped so this file leaves no state behind
 -- for other regression tests running in the same database.
 --

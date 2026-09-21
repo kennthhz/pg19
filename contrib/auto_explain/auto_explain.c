@@ -24,6 +24,7 @@
 #include "nodes/makefuncs.h"
 #include "nodes/value.h"
 #include "parser/scansup.h"
+#include "tcop/tcopprot.h"
 #include "utils/guc.h"
 #include "utils/varlena.h"
 
@@ -43,6 +44,7 @@ static bool auto_explain_log_wal = false;
 static bool auto_explain_log_triggers = false;
 static bool auto_explain_log_timing = true;
 static bool auto_explain_log_settings = false;
+static bool auto_explain_log_redact = false;
 static int	auto_explain_log_format = EXPLAIN_FORMAT_TEXT;
 static int	auto_explain_log_level = LOG;
 static bool auto_explain_log_nested_statements = false;
@@ -122,6 +124,8 @@ static void explain_ExecutorEnd(QueryDesc *queryDesc);
 static bool check_log_extension_options(char **newval, void **extra,
 										GucSource source);
 static void assign_log_extension_options(const char *newval, void *extra);
+static void warn_redaction_conflict(const char *setting, const char *why);
+static void check_logging_envelope(void);
 static void apply_extension_options(ExplainState *es,
 									auto_explain_extension_options *ext);
 static char *auto_explain_scan_literal(char **endp, char **nextp);
@@ -177,6 +181,28 @@ _PG_init(void)
 							 &auto_explain_log_settings,
 							 false,
 							 PGC_SUSET,
+							 0,
+							 NULL,
+							 NULL,
+							 NULL);
+
+	/*
+	 * PGC_SIGHUP rather than the PGC_SUSET used by every other auto_explain
+	 * GUC (D9).  This one is a data-protection control, not a logging
+	 * preference: at SUSET any superuser session could turn redaction off for
+	 * itself with a SET, which defeats the purpose of having switched it on.
+	 * Requiring a configuration change and a reload puts the decision where
+	 * the policy lives.
+	 */
+	DefineCustomBoolVariable("auto_explain.log_redact",
+							 "Withhold user data from logged plans.",
+							 "Object names, expressions, literal values, the "
+							 "query text and parameter values are omitted. "
+							 "Plan shape, costs, row counts and timings are "
+							 "kept.",
+							 &auto_explain_log_redact,
+							 false,
+							 PGC_SIGHUP,
 							 0,
 							 NULL,
 							 NULL,
@@ -415,6 +441,65 @@ explain_ExecutorFinish(QueryDesc *queryDesc)
 }
 
 /*
+ * Warn, once per session per topic, that something defeats redaction.
+ *
+ * Once per session rather than once per record because these are configuration
+ * facts, not properties of the statement: a per-record notice would multiply
+ * the log volume of the very log the operator is trying to keep clean, and
+ * would say nothing new each time.
+ */
+static void
+warn_redaction_conflict(const char *setting, const char *why)
+{
+	ereport(LOG,
+			(errmsg("auto_explain.log_redact is enabled, but %s is also active",
+					setting),
+			 errdetail("%s", why),
+			 errhidestmt(true)));
+}
+
+/*
+ * FR-75: report logging settings that place the unredacted statement in the
+ * same log stream as the redacted plan.
+ *
+ * Each topic is latched separately, so enabling a second one later in the
+ * session still reports it.
+ */
+static void
+check_logging_envelope(void)
+{
+	static bool warned_log_statement = false;
+	static bool warned_log_min_duration = false;
+	static bool warned_log_line_prefix = false;
+
+	if (log_statement != LOGSTMT_NONE && !warned_log_statement)
+	{
+		warned_log_statement = true;
+		warn_redaction_conflict("log_statement",
+								"Statements are logged in full, including the text redacted from the plan.");
+	}
+
+	if (log_min_duration_statement >= 0 && !warned_log_min_duration)
+	{
+		warned_log_min_duration = true;
+		warn_redaction_conflict("log_min_duration_statement",
+								"Statements exceeding the threshold are logged in full, including the text redacted from the plan.");
+	}
+
+	/*
+	 * %q is the marker for the process-title portion of log_line_prefix,
+	 * which carries the current statement.
+	 */
+	if (Log_line_prefix != NULL && strstr(Log_line_prefix, "%q") != NULL &&
+		!warned_log_line_prefix)
+	{
+		warned_log_line_prefix = true;
+		warn_redaction_conflict("a log_line_prefix containing %q",
+								"The prefix carries the current statement, including the text redacted from the plan.");
+	}
+}
+
+/*
  * ExecutorEnd hook: log results if needed
  */
 static void
@@ -437,6 +522,7 @@ explain_ExecutorEnd(QueryDesc *queryDesc)
 		{
 			ExplainState *es = NewExplainState();
 
+			es->redact = auto_explain_log_redact;
 			es->analyze = (queryDesc->instrument_options && auto_explain_log_analyze);
 			es->verbose = auto_explain_log_verbose;
 			es->buffers = (es->analyze && auto_explain_log_buffers);
@@ -449,7 +535,23 @@ explain_ExecutorEnd(QueryDesc *queryDesc)
 			es->format = auto_explain_log_format;
 			es->settings = auto_explain_log_settings;
 
-			apply_extension_options(es, extension_options);
+			/*
+			 * FR-73.  Extension options are ignored rather than refused here,
+			 * unlike the interactive path which raises an error: a GUC
+			 * combination set by an administrator should not start failing
+			 * every query's logging.  But it is not ignored silently, because
+			 * output the operator configured would then simply stop
+			 * appearing.
+			 */
+			if (es->redact)
+			{
+				if (extension_options != NULL &&
+					extension_options->noptions > 0)
+					warn_redaction_conflict("auto_explain.log_extension_options",
+											"The requested extension output is omitted, because output produced by an extension cannot be redacted.");
+			}
+			else
+				apply_extension_options(es, extension_options);
 
 			ExplainBeginOutput(es);
 			ExplainQueryText(es, queryDesc);
@@ -459,7 +561,8 @@ explain_ExecutorEnd(QueryDesc *queryDesc)
 				ExplainPrintTriggers(es, queryDesc);
 			if (es->costs)
 				ExplainPrintJITSummary(es, queryDesc);
-			if (explain_per_plan_hook)
+			/* Plugins can bypass every redaction guard (FR-25/D4) */
+			if (explain_per_plan_hook && !es->redact)
 				(*explain_per_plan_hook) (queryDesc->plannedstmt,
 										  NULL, es,
 										  queryDesc->sourceText,
@@ -477,6 +580,21 @@ explain_ExecutorEnd(QueryDesc *queryDesc)
 				es->str->data[0] = '{';
 				es->str->data[es->str->len - 1] = '}';
 			}
+
+			/*
+			 * FR-75.  Redaction only governs this record.  Three other
+			 * settings put the unredacted statement into the very same log,
+			 * where anything correlating by timestamp recovers what was
+			 * withheld here -- so the operator is told once per session
+			 * rather than left with a false sense of what the log contains.
+			 *
+			 * This cannot be enforced instead of warned about: refusing to
+			 * log would be a worse outcome than logging with a caveat, and
+			 * silently switching the other settings off is not auto_explain's
+			 * decision to make.
+			 */
+			if (es->redact)
+				check_logging_envelope();
 
 			/*
 			 * Note: we rely on the existing logging of context or
