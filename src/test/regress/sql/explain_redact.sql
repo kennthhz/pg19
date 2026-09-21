@@ -132,10 +132,23 @@ BEGIN
     -- clean.  Harmless while the assertions are positive, exactly wrong once
     -- they invert from T04 onward.  Results are lower-cased so the expected
     -- identifier comparison stays exact.
+    -- COLLATE "C" so the identifier order does not depend on the host locale.
+    -- It matters even though the markers are pure ASCII: "zsec_ssn" and
+    -- "zsecdata-ssn" first differ at "_" against "d", and a linguistic
+    -- collation ignores punctuation at the primary level where C does not, so
+    -- the two orderings disagree.
+    --
+    -- The sort is in an outer query rather than on the DISTINCT itself because
+    -- ORDER BY on a SELECT DISTINCT has to name a select-list expression, and
+    -- "ORDER BY 1 COLLATE \"C\"" does not mean the first column -- it parses as
+    -- a collation applied to the integer 1, which fails at run time.
     RETURN QUERY
-        SELECT DISTINCT lower(m[1])
-          FROM regexp_matches(buf, '(zsec_[a-z0-9_]*|zsecdata-[a-z0-9-]*)', 'gi') m
-         ORDER BY 1;
+        SELECT ident
+          FROM (SELECT DISTINCT lower(m[1]) AS ident
+                  FROM regexp_matches(buf,
+                                      '(zsec_[a-z0-9_]*|zsecdata-[a-z0-9-]*)',
+                                      'gi') m) d
+         ORDER BY ident COLLATE "C";
 END
 $$;
 
@@ -344,7 +357,12 @@ SELECT kind, name FROM (
      WHERE n.nspname = 'zsec_ns'
 ) obj
  WHERE name !~ '^_?zsec_'
- ORDER BY kind, name;
+ -- COLLATE "C" on every text sort in this file: the suite runs under whatever
+ -- locale the build host has, and a linguistic collation orders these rows
+ -- differently from C.  pg_upgrade's test harness initialises its cluster with a
+ -- different locale than "make check" does, so without this the same tree
+ -- produces two different expected outputs.
+ ORDER BY kind COLLATE "C", name COLLATE "C";
 
 -- Same idea for the seeded data: every stored value must carry the marker, or a
 -- leaked value would be invisible to the detector.  Must return nothing.
@@ -356,7 +374,7 @@ SELECT 'unmarked value' AS problem, v
     UNION ALL SELECT zsec_kind::text FROM zsec_customers
   ) vals
  WHERE v IS NOT NULL AND v !~ '^zsec'
- ORDER BY v;
+ ORDER BY v COLLATE "C";
 
 --
 -- POSITIVE CONTROL
@@ -374,9 +392,9 @@ SELECT f.fr,
                  || coalesce(array_to_string(g.found, ' '), '(nothing)')
        END AS verdict
   FROM zsec_fixtures f
-  CROSS JOIN LATERAL (SELECT array_agg(l ORDER BY l) AS found
+  CROSS JOIN LATERAL (SELECT array_agg(l ORDER BY l COLLATE "C") AS found
                         FROM zsec_leaks(f.qry, f.opts) AS l) g
- ORDER BY f.fr, f.note, f.qry;
+ ORDER BY f.fr COLLATE "C", f.note COLLATE "C", f.qry COLLATE "C";
 
 --
 -- GUC-dependent fixtures.  These cannot share the table-driven run above
@@ -414,13 +432,13 @@ RESET enable_seqscan;
 -- same identifier set in all four formats.
 --
 SELECT format_name,
-       CASE WHEN found = (SELECT array_agg(l ORDER BY l)
+       CASE WHEN found = (SELECT array_agg(l ORDER BY l COLLATE "C")
                             FROM zsec_leaks('SELECT zsec_a.zsec_id FROM zsec_customers zsec_a WHERE zsec_a.zsec_ssn = ''zsec_val_secret''',
                                             'COSTS OFF') AS l)
             THEN 'same as text'
             ELSE 'DIFFERS: ' || array_to_string(found, ' ') END AS verdict
   FROM (VALUES ('text'), ('json'), ('xml'), ('yaml')) AS fmt(format_name),
-       LATERAL (SELECT array_agg(l ORDER BY l) AS found
+       LATERAL (SELECT array_agg(l ORDER BY l COLLATE "C") AS found
                   FROM zsec_leaks('SELECT zsec_a.zsec_id FROM zsec_customers zsec_a WHERE zsec_a.zsec_ssn = ''zsec_val_secret''',
                                   'COSTS OFF, FORMAT ' || fmt.format_name) AS l) g
  ORDER BY format_name;
