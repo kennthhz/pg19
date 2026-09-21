@@ -60,6 +60,26 @@ itself changed:
    `pg_get_expr`, FDW deparse and every extension that calls
    `deparse_expression()`. Design §8 calls it gating; treat a failure as a
    blocker, never as an expected-file update.
+
+   **The tree must be configured with `--enable-depend`, and this criterion is
+   void without it.** PostgreSQL's makefiles do not track header dependencies
+   unless it is set, so editing a header recompiles nothing. T03 hit the
+   consequence: adding a field to `ExplainState` shifted the offsets of
+   `es->indent` and everything after it, `contrib/pg_plan_advice` was not
+   rebuilt, and its module read the new backend's `ExplainState` through the old
+   layout — nine test files failed on indentation alone, with no defect in the
+   change. The reverse is what makes this a standing criterion rather than a
+   footnote: a task that edits a header and is verified against stale objects
+   can report a clean check-world for code that was never compiled, and on this
+   feature that failure mode passes a leak. Any task touching
+   `explain_state.h`, `explain_redact.h` or `ruleutils.h` must either build with
+   dependency tracking on or `make clean` first.
+
+   Two further host requirements were established the same way, both of which
+   made check-world fail before any redaction code was involved:
+   `IO::Tty` >= 1.12 (`src/bin/psql/t/030_pager.pl` calls `set_winsize`, absent
+   in 1.10, and the test dies rather than skipping), and an expected-output
+   sort order that does not depend on the host locale — see criterion 6.
 2. **Leak-check suite green** (T01 harness): no fixture identifier appears in
    any redacted record, in any of the four formats.
 3. **Negative controls green** (requirements §10.4): exempt names, operators,
@@ -77,6 +97,18 @@ itself changed:
 5. **No new compiler warnings**; PostgreSQL coding style (NFR-1). From T02
    onward, `src/tools/pgindent` for C and `src/tools/pgindent/pgperltidy` for
    Perl (perltidy 20230309 specifically, per `src/tools/pgindent/README`).
+6. **Locale-independent expected output.** Every `ORDER BY` on a text column in
+   a new test needs `COLLATE "C"`. The suite runs under whatever locale the host
+   provides, and `pg_upgrade`'s harness initialises its cluster with a different
+   one than `make check` does — so a linguistic sort order that looks stable
+   under repeated `make check` runs still fails once check-world reaches
+   `src/bin/pg_upgrade`. T01 shipped with this defect and it went unnoticed
+   because check-world had not been run. The markers make it likelier than it
+   looks: `zsec_ssn` and `zsecdata-ssn` first differ at `_` against `d`, and a
+   linguistic collation ignores punctuation at the primary level where C does
+   not. Note that `ORDER BY 1 COLLATE "C"` does not mean the first column — it
+   collates the integer 1 and fails at run time; sort in an enclosing query
+   instead.
 
 ---
 
