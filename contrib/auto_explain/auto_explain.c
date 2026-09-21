@@ -124,6 +124,8 @@ static void explain_ExecutorEnd(QueryDesc *queryDesc);
 static bool check_log_extension_options(char **newval, void **extra,
 										GucSource source);
 static void assign_log_extension_options(const char *newval, void *extra);
+static char *make_reference_token(void);
+static void emit_reference_entry(const char *token, const char *query_text);
 static void warn_redaction_conflict(const char *setting, const char *why);
 static void check_logging_envelope(void);
 static void apply_extension_options(ExplainState *es,
@@ -441,6 +443,60 @@ explain_ExecutorFinish(QueryDesc *queryDesc)
 }
 
 /*
+ * Produce a reference token for one redacted record.
+ *
+ * A redacted record has no correlation handle of its own.  errhidestmt(true)
+ * suppresses the STATEMENT: line, and the comment further down notes that
+ * auto_explain otherwise leans on surrounding context to say which statement a
+ * record belongs to -- context that redaction removes.  With nothing to
+ * correlate on, the operator's obvious move is to switch on
+ * log_min_duration_statement, which puts every statement into the same log and
+ * gives back everything redaction withheld.  The token exists to make that
+ * unnecessary.
+ *
+ * Drawn from the global PRNG, and that choice is the requirement rather than a
+ * convenience.  The token must not be derived from the query text or from
+ * queryId: queryId is a hash that anyone can recompute, so a token derived from
+ * it would rebuild precisely the guessing attack that dropping Query Identifier
+ * was meant to remove.  A random value tells a reader nothing about the
+ * statement unless they also hold the companion entry.
+ *
+ * 64 bits in hex: wide enough that collisions within a log file are not a
+ * practical concern, short enough to read off a line and grep for.
+ */
+static char *
+make_reference_token(void)
+{
+	return psprintf("%016" PRIx64, pg_prng_uint64(&pg_global_prng_state));
+}
+
+/*
+ * Write the companion entry mapping a token to the statement it came from.
+ *
+ * This entry is the one part of the mechanism that contains user data, and it is
+ * kept separate from the record itself so that an operator can send it somewhere
+ * the plan log is not.  DEBUG1 is what makes that possible: it sits below the
+ * default log_min_messages, so by default this is never written at all, and
+ * anyone who wants correlation opts in knowingly.
+ *
+ * The trade is worth stating plainly.  A site that never enables it cannot tie
+ * records back to statements from the log alone -- that is the intent, not a
+ * shortcoming.  A site that does enable it has chosen to keep the statements and
+ * should route them accordingly, which is why check_logging_envelope() reports
+ * that they are being written.
+ */
+static void
+emit_reference_entry(const char *token, const char *query_text)
+{
+	if (query_text == NULL)
+		return;
+
+	ereport(DEBUG1,
+			(errmsg("auto_explain ref %s: %s", token, query_text),
+			 errhidestmt(true)));
+}
+
+/*
  * Warn, once per session per topic, that something defeats redaction.
  *
  * Once per session rather than once per record because these are configuration
@@ -471,6 +527,7 @@ check_logging_envelope(void)
 	static bool warned_log_statement = false;
 	static bool warned_log_min_duration = false;
 	static bool warned_log_line_prefix = false;
+	static bool warned_reference_entries = false;
 
 	if (log_statement != LOGSTMT_NONE && !warned_log_statement)
 	{
@@ -484,6 +541,25 @@ check_logging_envelope(void)
 		warned_log_min_duration = true;
 		warn_redaction_conflict("log_min_duration_statement",
 								"Statements exceeding the threshold are logged in full, including the text redacted from the plan.");
+	}
+
+	/*
+	 * The reference entries this module writes itself.  Listed with the
+	 * others because the hazard is identical and the cause is easy to miss:
+	 * an operator who raised log_min_messages to debug1 for some unrelated
+	 * investigation is now collecting every statement in this log, without
+	 * having asked for correlation at all.
+	 *
+	 * Asked as "would a DEBUG1 message be emitted" rather than by comparing
+	 * log_min_messages directly.  The comparison is not portable across this
+	 * tree: log_min_messages is an array indexed by MyBackendType, not a
+	 * scalar, and the rule for whether a level is output lives in elog.c.
+	 */
+	if (message_level_is_interesting(DEBUG1) && !warned_reference_entries)
+	{
+		warned_reference_entries = true;
+		warn_redaction_conflict("a log level of debug1 or lower",
+								"The companion reference entries are being written to this log, so the statements redacted from the plans are present in it.");
 	}
 
 	/*
@@ -601,11 +677,27 @@ explain_ExecutorEnd(QueryDesc *queryDesc)
 			 * debug_query_string to identify just which statement is being
 			 * reported.  This isn't ideal but trying to do it here would
 			 * often result in duplication.
+			 *
+			 * That reliance is exactly what breaks down under redaction,
+			 * which is why a redacted record carries a reference token
+			 * instead.  See emit_reference_entry() above.
 			 */
-			ereport(auto_explain_log_level,
-					(errmsg("duration: %.3f ms  plan:\n%s",
-							msec, es->str->data),
-					 errhidestmt(true)));
+			if (es->redact)
+			{
+				char	   *token = make_reference_token();
+
+				emit_reference_entry(token, queryDesc->sourceText);
+
+				ereport(auto_explain_log_level,
+						(errmsg("duration: %.3f ms  ref: %s  plan:\n%s",
+								msec, token, es->str->data),
+						 errhidestmt(true)));
+			}
+			else
+				ereport(auto_explain_log_level,
+						(errmsg("duration: %.3f ms  plan:\n%s",
+								msec, es->str->data),
+						 errhidestmt(true)));
 		}
 
 		MemoryContextSwitchTo(oldcxt);

@@ -193,7 +193,13 @@ sub plan_record
 
 	foreach my $line (split /\n/, $log)
 	{
-		if ($line =~ /duration: [\d.]+ ms  plan:/)
+		# The "ref:" field appears only on redacted records, so it is optional
+		# here.  Getting this pattern wrong is unusually dangerous: matching
+		# nothing returns an empty string, leaked("") finds no markers, and every
+		# "nothing leaked" assertion built on this helper then passes while
+		# examining nothing at all.  That is why the check below is a hard
+		# failure rather than an empty return.
+		if ($line =~ /duration: [\d.]+ ms  (?:ref: [0-9a-f]+  )?plan:/)
 		{
 			$in_record = 1;
 			push @kept, $line;
@@ -209,6 +215,13 @@ sub plan_record
 			$in_record = 0;
 		}
 	}
+
+	# A caller only asks for the record because it is about to assert something
+	# about its contents.  Returning empty would turn each of those assertions
+	# into a tautology, so refuse instead.
+	die "plan_record() found no auto_explain record in this log chunk; "
+	  . "has the record's message format changed?"
+	  unless @kept;
 
 	return join("\n", @kept) . "\n";
 }
@@ -781,7 +794,7 @@ $log = query_log(
 	{ 'auto_explain.log_nested_statements' => 'on' });
 like(
 	$log,
-	qr/duration: [\d.]+ ms  plan:/,
+	qr/duration: [\d.]+ ms  ref: [0-9a-f]+  plan:/,
 	'FR-2 redacted: the nested statement really was logged');
 is_deeply([ leaked(plan_record($log)) ],
 	[], 'FR-2 redacted: nested statements carry no marker either');
@@ -816,6 +829,79 @@ like(
 	$log,
 	qr/cost=[\d.]+\.\.[\d.]+ rows=\d+ width=\d+/,
 	'negative control: planner estimates still print under redaction');
+
+# ---------------------------------------------------------------------------
+# T05: the correlation token.
+#
+# A redacted record contains nothing identifying the statement it came from,
+# which is the intent -- but on its own that makes the feature awkward enough to
+# invite the one workaround that undoes it.  errhidestmt(true) removes the
+# STATEMENT: line, and auto_explain otherwise relies on surrounding context to
+# say which statement a record describes.  An operator unable to correlate will
+# reach for log_min_duration_statement, which puts every statement into this very
+# log.
+#
+# So each redacted record carries a random reference token, and the mapping from
+# token to statement goes into a separate DEBUG1 entry that a site can route
+# elsewhere, or never enable at all.
+# ---------------------------------------------------------------------------
+$log = query_log($node,
+	"SET search_path = zsec_ns, public; SELECT zsec_bal FROM zsec_customers;"
+);
+like(
+	$log,
+	qr/duration: [\d.]+ ms  ref: [0-9a-f]{16}  plan:/,
+	'FR-76: a redacted record carries a 64-bit reference token');
+
+# The companion entry must not appear at the default log level.  If it did, the
+# statement would sit in the same log as the plan and the separation would be
+# pointless.
+unlike(
+	$log,
+	qr/auto_explain ref/,
+	'FR-76: the token-to-statement entry is not written at the default log level'
+);
+is_deeply([ leaked(plan_record($log)) ],
+	[], 'FR-76: adding the token does not itself leak anything');
+
+# Two records must carry different tokens, or the token identifies a statement
+# rather than a record.
+my $log2 = query_log($node,
+	"SET search_path = zsec_ns, public; SELECT zsec_bal FROM zsec_customers;"
+);
+my ($tok1) = $log =~ /ref: ([0-9a-f]{16})/;
+my ($tok2) = $log2 =~ /ref: ([0-9a-f]{16})/;
+isnt($tok1, $tok2,
+	'FR-76: two records carry different tokens, even for the same statement');
+
+# That pair is also the test that the token is not derived from queryId, and it
+# is a stronger test than comparing the token against a rendering of queryId.
+# Both records ran the identical statement, so their queryId is identical, and a
+# token computed from the statement by any function at all -- not merely the ones
+# a test author thought to try -- would have come out the same.  They differ, so
+# the token cannot be a function of the statement.
+#
+# This matters because a queryId-derived token would rebuild the guessing attack
+# that dropping Query Identifier removed: a reader could hash a candidate
+# statement and compare.
+
+# With DEBUG1 enabled the companion entry appears, and its token has to be the
+# one in the record, or correlation does not actually work.
+$log = query_log(
+	$node,
+	"SET search_path = zsec_ns, public; SELECT zsec_ssn FROM zsec_customers WHERE zsec_bal > 0;",
+	{ 'log_min_messages' => 'debug1' });
+my ($rec_token) = $log =~ /ref: ([0-9a-f]{16})/;
+like(
+	$log,
+	qr/auto_explain ref \Q$rec_token\E: SELECT zsec_ssn FROM zsec_customers/,
+	'FR-76: the companion entry maps the record token to the real statement');
+
+# And the operator is told that enabling it placed the statements in this log.
+like(
+	$log,
+	qr/log_redact is enabled, but a log level of debug1 or lower is also active/,
+	'FR-76: writing the reference entries is reported by the envelope check');
 
 # FR-75: the envelope warning.  Redaction governs this record only; a setting
 # that logs the statement in full into the same file gives it all back, and the
