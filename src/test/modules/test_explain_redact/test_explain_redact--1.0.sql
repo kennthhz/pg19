@@ -45,3 +45,7 @@ CREATE FUNCTION test_redact_rtable_names(relid oid, redact boolean, collide bool
 RETURNS text[]
 AS 'MODULE_PATHNAME', 'test_redact_rtable_names'
 LANGUAGE C STRICT;
+CREATE FUNCTION test_redact_deparse(query text, redact boolean)
+RETURNS text
+AS 'MODULE_PATHNAME', 'test_redact_deparse'
+LANGUAGE C STRICT;

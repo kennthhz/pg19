@@ -116,7 +116,51 @@ the planner optimised away; the plan cannot show those by definition. A reviewer
 who needs to know what a statement *asked for*, rather than what was executed,
 has no other source.
 
-### 3.1.2 Rendering of `Query Parameters` (open question, not yet decided)
+### 3.1.2 Column numbering discloses the column's position (FR-12 not met)
+
+**Status: known shortfall, landed in T08, needs a decision.**
+
+FR-12 requires the numeric part of a column pseudonym to be an opaque per-relation
+counter and explicitly *not* the attribute number — a table whose sensitive column
+sits ninth must not surface `_c9` unless that column is the ninth one the plan
+touched. That is not what T08 produces. `SELECT c_third FROM t` yields `t1_c3`,
+and a reader of a redacted record can therefore infer that the printed column is
+the third column of its table.
+
+The cause is structural rather than an oversight.
+`set_relation_column_names()` must fill in a name for **every** column of the
+range-table entry, because `get_variable()` reads the array by attribute number,
+and it runs while the deparse context is being built — before anything knows which
+columns the plan will actually reference. Numbering in assignment order therefore
+yields the column's position, which for a relation with no dropped columns equals
+its attnum.
+
+It is also not fixable by choosing a different deterministic function of the
+attnum. Any such mapping is invertible by a reader who knows the scheme, and FR-42
+requires the same plan to produce the same pseudonyms, so the permutation cannot be
+randomised per record either.
+
+What is disclosed is schema shape, not data: the column's ordinal position, and by
+implication that the table has at least that many columns. It sits in the same
+category as the plan shape that §9 already accepts, but FR-12 was written
+specifically to exclude it, so the gap should be closed or the requirement
+amended.
+
+Two ways to close it, neither attempted in T08:
+
+- **Lazy assignment.** Leave `colinfo->colnames[]` entries NULL and issue a name
+  on first read, so the counter advances only for columns the plan actually
+  prints. Requires every reader of that array to go through an accessor;
+  `get_variable()` is the main one but not the only one.
+- **Reference-set precomputation.** Walk the plan tree once when building the
+  context, collect the set of `(varno, attno)` pairs that appear in any Var, and
+  number only those. More contained than lazy assignment, and it makes "distinct
+  columns used" literal, at the cost of a second pass over the plan.
+
+Until one is done, FR-12 should be read as "the number is the column's position
+within its range-table entry, never its name" rather than as written.
+
+### 3.1.3 Rendering of `Query Parameters` (open question, not yet decided)
 
 D10 and FR-22 omit the property outright. That decision has been challenged and
 is not settled. Two objections stand:

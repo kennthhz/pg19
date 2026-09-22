@@ -417,7 +417,8 @@ static void set_using_names(deparse_namespace *dpns, Node *jtnode,
 							List *parentUsing);
 static void set_relation_column_names(deparse_namespace *dpns,
 									  RangeTblEntry *rte,
-									  deparse_columns *colinfo);
+									  deparse_columns *colinfo,
+									  int rtindex);
 static void set_join_column_names(deparse_namespace *dpns, RangeTblEntry *rte,
 								  deparse_columns *colinfo);
 static bool colname_is_unique(const char *colname, deparse_namespace *dpns,
@@ -3933,6 +3934,28 @@ set_deparse_context_plan(List *dpcontext, Plan *plan, List *ancestors)
 	{
 		dpns->ret_old_alias = ((ModifyTable *) plan)->returningOldAlias;
 		dpns->ret_new_alias = ((ModifyTable *) plan)->returningNewAlias;
+
+		/*
+		 * RETURNING WITH (OLD AS x, NEW AS y) names are the user's own words
+		 * and are printed as the qualifier on the columns they introduce
+		 * (FR-13b).
+		 *
+		 * Scope 0 keys them, which no range-table entry can collide with
+		 * because a range-table index starts at 1.  The two need separate
+		 * ordinals or they would share one pseudonym and a reader could not
+		 * tell the before-image of a row from the after-image.
+		 */
+		if (dpns->redact != NULL)
+		{
+			if (dpns->ret_old_alias != NULL)
+				dpns->ret_old_alias =
+					unconstify(char *, explain_redact_local(dpns->redact,
+															REDACT_ALIAS, 0, 1));
+			if (dpns->ret_new_alias != NULL)
+				dpns->ret_new_alias =
+					unconstify(char *, explain_redact_local(dpns->redact,
+															REDACT_ALIAS, 0, 2));
+		}
 	}
 
 	return dpcontext;
@@ -4192,8 +4215,25 @@ set_deparse_for_query(deparse_namespace *dpns, Query *query,
 {
 	ListCell   *lc;
 	ListCell   *lc2;
+	int			rtindex;
 
-	/* Initialize *dpns and fill rtable/ctes links */
+	/*
+	 * Initialize *dpns and fill rtable/ctes links
+	 *
+	 * Note for redaction: this memset clears dpns->redact, so a sub-query
+	 * deparsed through get_query_def() assigns real names even when the
+	 * enclosing deparse was redacting.  That is currently unreachable from
+	 * EXPLAIN -- the planner converts every SubLink into a SubPlan, so
+	 * get_sublink_expr() and the other in-deparse callers of get_query_def()
+	 * belong to query deparsing rather than plan deparsing.  Checked rather
+	 * than assumed: scalar, EXISTS, ANY, ARRAY and in-CASE sublinks all
+	 * deparse as "(InitPlan ...).colN" from get_parameter(), never through
+	 * here.
+	 *
+	 * It is a latent hazard nonetheless.  Anything that made a plan deparse
+	 * reach this function would silently print real column names, so
+	 * redaction has to be threaded in here before that can happen.
+	 */
 	memset(dpns, 0, sizeof(deparse_namespace));
 	dpns->rtable = query->rtable;
 	dpns->subplans = NIL;
@@ -4233,6 +4273,7 @@ set_deparse_for_query(deparse_namespace *dpns, Query *query,
 	 * okay because they appear later in the rtable list than their children
 	 * (cf Asserts in identify_join_columns()).
 	 */
+	rtindex = 1;
 	forboth(lc, dpns->rtable, lc2, dpns->rtable_columns)
 	{
 		RangeTblEntry *rte = (RangeTblEntry *) lfirst(lc);
@@ -4241,7 +4282,8 @@ set_deparse_for_query(deparse_namespace *dpns, Query *query,
 		if (rte->rtekind == RTE_JOIN)
 			set_join_column_names(dpns, rte, colinfo);
 		else
-			set_relation_column_names(dpns, rte, colinfo);
+			set_relation_column_names(dpns, rte, colinfo, rtindex);
+		rtindex++;
 	}
 }
 
@@ -4260,6 +4302,7 @@ set_simple_column_names(deparse_namespace *dpns)
 {
 	ListCell   *lc;
 	ListCell   *lc2;
+	int			rtindex;
 
 	/* Initialize dpns->rtable_columns to contain zeroed structs */
 	dpns->rtable_columns = NIL;
@@ -4268,13 +4311,15 @@ set_simple_column_names(deparse_namespace *dpns)
 									   palloc0_object(deparse_columns));
 
 	/* Assign unique column aliases within each non-join RTE */
+	rtindex = 1;
 	forboth(lc, dpns->rtable, lc2, dpns->rtable_columns)
 	{
 		RangeTblEntry *rte = (RangeTblEntry *) lfirst(lc);
 		deparse_columns *colinfo = (deparse_columns *) lfirst(lc2);
 
 		if (rte->rtekind != RTE_JOIN)
-			set_relation_column_names(dpns, rte, colinfo);
+			set_relation_column_names(dpns, rte, colinfo, rtindex);
+		rtindex++;
 	}
 }
 
@@ -4473,7 +4518,21 @@ set_using_names(deparse_namespace *dpns, Node *jtnode, List *parentUsing)
 				/* Assert it's a merged column */
 				Assert(leftattnos[i] != 0 && rightattnos[i] != 0);
 
-				/* Adopt passed-down name if any, else select unique name */
+				/*
+				 * Adopt passed-down name if any, else select unique name
+				 *
+				 * Note for redaction: the name chosen here is the real USING
+				 * column name, and it is pushed down into both child RTEs
+				 * below, where set_relation_column_names() will keep it
+				 * rather than substitute a pseudonym -- its substitution only
+				 * applies when no name was passed down.  That is confined to
+				 * query deparsing: set_using_names() is reached only from
+				 * set_deparse_for_query(), and the plan path uses
+				 * set_simple_column_names(), which skips join RTEs entirely.
+				 * A USING join in a plan is therefore redacted correctly.
+				 * Threading redaction in here would be needed before that
+				 * ceases to be true.
+				 */
 				if (colinfo->colnames[i] != NULL)
 					colname = colinfo->colnames[i];
 				else
@@ -4534,7 +4593,7 @@ set_using_names(deparse_namespace *dpns, Node *jtnode, List *parentUsing)
  */
 static void
 set_relation_column_names(deparse_namespace *dpns, RangeTblEntry *rte,
-						  deparse_columns *colinfo)
+						  deparse_columns *colinfo, int rtindex)
 {
 	int			ncolumns;
 	char	  **real_colnames;
@@ -4669,8 +4728,53 @@ set_relation_column_names(deparse_namespace *dpns, RangeTblEntry *rte,
 		/* If alias already assigned, that's what to use */
 		if (colname == NULL)
 		{
+			/*
+			 * Under redaction the column gets a pseudonym instead, and
+			 * neither the real column name nor a user-written output alias is
+			 * consulted.
+			 *
+			 * One substitution covers both ways the real names were gathered
+			 * above -- the catalog, for a relation, and eref or expandRTE()
+			 * for everything else.  That matters because the second branch is
+			 * the only source available for a subquery, join, VALUES,
+			 * function, CTE or tuplestore RTE: those have no relid and no
+			 * catalog attribute number, so a (relid, attno) key could not
+			 * name their columns at all (FR-46).  Keying on (range-table
+			 * index, position) works for every kind.
+			 *
+			 * The qualifier is the reference name this RTE was already given,
+			 * rather than one derived here, so a column and its relation
+			 * cannot end up with unrelated names.  Deriving it would produce
+			 * "a1_c1" for a relation that prints as "t1", since an unaliased
+			 * relation is keyed by OID while a column is keyed by range-table
+			 * index.  Where no reference name was chosen -- an RTE the plan
+			 * does not reference -- fall back to this RTE's own alias
+			 * pseudonym.
+			 *
+			 * As in set_rtable_names(), this happens before
+			 * make_colname_unique(), so the tie-breaking below becomes a
+			 * no-op rather than appending a digit to a generated name
+			 * (FR-47).
+			 */
+			if (dpns->redact != NULL)
+			{
+				const char *qualifier = NULL;
+
+				if (rtindex >= 1 &&
+					rtindex <= list_length(dpns->rtable_names))
+					qualifier = (const char *) list_nth(dpns->rtable_names,
+														rtindex - 1);
+				if (qualifier == NULL)
+					qualifier = explain_redact_local(dpns->redact,
+													 REDACT_ALIAS, rtindex, 0);
+
+				colname = unconstify(char *,
+									 explain_redact_column(dpns->redact,
+														   qualifier,
+														   rtindex, i + 1));
+			}
 			/* If user wrote an alias, prefer that over real column name */
-			if (rte->alias && i < list_length(rte->alias->colnames))
+			else if (rte->alias && i < list_length(rte->alias->colnames))
 				colname = strVal(list_nth(rte->alias->colnames, i));
 			else
 				colname = real_colname;
@@ -4688,7 +4792,15 @@ set_relation_column_names(deparse_namespace *dpns, RangeTblEntry *rte,
 		colinfo->is_new_col[j] = (i >= noldcolumns);
 		j++;
 
-		/* Remember if any assigned aliases differ from "real" name */
+		/*
+		 * Remember if any assigned aliases differ from "real" name
+		 *
+		 * Under redaction every name differs, so this becomes true and
+		 * colinfo->printaliases follows.  That only affects get_rte_alias()
+		 * and get_column_alias_list(), both of which print a FROM item's
+		 * alias list during query deparsing; a plan has no FROM clause, so
+		 * EXPLAIN never reads it.
+		 */
 		if (!changed_any && strcmp(colname, real_colname) != 0)
 			changed_any = true;
 	}

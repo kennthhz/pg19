@@ -287,5 +287,123 @@ SELECT test_redact_rtable_names('zsec_t02.zsec_rt'::regclass, false, true)
 SELECT test_redact_rtable_names('zsec_t02.zsec_rt'::regclass, true, true)
          AS redacted_collision;
 
+--
+-- T08: column names assigned by set_relation_column_names().
+--
+-- Each RTE kind is a separate case, deliberately.  Combined into one query, a
+-- single working path would mask a broken one -- which is the failure T01 found
+-- in six of its own fixtures.
+--
+-- The left column is what EXPLAIN prints as "Output:" today; the right is what it
+-- prints under redaction.  Both come from the same three calls explain.c makes,
+-- so agreement between the name that gets assigned and the name that gets read
+-- back is part of what is being checked.
+CREATE TABLE zsec_t02.zsec_c (c_first int, c_second text, c_third numeric);
+INSERT INTO zsec_t02.zsec_c VALUES (1, 'x', 2);
+SET search_path = zsec_t02, public;
+
+SELECT what,
+       test_redact_deparse(qry, false) AS plain,
+       test_redact_deparse(qry, true)  AS redacted
+  FROM (VALUES
+    ('plain relation',
+     'SELECT c_first, c_second FROM zsec_c'),
+    -- FR-46: every kind below has no relid and no catalog attribute number, so
+    -- a (relid, attno) key could not name its columns at all.
+    ('subquery output name',
+     'SELECT s.o FROM (SELECT c_second AS o FROM zsec_c OFFSET 0) s'),
+    -- Two rows, not one.  A single-row VALUES is folded to constants, no Var
+    -- survives, and the case then passes having named no column at all --
+    -- wrapping it in OFFSET 0 does not help, because the planner propagates the
+    -- constants up through the subquery's target list anyway.
+    ('VALUES column aliases',
+     'SELECT v.v1, v.v2 FROM (VALUES (1,2),(3,4)) AS v(v1, v2)'),
+    ('function scan alias',
+     'SELECT g.g1 FROM generate_series(1,3) AS g(g1)'),
+    ('ROWS FROM coldeflist',
+     'SELECT r.* FROM ROWS FROM (json_to_record(''{"a":1}'') AS (a int)) AS r'),
+    ('join output names',
+     'SELECT a.c_first, b.c_second FROM zsec_c a JOIN zsec_c b USING (c_first)'),
+    ('CTE column aliases',
+     'WITH w(w1) AS MATERIALIZED (SELECT c_second FROM zsec_c) SELECT w.w1 FROM w')
+  ) AS t(what, qry)
+ ORDER BY what COLLATE "C";
+
+--
+-- Column numbering, and a known shortfall against FR-12.
+--
+-- FR-12 asks for an opaque counter that is never the attribute number: a table
+-- whose sensitive column sits ninth should not surface "_c9" unless that column
+-- is the ninth one the plan touched.  That is NOT what happens, and the result
+-- below records it rather than hiding it.
+--
+-- The cause is structural.  set_relation_column_names() has to fill a name in for
+-- every column of the RTE, because get_variable() reads the array by attribute
+-- number, and it runs while the deparse context is being built -- before anything
+-- knows which columns the plan will reference.  Numbering in assignment order
+-- therefore yields the column's position, which for a relation with no dropped
+-- columns is its attnum.
+--
+-- So a reader of a redacted record can infer that the column printed as "t1_c3"
+-- is the third column of its table.  That is schema shape rather than data, and it
+-- is a real disclosure that FR-12 meant to prevent.  Satisfying it needs either
+-- lazy assignment, so a name is issued on first read rather than up front, or an
+-- amendment to FR-12; see the requirements.
+SELECT test_redact_deparse('SELECT c_third FROM zsec_c', true)
+         AS number_is_the_position_not_a_use_counter;
+
+-- And the counter is per RTE, so a self-join numbers each side from 1 rather than
+-- continuing across the plan.
+SELECT test_redact_deparse(
+         'SELECT a.c_second, b.c_third FROM zsec_c a, zsec_c b WHERE a.c_first = b.c_first',
+         true) AS per_rte_counters;
+
+--
+-- FR-47 for columns, the analogue of the relation-alias case above.  A subquery
+-- may legally name two output columns the same; unredacted, make_colname_unique()
+-- appends a suffix to the second.  Redacted, the pseudonyms are distinct by
+-- construction and no suffix may appear -- "a1_c1_1" would mean the substitution
+-- ran after the tie-breaking instead of before it.
+SELECT test_redact_deparse(
+         'SELECT x.a, x.b FROM (SELECT 1 AS a, 2 AS a, 3 AS b FROM zsec_c OFFSET 0) x(a, a2, b)',
+         false) AS plain_duplicate_colnames;
+SELECT test_redact_deparse(
+         'SELECT x.a, x.b FROM (SELECT 1 AS a, 2 AS a, 3 AS b FROM zsec_c OFFSET 0) x(a, a2, b)',
+         true) AS redacted_duplicate_colnames;
+
+--
+-- A USING join in a plan must be redacted.  set_using_names() pushes the real
+-- USING column name into both child RTEs, where the substitution would be
+-- skipped -- but that function belongs to query deparsing, and the plan path
+-- skips join RTEs entirely.  Asserted rather than left to that argument.
+SELECT test_redact_deparse(
+         'SELECT a.c_second, b.c_third FROM zsec_c a JOIN zsec_c b USING (c_first)',
+         true) AS using_join_redacted;
+
+--
+-- System columns are exempt and must still print: they are PostgreSQL's names,
+-- not the application's, and a reader needs them to make sense of a plan.
+SELECT test_redact_deparse('SELECT ctid, xmin FROM zsec_c', true)
+         AS system_columns_still_print;
+
+--
+-- A whole-row Var prints the relation pseudonym with ".*", so the reference stays
+-- legible without naming anything.
+SELECT test_redact_deparse('SELECT zsec_c FROM zsec_c', true)
+         AS whole_row_var;
+
+--
+-- FR-13b: RETURNING WITH (OLD AS ..., NEW AS ...) aliases are the user's own
+-- words.  They are keyed outside the range-table index space, so they cannot
+-- collide with a relation's alias, and the two get different pseudonyms -- a
+-- reader must still be able to tell the row's before-image from its after-image.
+SELECT test_redact_deparse(
+         'UPDATE zsec_c SET c_third = 0 RETURNING WITH (OLD AS o, NEW AS n) o.c_third, n.c_third',
+         false) AS plain_returning;
+SELECT test_redact_deparse(
+         'UPDATE zsec_c SET c_third = 0 RETURNING WITH (OLD AS o, NEW AS n) o.c_third, n.c_third',
+         true) AS redacted_returning;
+
+RESET search_path;
 DROP SCHEMA zsec_t02 CASCADE;
 DROP EXTENSION test_explain_redact;

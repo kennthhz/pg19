@@ -26,10 +26,12 @@
 #include "commands/explain_redact.h"
 #include "commands/explain_state.h"
 #include "fmgr.h"
+#include "executor/spi.h"
 #include "nodes/makefuncs.h"
 #include "utils/array.h"
 #include "utils/builtins.h"
 #include "utils/lsyscache.h"
+#include "utils/plancache.h"
 #include "utils/ruleutils.h"
 #include "utils/memutils.h"
 #include "utils/varlena.h"
@@ -546,6 +548,87 @@ test_redact_rtable_names(PG_FUNCTION_ARGS)
 	PG_RETURN_ARRAYTYPE_P(construct_md_array(elems, nulls, 1, &i, lbs,
 											 TEXTOID, -1, false,
 											 TYPALIGN_INT));
+}
+
+/*
+ * test_redact_deparse(query text, redact bool) returns text
+ *
+ * Plans the given query, then deparses the target list of its top plan node and
+ * returns the result -- which is the same string EXPLAIN would print as
+ * "Output:", produced through the same three calls explain.c makes.
+ *
+ * Going through a real planner rather than a hand-built range table is the point
+ * here.  T07 could be checked against constructed RTEs because it only had to
+ * cover four branches of one function, but column naming runs the whole chain:
+ * the context is built, set_relation_column_names() assigns names into it, and
+ * get_variable() reads them back out when the expression is deparsed.  A test
+ * that skipped any of those would not show that they agree.
+ */
+PG_FUNCTION_INFO_V1(test_redact_deparse);
+Datum
+test_redact_deparse(PG_FUNCTION_ARGS)
+{
+	char	   *query = text_to_cstring(PG_GETARG_TEXT_PP(0));
+	bool		redact = PG_GETARG_BOOL(1);
+	SPIPlanPtr	spiplan;
+	List	   *sources;
+	CachedPlanSource *source;
+	CachedPlan *cplan;
+	PlannedStmt *pstmt;
+	RedactCtx  *ctx = NULL;
+	List	   *rtable_names;
+	List	   *dpcontext;
+	StringInfoData buf;
+	ListCell   *lc;
+	char	   *result;
+
+	if (SPI_connect() != SPI_OK_CONNECT)
+		elog(ERROR, "SPI_connect failed");
+
+	spiplan = SPI_prepare(query, 0, NULL);
+	if (spiplan == NULL)
+		elog(ERROR, "SPI_prepare failed: %s",
+			 SPI_result_code_string(SPI_result));
+
+	sources = SPI_plan_get_plan_sources(spiplan);
+	source = (CachedPlanSource *) linitial(sources);
+	cplan = GetCachedPlan(source, NULL, NULL, NULL);
+	pstmt = linitial_node(PlannedStmt, cplan->stmt_list);
+
+	if (redact)
+		ctx = explain_redact_create(NIL);
+
+	/*
+	 * The same sequence explain.c uses: choose reference names for the range
+	 * table, build a deparse context from them, then point it at a plan node.
+	 */
+	rtable_names = select_rtable_names_for_explain_redacted(pstmt->rtable,
+															NULL, ctx);
+	dpcontext = deparse_context_for_plan_tree_redacted(pstmt, rtable_names,
+													   ctx);
+	dpcontext = set_deparse_context_plan(dpcontext, pstmt->planTree, NIL);
+
+	initStringInfo(&buf);
+	foreach(lc, pstmt->planTree->targetlist)
+	{
+		TargetEntry *tle = (TargetEntry *) lfirst(lc);
+
+		if (buf.len > 0)
+			appendStringInfoString(&buf, ", ");
+		appendStringInfoString(&buf,
+							   deparse_expression_redacted((Node *) tle->expr,
+														   dpcontext, true,
+														   false, ctx));
+	}
+
+	result = pstrdup(buf.data);
+
+	if (ctx != NULL)
+		explain_redact_destroy(ctx);
+	ReleaseCachedPlan(cplan, NULL);
+	SPI_finish();
+
+	PG_RETURN_TEXT_P(cstring_to_text(result));
 }
 
 /*

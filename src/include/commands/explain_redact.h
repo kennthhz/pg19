@@ -120,6 +120,21 @@ extern const char *explain_redact_local(RedactCtx *ctx, RedactKind kind,
 										int scope, int ordinal);
 
 /*
+ * Name a column, qualified by a reference name the caller already holds.
+ *
+ * Preferred over explain_redact_local(REDACT_COLUMN, ...) wherever the owning
+ * range-table entry's printed name is known, because passing that string is what
+ * guarantees a column and its relation cannot acquire unrelated names: an
+ * unaliased relation is keyed by OID and prints "t1", while a column key is a
+ * range-table index and would otherwise derive "a1".
+ *
+ * Both entry points store their result against (varno, attno), so whichever
+ * names a given column first fixes its name for the remainder of the record.
+ */
+extern const char *explain_redact_column(RedactCtx *ctx, const char *qualifier,
+										 int varno, int attno);
+
+/*
  * Tripwire (§2.1 of the task plan).  In assert-enabled builds, aborts if the
  * given string contains a test marker while redaction is active, naming the
  * emission site.  A no-op when ctx is NULL, and compiled out entirely

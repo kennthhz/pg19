@@ -494,6 +494,74 @@ explain_redact_name(RedactCtx *ctx, RedactKind kind, Oid oid)
  * explain_redact_local
  *		Pseudonym for an object identified by position rather than by OID.
  */
+/*
+ * Fill in a column pseudonym: the owning range-table entry's name, then an
+ * opaque per-entry counter.
+ *
+ * The counter is assigned on first use and is never the attribute number.  Using
+ * the attno would disclose the column's ordinal position, and from that the
+ * table's shape -- how many columns it has and where the interesting one sits
+ * (FR-12, FR-43).  A table whose sensitive column is the ninth must not surface
+ * "_c9" unless that column happens to be the ninth one the plan touched.
+ *
+ * Keyed per scope so numbering restarts for each range-table entry, which keeps
+ * the numbers small and makes two columns of the same relation visibly related.
+ */
+static void
+redact_column_name(RedactCtx *ctx, const char *qualifier, int scope,
+				   int ordinal, RedactLocalEntry *entry)
+{
+	RedactColKey colkey;
+	RedactColEntry *colent;
+	bool		colfound;
+
+	memset(&colkey, 0, sizeof(colkey));
+	colkey.scope = scope;
+	colent = (RedactColEntry *) hash_search(ctx->col_counters, &colkey,
+											HASH_ENTER, &colfound);
+	if (!colfound)
+		colent->next = 0;
+
+	snprintf(entry->name, sizeof(entry->name), "%s_%s%d",
+			 qualifier, redact_prefix[REDACT_COLUMN], ++colent->next);
+}
+
+/*
+ * Name a column whose owning range-table entry already has a chosen reference
+ * name.
+ *
+ * Exists so that a column and the entry it belongs to cannot end up with
+ * unrelated names.  The alternative -- deriving the qualifier here from the
+ * range-table index -- produces "a1_c1" for a relation whose own name prints as
+ * "t1", because an unaliased relation is keyed by OID and a column key is a
+ * range-table index.  Passing the string that will actually be printed removes
+ * the possibility of the two being derived differently.
+ */
+const char *
+explain_redact_column(RedactCtx *ctx, const char *qualifier,
+					  int varno, int attno)
+{
+	RedactLocalKey key;
+	RedactLocalEntry *entry;
+	bool		found;
+
+	Assert(ctx != NULL);
+	Assert(qualifier != NULL);
+
+	memset(&key, 0, sizeof(key));
+	key.kind = REDACT_COLUMN;
+	key.scope = varno;
+	key.ordinal = attno;
+
+	entry = (RedactLocalEntry *) hash_search(ctx->local_map, &key,
+											 HASH_ENTER, &found);
+	if (found)
+		return entry->name;
+
+	redact_column_name(ctx, qualifier, varno, attno, entry);
+	return entry->name;
+}
+
 const char *
 explain_redact_local(RedactCtx *ctx, RedactKind kind, int scope, int ordinal)
 {
@@ -517,45 +585,27 @@ explain_redact_local(RedactCtx *ctx, RedactKind kind, int scope, int ordinal)
 	if (kind == REDACT_COLUMN)
 	{
 		/*
-		 * Columns are qualified by the pseudonym of the range-table entry
-		 * they belong to, so a reader can see which relation a column came
-		 * from without learning which relation it is.
+		 * A column with no qualifier supplied is named under the pseudonym of
+		 * its own range-table entry, which is the only pseudonym keyed the
+		 * same way a column is.
 		 *
-		 * The qualifier is the ALIAS pseudonym, because a column key is a
-		 * range-table index and that is the only pseudonym keyed the same
-		 * way. Columns therefore read "a1_c1" today, NOT the "t1_c3" that the
-		 * requirements use as their example -- this function has no way to
-		 * reach that form, because nothing yet links a range-table index to a
-		 * relation OID.  T07/T08 add that linkage, after which a plain
-		 * relation's columns can read "t1_c1" while a subquery's still read
-		 * "a1_c1".
+		 * Recursing while holding "entry" is safe, and the reason is worth
+		 * keeping: dynahash splits buckets by relinking in place and never
+		 * relocates elements, so the HASH_ENTER inside the recursive call
+		 * cannot invalidate this pointer.  The two keys differ in "kind" and
+		 * so cannot alias each other either.  Anyone tempted to copy the
+		 * string out first to be safe should know that is unnecessary rather
+		 * than merely harmless.
 		 *
-		 * The numeric part is an opaque per-relation counter assigned on
-		 * first use -- never the attribute number, which would leak the
-		 * column's ordinal position and hence the table's shape (FR-12,
-		 * FR-43).
-		 *
-		 * Recursing while holding "entry" is safe: dynahash splits buckets by
-		 * relinking in place and never relocates elements, so the inner
-		 * HASH_ENTER cannot invalidate this pointer.  The two keys differ in
-		 * "kind" and so cannot alias.
+		 * Callers that already know the reference name the range-table entry
+		 * will print should use explain_redact_column() and pass it, so that
+		 * the two cannot disagree.  Either way the result is stored against
+		 * (scope, ordinal), so whichever path names a given column first
+		 * fixes its name for the rest of the record.
 		 */
-		RedactColKey colkey;
-		RedactColEntry *colent;
-		const char *relname;
-		bool		colfound;
-
-		memset(&colkey, 0, sizeof(colkey));
-		colkey.scope = scope;
-		colent = (RedactColEntry *) hash_search(ctx->col_counters, &colkey,
-												HASH_ENTER, &colfound);
-		if (!colfound)
-			colent->next = 0;
-
-		relname = explain_redact_local(ctx, REDACT_ALIAS, scope, 0);
-
-		snprintf(entry->name, sizeof(entry->name), "%s_%s%d",
-				 relname, redact_prefix[REDACT_COLUMN], ++colent->next);
+		redact_column_name(ctx, explain_redact_local(ctx, REDACT_ALIAS,
+													 scope, 0),
+						   scope, ordinal, entry);
 	}
 	else
 		snprintf(entry->name, sizeof(entry->name), "%s%d",
