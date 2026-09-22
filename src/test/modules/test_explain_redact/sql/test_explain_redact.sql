@@ -514,6 +514,48 @@ SELECT test_redact_deparse(
          'SELECT c.relname, t.c_second FROM pg_class c, zsec_c t', true)
          AS mixed_catalog_and_user;
 
+--
+-- T11: type and collation names.
+--
+-- Same exemption rule as T10, applied to a different class of object.  Core type
+-- labels and core collations keep their names: "?::integer" can be diagnosed while
+-- "?::ty3" cannot, and neither "integer" nor COLLATE "C" discloses anything, being
+-- PostgreSQL's names.
+CREATE TYPE zsec_t02.zsec_enum2 AS ENUM ('a', 'b');
+CREATE DOMAIN zsec_t02.zsec_dom AS int CHECK (VALUE > 0);
+CREATE TYPE zsec_t02.zsec_pair AS (x int, y text);
+CREATE COLLATION zsec_t02.zsec_coll2 (locale = 'C');
+ALTER TABLE zsec_t02.zsec_c ADD COLUMN c_enum2 zsec_t02.zsec_enum2;
+
+SELECT what,
+       test_redact_deparse(qry, false) AS plain,
+       test_redact_deparse(qry, true)  AS redacted
+  FROM (VALUES
+    -- Negative controls: these must not change.
+    ('core type + typmod', 'SELECT c_second::varchar(10) FROM zsec_c'),
+    ('core collation',     'SELECT c_second < (''x'' COLLATE "C") FROM zsec_c'),
+    ('core array type',    'SELECT c_first = ANY (ARRAY[1,2]) FROM zsec_c'),
+    -- User-defined types.  Each casts to a *different* type than the column's
+    -- own, because a cast to its own type is folded away and the fixture would
+    -- then pass having printed no type label at all.
+    ('user enum',          'SELECT c_enum2 = ''a''::zsec_t02.zsec_enum2 FROM zsec_c'),
+    ('user domain cast',   'SELECT c_first::zsec_t02.zsec_dom FROM zsec_c'),
+    ('user composite cast',
+     'SELECT ROW(c_first, c_second)::zsec_t02.zsec_pair FROM zsec_c'),
+    ('user collation',
+     'SELECT c_second < (''x'' COLLATE zsec_t02.zsec_coll2) FROM zsec_c'),
+    -- FR-40 again: one type reached twice yields one pseudonym.
+    ('same type twice',
+     'SELECT c_enum2 = ''a''::zsec_t02.zsec_enum2 OR c_enum2 = ''b''::zsec_t02.zsec_enum2 FROM zsec_c')
+  ) AS t(what, qry)
+ ORDER BY what COLLATE "C";
+
+-- The schema qualifier goes with the name: a user type never prints as
+-- "schema.ty1", because FR-11 drops schema names and there is nothing to qualify
+-- a generated name against.  Asserted rather than left to inspection.
+SELECT test_redact_deparse('SELECT c_first::zsec_t02.zsec_dom FROM zsec_c', true)
+         NOT LIKE '%zsec_t02%' AS user_type_not_schema_qualified;
+
 RESET search_path;
 DROP SCHEMA zsec_t02 CASCADE;
 DROP EXTENSION test_explain_redact;

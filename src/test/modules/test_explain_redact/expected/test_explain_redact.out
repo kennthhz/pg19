@@ -606,18 +606,18 @@ SELECT what,
     ('array / ANY',    'SELECT c_first = ANY (ARRAY[1,2,3]) FROM zsec_c')
   ) AS t(what, qry)
  ORDER BY what COLLATE "C";
-       what       |                      plain                      |                redacted                
-------------------+-------------------------------------------------+----------------------------------------
+       what       |                      plain                      |              redacted              
+------------------+-------------------------------------------------+------------------------------------
  NULL             | NULL::integer                                   | ?::integer
  array / ANY      | (zsec_c.c_first = ANY ('{1,2,3}'::integer[]))   | (t1.t1_c1 = ANY (?::integer[]))
  bool literals    | true, false                                     | ?::boolean, ?::boolean
- collated const   | (zsec_c.c_second < 'x'::text COLLATE zsec_coll) | (t1.t1_c2 < ?::text COLLATE zsec_coll)
+ collated const   | (zsec_c.c_second < 'x'::text COLLATE zsec_coll) | (t1.t1_c2 < ?::text COLLATE coll1)
  int              | (zsec_c.c_first + 5)                            | (t1.t1_c1 + ?::integer)
  int negative     | (zsec_c.c_first + '-5'::integer)                | (t1.t1_c1 + ?::integer)
  numeric float    | (zsec_c.c_third + 2.5)                          | (t1.t1_c3 + ?::numeric)
  numeric integral | (zsec_c.c_third + '7'::numeric)                 | (t1.t1_c3 + ?::numeric)
  text             | (zsec_c.c_second || 'secret'::text)             | (t1.t1_c2 || ?::text)
- user enum        | (zsec_c.c_kind = 'cash'::zsec_kind)             | (t1.t1_c5 = ?::zsec_kind)
+ user enum        | (zsec_c.c_kind = 'cash'::zsec_kind)             | (t1.t1_c5 = ?::ty1)
 (10 rows)
 
 --
@@ -722,9 +722,65 @@ SELECT test_redact_deparse(
  a1.relname, a2.a2_c2
 (1 row)
 
+--
+-- T11: type and collation names.
+--
+-- Same exemption rule as T10, applied to a different class of object.  Core type
+-- labels and core collations keep their names: "?::integer" can be diagnosed while
+-- "?::ty3" cannot, and neither "integer" nor COLLATE "C" discloses anything, being
+-- PostgreSQL's names.
+CREATE TYPE zsec_t02.zsec_enum2 AS ENUM ('a', 'b');
+CREATE DOMAIN zsec_t02.zsec_dom AS int CHECK (VALUE > 0);
+CREATE TYPE zsec_t02.zsec_pair AS (x int, y text);
+CREATE COLLATION zsec_t02.zsec_coll2 (locale = 'C');
+ALTER TABLE zsec_t02.zsec_c ADD COLUMN c_enum2 zsec_t02.zsec_enum2;
+SELECT what,
+       test_redact_deparse(qry, false) AS plain,
+       test_redact_deparse(qry, true)  AS redacted
+  FROM (VALUES
+    -- Negative controls: these must not change.
+    ('core type + typmod', 'SELECT c_second::varchar(10) FROM zsec_c'),
+    ('core collation',     'SELECT c_second < (''x'' COLLATE "C") FROM zsec_c'),
+    ('core array type',    'SELECT c_first = ANY (ARRAY[1,2]) FROM zsec_c'),
+    -- User-defined types.  Each casts to a *different* type than the column's
+    -- own, because a cast to its own type is folded away and the fixture would
+    -- then pass having printed no type label at all.
+    ('user enum',          'SELECT c_enum2 = ''a''::zsec_t02.zsec_enum2 FROM zsec_c'),
+    ('user domain cast',   'SELECT c_first::zsec_t02.zsec_dom FROM zsec_c'),
+    ('user composite cast',
+     'SELECT ROW(c_first, c_second)::zsec_t02.zsec_pair FROM zsec_c'),
+    ('user collation',
+     'SELECT c_second < (''x'' COLLATE zsec_t02.zsec_coll2) FROM zsec_c'),
+    -- FR-40 again: one type reached twice yields one pseudonym.
+    ('same type twice',
+     'SELECT c_enum2 = ''a''::zsec_t02.zsec_enum2 OR c_enum2 = ''b''::zsec_t02.zsec_enum2 FROM zsec_c')
+  ) AS t(what, qry)
+ ORDER BY what COLLATE "C";
+        what         |                                   plain                                    |                   redacted                   
+---------------------+----------------------------------------------------------------------------+----------------------------------------------
+ core array type     | (zsec_c.c_first = ANY ('{1,2}'::integer[]))                                | (t1.t1_c1 = ANY (?::integer[]))
+ core collation      | (zsec_c.c_second < 'x'::text COLLATE "C")                                  | (t1.t1_c2 < ?::text COLLATE "C")
+ core type + typmod  | (zsec_c.c_second)::character varying(10)                                   | (t1.t1_c2)::character varying(10)
+ same type twice     | ((zsec_c.c_enum2 = 'a'::zsec_enum2) OR (zsec_c.c_enum2 = 'b'::zsec_enum2)) | ((t1.t1_c6 = ?::ty1) OR (t1.t1_c6 = ?::ty1))
+ user collation      | (zsec_c.c_second < 'x'::text COLLATE zsec_coll2)                           | (t1.t1_c2 < ?::text COLLATE coll1)
+ user composite cast | ROW(zsec_c.c_first, zsec_c.c_second)::zsec_pair                            | ROW(t1.t1_c1, t1.t1_c2)::ty1
+ user domain cast    | (zsec_c.c_first)::zsec_dom                                                 | (t1.t1_c1)::ty1
+ user enum           | (zsec_c.c_enum2 = 'a'::zsec_enum2)                                         | (t1.t1_c6 = ?::ty1)
+(8 rows)
+
+-- The schema qualifier goes with the name: a user type never prints as
+-- "schema.ty1", because FR-11 drops schema names and there is nothing to qualify
+-- a generated name against.  Asserted rather than left to inspection.
+SELECT test_redact_deparse('SELECT c_first::zsec_t02.zsec_dom FROM zsec_c', true)
+         NOT LIKE '%zsec_t02%' AS user_type_not_schema_qualified;
+ user_type_not_schema_qualified 
+--------------------------------
+ t
+(1 row)
+
 RESET search_path;
 DROP SCHEMA zsec_t02 CASCADE;
-NOTICE:  drop cascades to 9 other objects
+NOTICE:  drop cascades to 13 other objects
 DETAIL:  drop cascades to table zsec_t02.zsec_a
 drop cascades to table zsec_t02.zsec_b
 drop cascades to table zsec_t02.zsec_rt
@@ -734,4 +790,8 @@ drop cascades to collation zsec_t02.zsec_coll
 drop cascades to function zsec_t02.zsec_fn(integer)
 drop cascades to function zsec_t02.zsec_opfn(integer,integer)
 drop cascades to operator zsec_t02.###(integer,integer)
+drop cascades to type zsec_t02.zsec_enum2
+drop cascades to type zsec_t02.zsec_dom
+drop cascades to type zsec_t02.zsec_pair
+drop cascades to collation zsec_t02.zsec_coll2
 DROP EXTENSION test_explain_redact;

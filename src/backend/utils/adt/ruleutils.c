@@ -531,11 +531,13 @@ static void get_const_expr(Const *constval, deparse_context *context,
 static void get_const_collation(Const *constval, deparse_context *context);
 static void get_json_format(JsonFormat *format, StringInfo buf);
 static void get_json_returning(JsonReturning *returning, StringInfo buf,
-							   bool json_format_by_default);
+							   bool json_format_by_default,
+							   struct RedactCtx *redact);
 static void get_json_constructor(JsonConstructorExpr *ctor,
 								 deparse_context *context, bool showimplicit);
 static void get_json_constructor_options(JsonConstructorExpr *ctor,
-										 StringInfo buf);
+										 StringInfo buf,
+										 struct RedactCtx *redact);
 static void get_json_agg_constructor(JsonConstructorExpr *ctor,
 									 deparse_context *context,
 									 const char *funcname,
@@ -577,6 +579,9 @@ static char *generate_function_name(Oid funcid, int nargs,
 									struct RedactCtx *redact);
 static char *generate_operator_name(Oid operid, Oid arg1, Oid arg2,
 									struct RedactCtx *redact);
+static char *redact_format_type(Oid typid, int32 typmod,
+								struct RedactCtx *redact);
+static char *redact_collation_name(Oid collid, struct RedactCtx *redact);
 static void add_cast_to(StringInfo buf, Oid typid);
 static char *generate_qualified_type_name(Oid typid);
 static text *string_to_text(char *str);
@@ -8200,8 +8205,8 @@ get_variable(Var *var, int levelsup, bool istoplevel, deparse_context *context)
 		appendStringInfoChar(buf, '*');
 		if (istoplevel)
 			appendStringInfo(buf, "::%s",
-							 format_type_with_typemod(var->vartype,
-													  var->vartypmod));
+							 redact_format_type(var->vartype,
+												var->vartypmod, context->redact));
 	}
 
 	return attname;
@@ -9801,8 +9806,8 @@ get_rule_expr(Node *node, deparse_context *context,
 				if (IsA(arg2, SubLink) &&
 					((SubLink *) arg2)->subLinkType == EXPR_SUBLINK)
 					appendStringInfo(buf, "::%s",
-									 format_type_with_typemod(exprType(arg2),
-															  exprTypmod(arg2)));
+									 redact_format_type(exprType(arg2),
+														exprTypmod(arg2), context->redact));
 				appendStringInfoChar(buf, ')');
 				if (!PRETTY_PAREN(context))
 					appendStringInfoChar(buf, ')');
@@ -10150,7 +10155,7 @@ get_rule_expr(Node *node, deparse_context *context,
 					appendStringInfoChar(buf, '(');
 				get_rule_expr_paren(arg, context, showimplicit, node);
 				appendStringInfo(buf, " COLLATE %s",
-								 generate_collation_name(collate->collOid));
+								 redact_collation_name(collate->collOid, context->redact));
 				if (!PRETTY_PAREN(context))
 					appendStringInfoChar(buf, ')');
 			}
@@ -10246,7 +10251,7 @@ get_rule_expr(Node *node, deparse_context *context,
 				 */
 				if (arrayexpr->elements == NIL)
 					appendStringInfo(buf, "::%s",
-									 format_type_with_typemod(arrayexpr->array_typeid, -1));
+									 redact_format_type(arrayexpr->array_typeid, -1, context->redact));
 			}
 			break;
 
@@ -10308,7 +10313,7 @@ get_rule_expr(Node *node, deparse_context *context,
 				appendStringInfoChar(buf, ')');
 				if (rowexpr->row_format == COERCE_EXPLICIT_CAST)
 					appendStringInfo(buf, "::%s",
-									 format_type_with_typemod(rowexpr->row_typeid, -1));
+									 redact_format_type(rowexpr->row_typeid, -1, context->redact));
 			}
 			break;
 
@@ -10576,8 +10581,8 @@ get_rule_expr(Node *node, deparse_context *context,
 				if (xexpr->op == IS_XMLSERIALIZE)
 				{
 					appendStringInfo(buf, " AS %s",
-									 format_type_with_typemod(xexpr->type,
-															  xexpr->typmod));
+									 redact_format_type(xexpr->type,
+														xexpr->typmod, context->redact));
 					if (xexpr->indent)
 						appendStringInfoString(buf, " INDENT");
 					else
@@ -10769,7 +10774,7 @@ get_rule_expr(Node *node, deparse_context *context,
 
 				if (iexpr->infercollid)
 					appendStringInfo(buf, " COLLATE %s",
-									 generate_collation_name(iexpr->infercollid));
+									 redact_collation_name(iexpr->infercollid, context->redact));
 
 				/* Add the operator class name, if not default */
 				if (iexpr->inferopclass)
@@ -10954,7 +10959,7 @@ get_rule_expr(Node *node, deparse_context *context,
 				if (jexpr->op != JSON_EXISTS_OP ||
 					jexpr->returning->typid != BOOLOID)
 					get_json_returning(jexpr->returning, context->buf,
-									   jexpr->op == JSON_QUERY_OP);
+									   jexpr->op == JSON_QUERY_OP, context->redact);
 
 				get_json_expr_options(jexpr, context,
 									  jexpr->op != JSON_EXISTS_OP ?
@@ -11063,8 +11068,8 @@ get_rule_expr_funccall(Node *node, deparse_context *context,
 		/* no point in showing any top-level implicit cast */
 		get_rule_expr(node, context, false);
 		appendStringInfo(buf, " AS %s)",
-						 format_type_with_typemod(exprType(node),
-												  exprTypmod(node)));
+						 redact_format_type(exprType(node),
+											exprTypmod(node), context->redact));
 	}
 }
 
@@ -11814,12 +11819,68 @@ get_coercion_expr(Node *arg, deparse_context *context,
 	/*
 	 * Never emit resulttype(arg) functional notation. A pg_proc entry could
 	 * take precedence, and a resulttype in pg_temp would require schema
-	 * qualification that format_type_with_typemod() would usually omit. We've
-	 * standardized on arg::resulttype, but CAST(arg AS resulttype) notation
-	 * would work fine.
+	 * qualification that redact_format_type(, context->redact) would usually
+	 * omit. We've standardized on arg::resulttype, but CAST(arg AS
+	 * resulttype) notation would work fine.
 	 */
 	appendStringInfo(buf, "::%s",
-					 format_type_with_typemod(resulttype, resulttypmod));
+					 redact_format_type(resulttype, resulttypmod, context->redact));
+}
+
+/*
+ * redact_format_type
+ *		format_type_with_typemod(), with a user-defined type replaced by its
+ *		pseudonym.
+ *
+ * One helper rather than an edit at each of the fifteen places the expression
+ * path prints a type, so the rule lives in one readable spot and a site added
+ * later is a one-word change.
+ *
+ * Core type labels are kept, for the same reason built-in function names are
+ * (FR-20 covers user-defined types only).  A cast printed as "?::ty3" instead of
+ * "?::integer" would tell a reader nothing, and "integer" discloses nothing --
+ * it is PostgreSQL's name, and a reader who could not look it up would be no
+ * better off.
+ *
+ * The typmod goes with the pseudonym: there is no "ty1(10)".  A pseudonym stands
+ * for the type as an object, and a length or precision is a property of the
+ * declaration rather than of the name.  Exempt types keep theirs, so
+ * "character varying(10)" still prints in full.
+ *
+ * One consequence worth knowing: an array of a user-defined type has its own OID
+ * in the user's schema, so it redacts to a plain "ty1" and the reader loses the
+ * fact that it was an array.  An array of a core type keeps "integer[]" because
+ * the array type is in pg_catalog too.
+ */
+static char *
+redact_format_type(Oid typid, int32 typmod, struct RedactCtx *redact)
+{
+	if (redact != NULL && !explain_redact_exempt(redact, REDACT_TYPE, typid))
+		return pstrdup(explain_redact_name(redact, REDACT_TYPE, typid));
+
+	return format_type_with_typemod(typid, typmod);
+}
+
+/*
+ * redact_collation_name
+ *		generate_collation_name(), with a user-defined collation replaced by its
+ *		pseudonym.
+ *
+ * A helper rather than a new parameter on generate_collation_name(), which is
+ * exported and has callers outside the expression path that must not change.
+ *
+ * Core collations keep their names.  "COLLATE \"C\"" and "COLLATE \"en_US\"" are
+ * PostgreSQL's, and a sort whose collation had become "coll2" would be harder to
+ * diagnose for no gain.
+ */
+static char *
+redact_collation_name(Oid collid, struct RedactCtx *redact)
+{
+	if (redact != NULL &&
+		!explain_redact_exempt(redact, REDACT_COLLATION, collid))
+		return pstrdup(explain_redact_name(redact, REDACT_COLLATION, collid));
+
+	return generate_collation_name(collid);
 }
 
 /* ----------
@@ -11888,8 +11949,8 @@ get_const_expr(Const *constval, deparse_context *context, int showtype)
 		if (showtype >= 0)
 		{
 			appendStringInfo(buf, "::%s",
-							 format_type_with_typemod(constval->consttype,
-													  constval->consttypmod));
+							 redact_format_type(constval->consttype,
+												constval->consttypmod, context->redact));
 			get_const_collation(constval, context);
 		}
 		return;
@@ -11905,8 +11966,8 @@ get_const_expr(Const *constval, deparse_context *context, int showtype)
 		if (showtype >= 0)
 		{
 			appendStringInfo(buf, "::%s",
-							 format_type_with_typemod(constval->consttype,
-													  constval->consttypmod));
+							 redact_format_type(constval->consttype,
+												constval->consttypmod, context->redact));
 			get_const_collation(constval, context);
 		}
 		return;
@@ -12007,8 +12068,8 @@ get_const_expr(Const *constval, deparse_context *context, int showtype)
 	}
 	if (needlabel || showtype > 0)
 		appendStringInfo(buf, "::%s",
-						 format_type_with_typemod(constval->consttype,
-												  constval->consttypmod));
+						 redact_format_type(constval->consttype,
+											constval->consttypmod, context->redact));
 
 	get_const_collation(constval, context);
 }
@@ -12028,7 +12089,7 @@ get_const_collation(Const *constval, deparse_context *context)
 		if (constval->constcollid != typcollation)
 		{
 			appendStringInfo(buf, " COLLATE %s",
-							 generate_collation_name(constval->constcollid));
+							 redact_collation_name(constval->constcollid, context->redact));
 		}
 	}
 }
@@ -12075,14 +12136,14 @@ get_json_format(JsonFormat *format, StringInfo buf)
  */
 static void
 get_json_returning(JsonReturning *returning, StringInfo buf,
-				   bool json_format_by_default)
+				   bool json_format_by_default, struct RedactCtx *redact)
 {
 	if (!OidIsValid(returning->typid))
 		return;
 
 	appendStringInfo(buf, " RETURNING %s",
-					 format_type_with_typemod(returning->typid,
-											  returning->typmod));
+					 redact_format_type(returning->typid,
+										returning->typmod, redact));
 
 	if (!json_format_by_default ||
 		returning->format->format_type !=
@@ -12125,7 +12186,7 @@ get_json_constructor(JsonConstructorExpr *ctor, deparse_context *context,
 					  context->redact);
 
 		get_json_format(ctor->format, buf);
-		get_json_constructor_options(ctor, buf);
+		get_json_constructor_options(ctor, buf, context->redact);
 		appendStringInfoChar(buf, ')');
 
 		return;
@@ -12169,7 +12230,7 @@ get_json_constructor(JsonConstructorExpr *ctor, deparse_context *context,
 		get_rule_expr((Node *) lfirst(lc), context, true);
 	}
 
-	get_json_constructor_options(ctor, buf);
+	get_json_constructor_options(ctor, buf, context->redact);
 	appendStringInfoChar(buf, ')');
 }
 
@@ -12177,7 +12238,8 @@ get_json_constructor(JsonConstructorExpr *ctor, deparse_context *context,
  * Append options, if any, to the JSON constructor being deparsed
  */
 static void
-get_json_constructor_options(JsonConstructorExpr *ctor, StringInfo buf)
+get_json_constructor_options(JsonConstructorExpr *ctor, StringInfo buf,
+							 struct RedactCtx *redact)
 {
 	if (ctor->absent_on_null)
 	{
@@ -12200,7 +12262,7 @@ get_json_constructor_options(JsonConstructorExpr *ctor, StringInfo buf)
 	 * support one.
 	 */
 	if (ctor->type != JSCTOR_JSON_PARSE && ctor->type != JSCTOR_JSON_SCALAR)
-		get_json_returning(ctor->returning, buf, true);
+		get_json_returning(ctor->returning, buf, true, redact);
 }
 
 /*
@@ -12213,7 +12275,7 @@ get_json_agg_constructor(JsonConstructorExpr *ctor, deparse_context *context,
 	StringInfoData options;
 
 	initStringInfo(&options);
-	get_json_constructor_options(ctor, &options);
+	get_json_constructor_options(ctor, &options, context->redact);
 
 	if (IsA(ctor->func, Aggref))
 		get_agg_expr_helper((Aggref *) ctor->func, context,
@@ -12484,7 +12546,7 @@ get_xmltable(TableFunc *tf, deparse_context *context, bool showimplicit)
 
 			appendStringInfo(buf, "%s %s", quote_identifier(colname),
 							 ordinality ? "FOR ORDINALITY" :
-							 format_type_with_typemod(typid, typmod));
+							 redact_format_type(typid, typmod, context->redact));
 			if (ordinality)
 				continue;
 
@@ -12681,7 +12743,7 @@ get_json_table_columns(TableFunc *tf, JsonTablePathScan *scan,
 
 		appendStringInfo(buf, "%s %s", quote_identifier(colname),
 						 ordinality ? "FOR ORDINALITY" :
-						 format_type_with_typemod(typid, typmod));
+						 redact_format_type(typid, typmod, context->redact));
 		if (ordinality)
 			continue;
 
@@ -13405,11 +13467,11 @@ get_from_clause_coldeflist(RangeTblFunction *rtfunc,
 			appendStringInfoString(buf, ", ");
 		appendStringInfo(buf, "%s %s",
 						 quote_identifier(attname),
-						 format_type_with_typemod(atttypid, atttypmod));
+						 redact_format_type(atttypid, atttypmod, context->redact));
 		if (OidIsValid(attcollation) &&
 			attcollation != get_typcollation(atttypid))
 			appendStringInfo(buf, " COLLATE %s",
-							 generate_collation_name(attcollation));
+							 redact_collation_name(attcollation, context->redact));
 
 		i++;
 	}
