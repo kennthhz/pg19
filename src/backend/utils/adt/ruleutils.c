@@ -11811,6 +11811,55 @@ get_const_expr(Const *constval, deparse_context *context, int showtype)
 	char	   *extval;
 	bool		needlabel = false;
 
+	/*
+	 * Under redaction the value is replaced by a placeholder, and the type
+	 * label is kept so a reader can still tell what kind of comparison a plan
+	 * is doing (FR-21).
+	 *
+	 * No value class is exempt, NULL included.  That is not over-caution: a
+	 * NULL literal in a plan asserts something about real rows -- that the
+	 * query tested for their absence -- and "?" versus "NULL" is exactly the
+	 * distinction that would give it away.  true and false go the same way.
+	 * Treating every constant alike also means the redacted form cannot be
+	 * used to classify the original (D6).
+	 *
+	 * Returning here rather than further down matters twice over.  The type's
+	 * output function is never called, so a sensitive value is never rendered
+	 * into a buffer only to be discarded, and a user-defined output function
+	 * -- which may run arbitrary code -- is never invoked on it.  Same
+	 * reasoning as the parameter list in ExplainQueryParameters().
+	 *
+	 * The label is emitted whenever the caller permits one, and deliberately
+	 * without consulting "needlabel".  The unredacted rule below decides that
+	 * from the value: a negative int4 prints as '-5'::integer while a
+	 * positive one prints as 5, and a numeric gets a cast unless it looks
+	 * like a float. Keeping that rule would have let the presence or absence
+	 * of "::integer" disclose the sign of a value that had just been replaced
+	 * precisely so it would not be disclosed.
+	 *
+	 * showtype == -1 still means "no label", because the caller prints the
+	 * type itself and a cast inserted here would land in the middle of its
+	 * output. The type information survives either way.
+	 *
+	 * The type and collation names printed below are still the real ones;
+	 * they are separate objects with their own requirement (FR-20) and are
+	 * pseudonymized in T11.  Nothing is exposed in the meantime, since
+	 * EXPLAIN suppresses expressions entirely until T21.
+	 */
+	if (context->redact != NULL)
+	{
+		appendStringInfoChar(buf, '?');
+
+		if (showtype >= 0)
+		{
+			appendStringInfo(buf, "::%s",
+							 format_type_with_typemod(constval->consttype,
+													  constval->consttypmod));
+			get_const_collation(constval, context);
+		}
+		return;
+	}
+
 	if (constval->constisnull)
 	{
 		/*

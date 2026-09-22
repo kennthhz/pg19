@@ -404,6 +404,61 @@ SELECT test_redact_deparse(
          'UPDATE zsec_c SET c_third = 0 RETURNING WITH (OLD AS o, NEW AS n) o.c_third, n.c_third',
          true) AS redacted_returning;
 
+--
+-- T09: constants become a placeholder plus the type label.
+--
+CREATE TYPE zsec_t02.zsec_kind AS ENUM ('cash', 'card');
+CREATE COLLATION zsec_t02.zsec_coll (locale = 'C');
+ALTER TABLE zsec_t02.zsec_c ADD COLUMN c_bool bool;
+ALTER TABLE zsec_t02.zsec_c ADD COLUMN c_kind zsec_t02.zsec_kind;
+
+SELECT what,
+       test_redact_deparse(qry, false) AS plain,
+       test_redact_deparse(qry, true)  AS redacted
+  FROM (VALUES
+    ('int',            'SELECT c_first + 5 FROM zsec_c'),
+    -- The pair that matters most.  Unredacted, a negative int4 prints as
+    -- '-5'::integer while a positive one prints as 5, so the cast itself tells a
+    -- reader the sign.  Both must redact to the same thing, or replacing the
+    -- value would have been pointless.
+    ('int negative',   'SELECT c_first + (-5) FROM zsec_c'),
+    ('numeric float',  'SELECT c_third + 2.5 FROM zsec_c'),
+    -- Same idea for numeric: a float-looking literal needs no cast, an integral
+    -- one does.
+    ('numeric integral', 'SELECT c_third + 7 FROM zsec_c'),
+    ('text',           'SELECT c_second || ''secret'' FROM zsec_c'),
+    -- FR-21 and D6: no value class is exempt.  A NULL in a plan asserts that the
+    -- query tested real rows for absence, and true/false are data as much as any
+    -- other literal.  All three must be indistinguishable from each other and
+    -- from an ordinary value of the same type.
+    ('NULL',           'SELECT c_first + NULL::int FROM zsec_c'),
+    ('bool literals',  'SELECT true, false FROM zsec_c'),
+    ('user enum',      'SELECT c_kind = ''cash''::zsec_t02.zsec_kind FROM zsec_c'),
+    ('collated const', 'SELECT c_second < (''x'' COLLATE zsec_t02.zsec_coll) FROM zsec_c'),
+    -- The whole array constant is replaced, not its elements.
+    ('array / ANY',    'SELECT c_first = ANY (ARRAY[1,2,3]) FROM zsec_c')
+  ) AS t(what, qry)
+ ORDER BY what COLLATE "C";
+
+--
+-- showtype = -1: the caller prints the type itself, so no cast may be inserted
+-- here -- one would land in the middle of the caller's syntax.  JSON_QUERY shows
+-- both modes at once: its context item is a labelled constant, its path spec is
+-- not.
+SELECT test_redact_deparse(
+         'SELECT JSON_QUERY(''{"a":1}''::jsonb, ''$.a'') FROM zsec_c', false)
+         AS plain_json_query;
+SELECT test_redact_deparse(
+         'SELECT JSON_QUERY(''{"a":1}''::jsonb, ''$.a'') FROM zsec_c', true)
+         AS redacted_json_query;
+
+-- Not covered here, and deliberately: the remaining showtype = -1 callers are
+-- get_values_def(), which prints a VALUES list's rows, and
+-- get_range_partbound_string(), which prints a partition bound.  Neither is
+-- reachable from a plan -- EXPLAIN prints no VALUES rows and no partition bounds
+-- -- and the second zeroes its own deparse context, so it never carries the
+-- handle.  Both are noted in ruleutils.c at the point where it would matter.
+
 RESET search_path;
 DROP SCHEMA zsec_t02 CASCADE;
 DROP EXTENSION test_explain_redact;

@@ -581,7 +581,24 @@ test_redact_deparse(PG_FUNCTION_ARGS)
 	StringInfoData buf;
 	ListCell   *lc;
 	char	   *result;
+	MemoryContext caller_cxt = CurrentMemoryContext;
+	MemoryContext oldcxt;
 
+	/*
+	 * The caller's context is captured before connecting, because
+	 * SPI_connect() switches CurrentMemoryContext to a context of its own and
+	 * SPI_finish() frees it.  Anything palloc'd in between -- including the
+	 * finished string -- dies there, so the result has to be copied out
+	 * before finishing.
+	 *
+	 * This was got wrong first time round, and the failure is worth
+	 * describing because it did not look like a memory bug.  Returning the
+	 * freed pointer mostly appeared to work, since nothing had reused the
+	 * memory yet; roughly one query in three came back as several hundred
+	 * bytes of stale heap that psql rendered as an empty string.  A test that
+	 * reads freed memory can agree with its expected output indefinitely and
+	 * then stop.
+	 */
 	if (SPI_connect() != SPI_OK_CONNECT)
 		elog(ERROR, "SPI_connect failed");
 
@@ -621,7 +638,10 @@ test_redact_deparse(PG_FUNCTION_ARGS)
 														   false, ctx));
 	}
 
+	/* Copy out to the caller's context, which outlives SPI_finish() */
+	oldcxt = MemoryContextSwitchTo(caller_cxt);
 	result = pstrdup(buf.data);
+	MemoryContextSwitchTo(oldcxt);
 
 	if (ctx != NULL)
 		explain_redact_destroy(ctx);
