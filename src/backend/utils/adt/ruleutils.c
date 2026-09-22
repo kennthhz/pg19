@@ -38,6 +38,7 @@
 #include "catalog/pg_trigger.h"
 #include "catalog/pg_type.h"
 #include "commands/defrem.h"
+#include "commands/explain_redact.h"
 #include "commands/tablespace.h"
 #include "common/keywords.h"
 #include "executor/spi.h"
@@ -4077,6 +4078,52 @@ set_rtable_names(deparse_namespace *dpns, List *parent_namespaces,
 		{
 			/* Otherwise use whatever the parser assigned */
 			refname = rte->eref->aliasname;
+		}
+
+		/*
+		 * Under redaction, replace whichever of the four names above was
+		 * chosen with a pseudonym.
+		 *
+		 * This has to happen here rather than after the loop, and the reason
+		 * is the uniquifier immediately below: it appends _1, _2 to break
+		 * ties between colliding names.  Substituting afterwards would either
+		 * collide with an already-assigned pseudonym or leave a name like
+		 * "t1_1", which carries a fragment of nothing and invites the reader
+		 * to think the suffix means something.  Substituting first makes the
+		 * uniquifier a no-op, because generated names cannot collide (FR-47).
+		 *
+		 * Two different pseudonym kinds, and the split is what keeps this
+		 * consistent with the relation name printed separately by
+		 * ExplainTargetRel:
+		 *
+		 * A relation with no alias is keyed by its OID, so it gets the same
+		 * "tN" that its object name will get.  EXPLAIN prints the reference
+		 * name only when it differs from the object name, so keying it any
+		 * other way would make "Seq Scan on customers" become "Seq Scan on t1
+		 * a1" -- a change in shape rather than in content.
+		 *
+		 * Everything else is keyed by range-table index, because there is
+		 * nothing else to key it by: a subquery, join, VALUES, function, CTE
+		 * or tuplestore RTE has no relid at all.  A user-written alias goes
+		 * here too even when the RTE is a relation, because the alias is the
+		 * user's own word and not the table's name.
+		 *
+		 * refname stays NULL where it is already NULL -- an unreferenced RTE
+		 * or an unnamed join -- since those print nothing and there is
+		 * nothing to disclose.
+		 */
+		if (dpns->redact != NULL && refname != NULL)
+		{
+			if (rte->alias == NULL && rte->rtekind == RTE_RELATION)
+				refname = unconstify(char *,
+									 explain_redact_name(dpns->redact,
+														 REDACT_RELATION,
+														 rte->relid));
+			else
+				refname = unconstify(char *,
+									 explain_redact_local(dpns->redact,
+														  REDACT_ALIAS,
+														  rtindex, 0));
 		}
 
 		/*

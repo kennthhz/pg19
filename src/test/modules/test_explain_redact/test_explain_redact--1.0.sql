@@ -41,3 +41,7 @@ CREATE FUNCTION test_explain_state_redact_defaults()
 RETURNS text
 AS 'MODULE_PATHNAME', 'test_explain_state_redact_defaults'
 LANGUAGE C STRICT;
+CREATE FUNCTION test_redact_rtable_names(relid oid, redact boolean, collide boolean)
+RETURNS text[]
+AS 'MODULE_PATHNAME', 'test_redact_rtable_names'
+LANGUAGE C STRICT;

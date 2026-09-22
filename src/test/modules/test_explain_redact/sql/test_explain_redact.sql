@@ -248,5 +248,44 @@ SELECT test_redact_local_seq(ARRAY['alias', NULL], ARRAY[1, 1], ARRAY[0, 0]);
 -- in redacts nothing and holds no pseudonym map.
 --
 SELECT test_explain_state_redact_defaults() AS fresh_state;
+--
+-- T07: relation aliases assigned by set_rtable_names().
+--
+-- Nothing in EXPLAIN output changes yet, so the assignment is observed by asking
+-- for it directly.  The range table is built in C and covers all four branches
+-- plus the RTE kinds that have no relid, which is the reason the alias key cannot
+-- be an OID.
+--
+-- Order of entries: relation without alias, relation with a user alias, unnamed
+-- join, subquery, function scan, VALUES.
+CREATE TABLE zsec_t02.zsec_rt (c int);
+
+-- Unredacted, for contrast: real names, and NULL for the unnamed join.
+SELECT test_redact_rtable_names('zsec_t02.zsec_rt'::regclass, false, false)
+         AS plain_names;
+
+-- Redacted.  The unaliased relation is keyed by OID and so must read "t1", which
+-- is what keeps it equal to the object name ExplainTargetRel will print -- had it
+-- been keyed by range-table index, "Seq Scan on customers" would have become
+-- "Seq Scan on t1 a1", a change of shape rather than of content.
+--
+-- Everything else is keyed by range-table index and so reads "aN".  The unnamed
+-- join stays NULL: it prints nothing either way and has nothing to disclose.
+SELECT test_redact_rtable_names('zsec_t02.zsec_rt'::regclass, true, false)
+         AS redacted_names;
+
+--
+-- FR-47: the uniquifier must become a no-op.
+--
+-- Two entries whose chosen names are identical.  Unredacted, set_rtable_names()
+-- appends "_1" to the second.  Redacted, both must come back as distinct
+-- pseudonyms with no suffix -- a name like "a1_1" would mean the substitution
+-- happened after the tie-breaking rather than before it, and would carry a
+-- fragment of a real name's disambiguation into a redacted record.
+SELECT test_redact_rtable_names('zsec_t02.zsec_rt'::regclass, false, true)
+         AS plain_collision;
+SELECT test_redact_rtable_names('zsec_t02.zsec_rt'::regclass, true, true)
+         AS redacted_collision;
+
 DROP SCHEMA zsec_t02 CASCADE;
 DROP EXTENSION test_explain_redact;
