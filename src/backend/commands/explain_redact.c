@@ -537,6 +537,32 @@ redact_column_name(RedactCtx *ctx, const char *qualifier, int scope,
  * range-table index.  Passing the string that will actually be printed removes
  * the possibility of the two being derived differently.
  */
+/*
+ * Report whether an object would be printed under its real name.
+ *
+ * Exists so a caller can choose between two whole code paths rather than
+ * post-processing a name it has already been given.  generate_relation_name()
+ * and friends do more than emit a name: they decide whether to schema-qualify
+ * it, and whether to wrap an operator in OPERATOR(...).  An exempt object must
+ * keep all of that, while a pseudonym must have none of it -- a schema qualifier
+ * on "t1" would disclose the schema that FR-11 drops, and there is nothing to
+ * qualify a generated name against.
+ *
+ * Inferring this by comparing the returned name against the real one would
+ * almost work and fail rarely: a table genuinely called "t1" would be taken for
+ * a pseudonym.  Asking directly costs one syscache lookup on first use, and
+ * explain_redact_name() caches the same answer, so a plan naming one relation
+ * from twenty sites still pays once.
+ */
+bool
+explain_redact_exempt(RedactCtx *ctx, RedactKind kind, Oid oid)
+{
+	Assert(ctx != NULL);
+	Assert(kind >= 0 && kind < REDACT_NKINDS);
+
+	return redact_is_exempt(ctx, kind, oid);
+}
+
 const char *
 explain_redact_column(RedactCtx *ctx, const char *qualifier,
 					  int varno, int attno)

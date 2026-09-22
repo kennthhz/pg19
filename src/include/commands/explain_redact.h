@@ -135,6 +135,15 @@ extern const char *explain_redact_column(RedactCtx *ctx, const char *qualifier,
 										 int varno, int attno);
 
 /*
+ * Whether an object is exempt, and so would be printed under its real name.
+ *
+ * For callers that must choose between two code paths rather than between two
+ * strings -- deparsing a relation or an operator also decides on schema
+ * qualification, which a pseudonym must not carry.
+ */
+extern bool explain_redact_exempt(RedactCtx *ctx, RedactKind kind, Oid oid);
+
+/*
  * Tripwire (§2.1 of the task plan).  In assert-enabled builds, aborts if the
  * given string contains a test marker while redaction is active, naming the
  * emission site.  A no-op when ctx is NULL, and compiled out entirely

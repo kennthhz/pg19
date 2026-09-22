@@ -567,13 +567,16 @@ static void get_opclass_name(Oid opclass, Oid actual_datatype,
 static Node *processIndirection(Node *node, deparse_context *context);
 static void printSubscripts(SubscriptingRef *sbsref, deparse_context *context);
 static char *get_relation_name(Oid relid);
-static char *generate_relation_name(Oid relid, List *namespaces);
+static char *generate_relation_name(Oid relid, List *namespaces,
+									struct RedactCtx *redact);
 static char *generate_qualified_relation_name(Oid relid);
 static char *generate_function_name(Oid funcid, int nargs,
 									List *argnames, Oid *argtypes,
 									bool has_variadic, bool *use_variadic_p,
-									bool inGroupBy);
-static char *generate_operator_name(Oid operid, Oid arg1, Oid arg2);
+									bool inGroupBy,
+									struct RedactCtx *redact);
+static char *generate_operator_name(Oid operid, Oid arg1, Oid arg2,
+									struct RedactCtx *redact);
 static void add_cast_to(StringInfo buf, Oid typid);
 static char *generate_qualified_type_name(Oid typid);
 static text *string_to_text(char *str);
@@ -1051,14 +1054,14 @@ pg_get_triggerdef_worker(Oid trigid, bool pretty)
 	 */
 	appendStringInfo(&buf, " ON %s ",
 					 pretty ?
-					 generate_relation_name(trigrec->tgrelid, NIL) :
+					 generate_relation_name(trigrec->tgrelid, NIL, NULL) :
 					 generate_qualified_relation_name(trigrec->tgrelid));
 
 	if (OidIsValid(trigrec->tgconstraint))
 	{
 		if (OidIsValid(trigrec->tgconstrrelid))
 			appendStringInfo(&buf, "FROM %s ",
-							 generate_relation_name(trigrec->tgconstrrelid, NIL));
+							 generate_relation_name(trigrec->tgconstrrelid, NIL, NULL));
 		if (!trigrec->tgdeferrable)
 			appendStringInfoString(&buf, "NOT ");
 		appendStringInfoString(&buf, "DEFERRABLE INITIALLY ");
@@ -1170,7 +1173,7 @@ pg_get_triggerdef_worker(Oid trigid, bool pretty)
 	appendStringInfo(&buf, "EXECUTE FUNCTION %s(",
 					 generate_function_name(trigrec->tgfoid, 0,
 											NIL, NULL,
-											false, NULL, false));
+											false, NULL, false, NULL));
 
 	if (trigrec->tgnargs > 0)
 	{
@@ -1426,7 +1429,7 @@ pg_get_indexdef_worker(Oid indexrelid, int colno,
 							 idxrelrec->relkind == RELKIND_PARTITIONED_INDEX
 							 && !inherits ? "ONLY " : "",
 							 (prettyFlags & PRETTYFLAG_SCHEMA) ?
-							 generate_relation_name(indrelid, NIL) :
+							 generate_relation_name(indrelid, NIL, NULL) :
 							 generate_qualified_relation_name(indrelid),
 							 quote_identifier(NameStr(amrec->amname)));
 		else					/* currently, must be EXCLUDE constraint */
@@ -1546,7 +1549,7 @@ pg_get_indexdef_worker(Oid indexrelid, int colno,
 				appendStringInfo(&buf, " WITH %s",
 								 generate_operator_name(excludeOps[keyno],
 														keycoltype,
-														keycoltype));
+														keycoltype, NULL));
 		}
 	}
 
@@ -1867,7 +1870,7 @@ pg_get_statisticsobj_worker(Oid statextid, bool columns_only, bool missing_ok)
 
 	if (!columns_only)
 		appendStringInfo(&buf, " FROM %s",
-						 generate_relation_name(statextrec->stxrelid, NIL));
+						 generate_relation_name(statextrec->stxrelid, NIL, NULL));
 
 	ReleaseSysCache(statexttup);
 
@@ -2325,7 +2328,7 @@ pg_get_constraintdef_worker(Oid constraintId, bool fullCommand,
 				/* add foreign relation name */
 				appendStringInfo(&buf, ") REFERENCES %s(",
 								 generate_relation_name(conForm->confrelid,
-														NIL));
+														NIL, NULL));
 
 				/* Fetch and build referenced-column list */
 				val = SysCacheGetAttrNotNull(CONSTROID, tup,
@@ -3082,7 +3085,7 @@ pg_get_functiondef(PG_FUNCTION_ARGS)
 		appendStringInfo(&buf, " SUPPORT %s",
 						 generate_function_name(proc->prosupport, 1,
 												NIL, argtypes,
-												false, NULL, false));
+												false, NULL, false, NULL));
 	}
 
 	if (oldlen != buf.len)
@@ -4755,8 +4758,23 @@ set_relation_column_names(deparse_namespace *dpns, RangeTblEntry *rte,
 			 * make_colname_unique(), so the tie-breaking below becomes a
 			 * no-op rather than appending a digit to a generated name
 			 * (FR-47).
+			 *
+			 * The columns of an exempt relation keep their real names, for
+			 * the same reason its own name is kept: they are PostgreSQL's
+			 * names rather than the application's, so withholding them
+			 * protects nothing and costs a great deal.  Without this a plan
+			 * over the system catalogs read "pg_class.pg_class_c2" instead of
+			 * "pg_class.relname" -- unreadable, and still disclosing the
+			 * attribute's position, which for a catalog table is public
+			 * knowledge anyway.
+			 *
+			 * Only RTE_RELATION can be tested this way: every other kind has
+			 * no catalog object behind it and so nothing to be exempt.
 			 */
-			if (dpns->redact != NULL)
+			if (dpns->redact != NULL &&
+				!(rte->rtekind == RTE_RELATION &&
+				  explain_redact_exempt(dpns->redact, REDACT_RELATION,
+										rte->relid)))
 			{
 				const char *qualifier = NULL;
 
@@ -5711,7 +5729,7 @@ make_ruledef(StringInfo buf, HeapTuple ruletup, TupleDesc rulettc,
 	/* The relation the rule is fired on */
 	appendStringInfo(buf, " TO %s",
 					 (prettyFlags & PRETTYFLAG_SCHEMA) ?
-					 generate_relation_name(ev_class, NIL) :
+					 generate_relation_name(ev_class, NIL, NULL) :
 					 generate_qualified_relation_name(ev_class));
 
 	/* If the rule has an event qualification, add it */
@@ -7015,7 +7033,7 @@ get_rule_orderby(List *orderList, List *targetList,
 			appendStringInfo(buf, " USING %s",
 							 generate_operator_name(srt->sortop,
 													sortcoltype,
-													sortcoltype));
+													sortcoltype, context->redact));
 			/* be specific to eliminate ambiguity */
 			if (srt->nulls_first)
 				appendStringInfoString(buf, " NULLS FIRST");
@@ -7274,7 +7292,7 @@ get_insert_query_def(Query *query, deparse_context *context)
 		appendStringInfoChar(buf, ' ');
 	}
 	appendStringInfo(buf, "INSERT INTO %s",
-					 generate_relation_name(rte->relid, NIL));
+					 generate_relation_name(rte->relid, NIL, context->redact));
 
 	/* Print the relation alias, if needed; INSERT requires explicit AS */
 	get_rte_alias(rte, query->resultRelation, true, context);
@@ -7474,7 +7492,7 @@ get_update_query_def(Query *query, deparse_context *context)
 	}
 	appendStringInfo(buf, "UPDATE %s%s",
 					 only_marker(rte),
-					 generate_relation_name(rte->relid, NIL));
+					 generate_relation_name(rte->relid, NIL, context->redact));
 
 	/* Print the FOR PORTION OF, if needed */
 	get_for_portion_of(query->forPortionOf, rte, context);
@@ -7681,7 +7699,7 @@ get_delete_query_def(Query *query, deparse_context *context)
 	}
 	appendStringInfo(buf, "DELETE FROM %s%s",
 					 only_marker(rte),
-					 generate_relation_name(rte->relid, NIL));
+					 generate_relation_name(rte->relid, NIL, context->redact));
 
 	/* Print the FOR PORTION OF, if needed */
 	get_for_portion_of(query->forPortionOf, rte, context);
@@ -7733,7 +7751,7 @@ get_merge_query_def(Query *query, deparse_context *context)
 	}
 	appendStringInfo(buf, "MERGE INTO %s%s",
 					 only_marker(rte),
-					 generate_relation_name(rte->relid, NIL));
+					 generate_relation_name(rte->relid, NIL, context->redact));
 
 	/* Print the relation alias, if needed */
 	get_rte_alias(rte, query->resultRelation, false, context);
@@ -9152,7 +9170,24 @@ get_simple_binary_op_name(OpExpr *expr)
 		Node	   *arg2 = (Node *) lsecond(args);
 		const char *op;
 
-		op = generate_operator_name(expr->opno, exprType(arg1), exprType(arg2));
+		/*
+		 * NULL, not the caller's redaction handle, and that is deliberate.
+		 *
+		 * This name is never printed.  It is classified by its first
+		 * character to work out operator precedence, and the caller only
+		 * proceeds if strlen(op) == 1.  A pseudonym such as "op1" would fail
+		 * that test, so passing the handle would change where parentheses are
+		 * placed -- which would make a redacted expression structurally
+		 * different from the same expression unredacted, and disclose whether
+		 * the operator was a single character.  Reading the real name here
+		 * discloses nothing, because nothing reaches the output.
+		 *
+		 * EXPLAIN does not reach this code in any case: it deparses with
+		 * prettyFlags == 0, and the caller requires PRETTYFLAG_PAREN.  The
+		 * argument above is what matters if that ever changes.
+		 */
+		op = generate_operator_name(expr->opno, exprType(arg1), exprType(arg2),
+									NULL);
 		if (strlen(op) == 1)
 			return op;
 	}
@@ -9747,7 +9782,7 @@ get_rule_expr(Node *node, deparse_context *context,
 				appendStringInfo(buf, " %s %s (",
 								 generate_operator_name(expr->opno,
 														exprType(arg1),
-														get_base_element_type(exprType(arg2))),
+														get_base_element_type(exprType(arg2)), context->redact),
 								 expr->useOr ? "ANY" : "ALL");
 				get_rule_expr_paren(arg2, context, true, node);
 
@@ -10300,7 +10335,7 @@ get_rule_expr(Node *node, deparse_context *context,
 				appendStringInfo(buf, ") %s ROW(",
 								 generate_operator_name(linitial_oid(rcexpr->opnos),
 														exprType(linitial(rcexpr->largs)),
-														exprType(linitial(rcexpr->rargs))));
+														exprType(linitial(rcexpr->rargs)), context->redact));
 				get_rule_list_toplevel(rcexpr->rargs, context, true);
 				appendStringInfoString(buf, "))");
 			}
@@ -10695,7 +10730,7 @@ get_rule_expr(Node *node, deparse_context *context,
 				appendStringInfoString(buf, "nextval(");
 				simple_quote_literal(buf,
 									 generate_relation_name(nvexpr->seqid,
-															NIL));
+															NIL, context->redact));
 				appendStringInfoChar(buf, ')');
 			}
 			break;
@@ -11085,7 +11120,7 @@ get_oper_expr(OpExpr *expr, deparse_context *context)
 		appendStringInfo(buf, " %s ",
 						 generate_operator_name(opno,
 												exprType(arg1),
-												exprType(arg2)));
+												exprType(arg2), context->redact));
 		get_rule_expr_paren(arg2, context, true, (Node *) expr);
 	}
 	else
@@ -11096,7 +11131,7 @@ get_oper_expr(OpExpr *expr, deparse_context *context)
 		appendStringInfo(buf, "%s ",
 						 generate_operator_name(opno,
 												InvalidOid,
-												exprType(arg)));
+												exprType(arg), context->redact));
 		get_rule_expr_paren(arg, context, true, (Node *) expr);
 	}
 	if (!PRETTY_PAREN(context))
@@ -11186,7 +11221,7 @@ get_func_expr(FuncExpr *expr, deparse_context *context,
 											argnames, argtypes,
 											expr->funcvariadic,
 											&use_variadic,
-											context->inGroupBy));
+											context->inGroupBy, context->redact));
 	nargs = 0;
 	foreach(l, expr->args)
 	{
@@ -11256,7 +11291,7 @@ get_agg_expr_helper(Aggref *aggref, deparse_context *context,
 		funcname = generate_function_name(aggref->aggfnoid, nargs, NIL,
 										  argtypes, aggref->aggvariadic,
 										  &use_variadic,
-										  context->inGroupBy);
+										  context->inGroupBy, context->redact);
 
 	/* Print the aggregate name, schema-qualified if needed */
 	appendStringInfo(buf, "%s(%s", funcname,
@@ -11397,7 +11432,7 @@ get_windowfunc_expr_helper(WindowFunc *wfunc, deparse_context *context,
 	if (!funcname)
 		funcname = generate_function_name(wfunc->winfnoid, nargs, argnames,
 										  argtypes, false, NULL,
-										  context->inGroupBy);
+										  context->inGroupBy, context->redact);
 
 	appendStringInfo(buf, "%s(", funcname);
 
@@ -12281,7 +12316,7 @@ get_sublink_expr(SubLink *sublink, deparse_context *context)
 			get_rule_expr(linitial(opexpr->args), context, true);
 			opname = generate_operator_name(opexpr->opno,
 											exprType(linitial(opexpr->args)),
-											exprType(lsecond(opexpr->args)));
+											exprType(lsecond(opexpr->args)), context->redact);
 		}
 		else if (IsA(sublink->testexpr, BoolExpr))
 		{
@@ -12300,7 +12335,7 @@ get_sublink_expr(SubLink *sublink, deparse_context *context)
 				if (!opname)
 					opname = generate_operator_name(opexpr->opno,
 													exprType(linitial(opexpr->args)),
-													exprType(lsecond(opexpr->args)));
+													exprType(lsecond(opexpr->args)), context->redact);
 				sep = ", ";
 			}
 			appendStringInfoChar(buf, ')');
@@ -12314,7 +12349,7 @@ get_sublink_expr(SubLink *sublink, deparse_context *context)
 			get_rule_expr((Node *) rcexpr->largs, context, true);
 			opname = generate_operator_name(linitial_oid(rcexpr->opnos),
 											exprType(linitial(rcexpr->largs)),
-											exprType(linitial(rcexpr->rargs)));
+											exprType(linitial(rcexpr->rargs)), context->redact);
 			appendStringInfoChar(buf, ')');
 		}
 		else
@@ -12916,7 +12951,7 @@ get_from_clause_item(Node *jtnode, Query *query, deparse_context *context)
 				appendStringInfo(buf, "%s%s",
 								 only_marker(rte),
 								 generate_relation_name(rte->relid,
-														context->namespaces));
+														context->namespaces, context->redact));
 				break;
 			case RTE_SUBQUERY:
 				/* Subquery RTE */
@@ -13401,7 +13436,7 @@ get_tablesample_def(TableSampleClause *tablesample, deparse_context *context)
 	appendStringInfo(buf, " TABLESAMPLE %s (",
 					 generate_function_name(tablesample->tsmhandler, 1,
 											NIL, argtypes,
-											false, NULL, false));
+											false, NULL, false, context->redact));
 
 	nargs = 0;
 	foreach(l, tablesample->args)
@@ -13722,7 +13757,7 @@ get_relation_name(Oid relid)
  * visible in the namespace list.
  */
 static char *
-generate_relation_name(Oid relid, List *namespaces)
+generate_relation_name(Oid relid, List *namespaces, struct RedactCtx *redact)
 {
 	HeapTuple	tp;
 	Form_pg_class reltup;
@@ -13731,6 +13766,20 @@ generate_relation_name(Oid relid, List *namespaces)
 	char	   *relname;
 	char	   *nspname;
 	char	   *result;
+
+	/*
+	 * A relation the user owns is replaced by its pseudonym, and returning
+	 * here skips the schema qualification below -- deliberately, since FR-11
+	 * drops schema names and there is nothing to qualify a generated name
+	 * against.
+	 *
+	 * An exempt relation, one in pg_catalog or information_schema, falls
+	 * through to the original path untouched and keeps its qualification
+	 * rules.  That is about readability rather than safety: a plan that scans
+	 * pg_class should say so.
+	 */
+	if (redact != NULL && !explain_redact_exempt(redact, REDACT_RELATION, relid))
+		return pstrdup(explain_redact_name(redact, REDACT_RELATION, relid));
 
 	tp = SearchSysCache1(RELOID, ObjectIdGetDatum(relid));
 	if (!HeapTupleIsValid(tp))
@@ -13820,7 +13869,7 @@ generate_qualified_relation_name(Oid relid)
 static char *
 generate_function_name(Oid funcid, int nargs, List *argnames, Oid *argtypes,
 					   bool has_variadic, bool *use_variadic_p,
-					   bool inGroupBy)
+					   bool inGroupBy, struct RedactCtx *redact)
 {
 	char	   *result;
 	HeapTuple	proctup;
@@ -13906,7 +13955,21 @@ generate_function_name(Oid funcid, int nargs, List *argnames, Oid *argtypes,
 	else
 		nspname = get_namespace_name_or_temp(procform->pronamespace);
 
-	result = quote_qualified_identifier(nspname, proname);
+	/*
+	 * A user-defined function becomes its pseudonym; a built-in keeps its
+	 * name. Keeping built-ins is what leaves a redacted plan readable -- a
+	 * Filter reading "(t1_c1 = ?::text)" can be diagnosed, one reading
+	 * "f7(t1_c1, ?::text)" where f7 is lower() cannot.
+	 *
+	 * Substituted here rather than on entry so use_variadic_p is still
+	 * answered from the catalog: the caller needs it to decide whether to
+	 * print VARIADIC, which describes the call rather than the name.
+	 */
+	if (redact != NULL &&
+		!explain_redact_exempt(redact, REDACT_FUNCTION, funcid))
+		result = pstrdup(explain_redact_name(redact, REDACT_FUNCTION, funcid));
+	else
+		result = quote_qualified_identifier(nspname, proname);
 
 	ReleaseSysCache(proctup);
 
@@ -13925,7 +13988,8 @@ generate_function_name(Oid funcid, int nargs, List *argnames, Oid *argtypes,
  * in an expression.
  */
 static char *
-generate_operator_name(Oid operid, Oid arg1, Oid arg2)
+generate_operator_name(Oid operid, Oid arg1, Oid arg2,
+					   struct RedactCtx *redact)
 {
 	StringInfoData buf;
 	HeapTuple	opertup;
@@ -13933,6 +13997,20 @@ generate_operator_name(Oid operid, Oid arg1, Oid arg2)
 	char	   *oprname;
 	char	   *nspname;
 	Operator	p_result;
+
+	/*
+	 * A user-defined operator becomes its pseudonym, with no
+	 * OPERATOR(schema.op) wrapper: the wrapper exists so the name re-parses
+	 * to the same operator, which a generated name cannot do and redacted
+	 * output does not promise.
+	 *
+	 * Built-in operators keep their names, and that is not a concession.  An
+	 * expression whose "=" had become "op1" would tell a reader nothing about
+	 * what the plan was doing, and the catalog operators are exactly the ones
+	 * a reader could look up anyway.
+	 */
+	if (redact != NULL && !explain_redact_exempt(redact, REDACT_OPERATOR, operid))
+		return pstrdup(explain_redact_name(redact, REDACT_OPERATOR, operid));
 
 	initStringInfo(&buf);
 

@@ -459,6 +459,61 @@ SELECT test_redact_deparse(
 -- -- and the second zeroes its own deparse context, so it never carries the
 -- handle.  Both are noted in ruleutils.c at the point where it would matter.
 
+--
+-- T10: relation, function and operator names inside expressions.
+--
+-- The exemption rule is the substance of this task, and it is the first one where
+-- erring on the safe side still breaks the feature.  A Filter reading
+-- "(t1_c1 op1 ?::integer)" where op1 is "=" tells a reader nothing, so built-in
+-- functions and operators must keep their names.  They also disclose nothing: they
+-- are PostgreSQL's names, and any reader could look them up.
+CREATE FUNCTION zsec_t02.zsec_fn(int) RETURNS int
+  LANGUAGE plpgsql AS $$ BEGIN RETURN $1; END $$;
+CREATE FUNCTION zsec_t02.zsec_opfn(int, int) RETURNS bool
+  LANGUAGE plpgsql AS $$ BEGIN RETURN true; END $$;
+CREATE OPERATOR zsec_t02.### (LEFTARG = int, RIGHTARG = int,
+                              FUNCTION = zsec_t02.zsec_opfn);
+
+SELECT what,
+       test_redact_deparse(qry, false) AS plain,
+       test_redact_deparse(qry, true)  AS redacted
+  FROM (VALUES
+    ('builtin function',  'SELECT lower(c_second) FROM zsec_c'),
+    ('user function',     'SELECT zsec_t02.zsec_fn(c_first) FROM zsec_c'),
+    -- The case the plan asks for by name: both in one expression, so the test
+    -- cannot pass by treating every function the same way.
+    ('both in one expr',  'SELECT lower(c_second), zsec_t02.zsec_fn(c_first) FROM zsec_c'),
+    ('builtin operator',  'SELECT c_first = 1 FROM zsec_c'),
+    ('user operator',     'SELECT c_first OPERATOR(zsec_t02.###) 1 FROM zsec_c'),
+    -- FR-40: the same object reached twice yields the same pseudonym, which is
+    -- what lets a reader see that two nodes touch the same function.
+    ('same function twice',
+     'SELECT zsec_t02.zsec_fn(c_first), zsec_t02.zsec_fn(c_first + 1) FROM zsec_c')
+  ) AS t(what, qry)
+ ORDER BY what COLLATE "C";
+
+--
+-- Exempt objects, and the negative control for the whole rule.
+--
+-- A catalog relation keeps its name, and so do its columns.  The column half was
+-- missing until this task: set_relation_column_names() substituted regardless of
+-- exemption, so a plan over the system catalogs read "pg_class.pg_class_c2"
+-- instead of "pg_class.relname".  That protected nothing -- those are
+-- PostgreSQL's names -- while making catalog plans unreadable, and it still
+-- disclosed the attribute's position, which for a catalog table is published.
+SELECT test_redact_deparse('SELECT relname, relnatts FROM pg_class', true)
+         AS catalog_relation_and_columns_kept;
+
+-- A user-written alias on a catalog table is still redacted, because the alias is
+-- the user's word even when the table is not.
+SELECT test_redact_deparse('SELECT c.relname FROM pg_class c', true)
+         AS catalog_column_kept_user_alias_redacted;
+
+-- Mixed in one query: the catalog column survives, the user column does not.
+SELECT test_redact_deparse(
+         'SELECT c.relname, t.c_second FROM pg_class c, zsec_c t', true)
+         AS mixed_catalog_and_user;
+
 RESET search_path;
 DROP SCHEMA zsec_t02 CASCADE;
 DROP EXTENSION test_explain_redact;
