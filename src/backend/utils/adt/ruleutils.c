@@ -125,6 +125,23 @@ typedef struct
 	bool		varInOrderBy;	/* deparsing simple Var in ORDER BY? */
 	Bitmapset  *appendparents;	/* if not null, map child Vars of these relids
 								 * back to the parent rel */
+
+	/*
+	 * Pseudonym map for redacted EXPLAIN output, or NULL when not redacting
+	 * -- which is the case for every caller other than EXPLAIN, and is what
+	 * keeps pg_get_viewdef and friends unaffected.
+	 *
+	 * Carried as a field, and threaded explicitly through the static helpers
+	 * that build their own context, rather than held in a file-scope static.
+	 * The static would be a much smaller diff and would reach every context
+	 * automatically, including ones this file zeroes out.  It was rejected
+	 * because a missed site then fails silently in the unsafe direction,
+	 * whereas an explicit parameter makes the compiler point at every call
+	 * site that has to decide.  The cost is that a newly added context must
+	 * initialise this field; see the count assertion in the redaction test
+	 * module, which exists to force that decision to be made consciously.
+	 */
+	struct RedactCtx *redact;
 } deparse_context;
 
 /*
@@ -184,6 +201,21 @@ typedef struct
 	char	   *funcname;
 	int			numargs;
 	char	  **argnames;
+
+	/*
+	 * Pseudonym map for redacted EXPLAIN output, or NULL when not redacting.
+	 *
+	 * This is the copy that reaches the name-assignment functions -- the ones
+	 * that decide an RTE's alias and its column names -- because those are
+	 * handed a deparse_namespace and never see a deparse_context.  Assigning
+	 * names is a separate step from printing them, and it happens first, so
+	 * the handle has to be here as well as on the context.
+	 *
+	 * Unlike deparse_context, every site that builds one of these zeroes it
+	 * first -- by memset, by palloc0, or via set_deparse_for_query() -- so
+	 * this field defaults to NULL without each site having to say so.
+	 */
+	struct RedactCtx *redact;
 } deparse_namespace;
 
 /*
@@ -349,7 +381,8 @@ bool		quote_all_identifiers = false;
  */
 static char *deparse_expression_pretty(Node *expr, List *dpcontext,
 									   bool forceprefix, bool showimplicit,
-									   int prettyFlags, int startIndent);
+									   int prettyFlags, int startIndent,
+									   struct RedactCtx *redact);
 static char *pg_get_viewdef_worker(Oid viewoid,
 								   int prettyFlags, int wrapColumn);
 static char *pg_get_triggerdef_worker(Oid trigid, bool pretty);
@@ -414,7 +447,8 @@ static void make_viewdef(StringInfo buf, HeapTuple ruletup, TupleDesc rulettc,
 						 int prettyFlags, int wrapColumn);
 static void get_query_def(Query *query, StringInfo buf, List *parentnamespace,
 						  TupleDesc resultDesc, bool colNamesVisible,
-						  int prettyFlags, int wrapColumn, int startIndent);
+						  int prettyFlags, int wrapColumn, int startIndent,
+						  struct RedactCtx *redact);
 static void get_values_def(List *values_lists, deparse_context *context);
 static void get_with_clause(Query *query, deparse_context *context);
 static void get_select_query_def(Query *query, deparse_context *context);
@@ -1124,6 +1158,7 @@ pg_get_triggerdef_worker(Oid trigid, bool pretty)
 		context.inGroupBy = false;
 		context.varInOrderBy = false;
 		context.appendparents = NULL;
+		context.redact = NULL;
 
 		get_rule_expr(qual, &context, false);
 
@@ -1448,7 +1483,7 @@ pg_get_indexdef_worker(Oid indexrelid, int colno,
 			indexpr_item = lnext(indexprs, indexpr_item);
 			/* Deparse */
 			str = deparse_expression_pretty(indexkey, context, false, false,
-											prettyFlags, 0);
+											prettyFlags, 0, NULL);
 			if (!colno || colno == keyno + 1)
 			{
 				/* Need parens if it's not a bare function call */
@@ -1565,7 +1600,7 @@ pg_get_indexdef_worker(Oid indexrelid, int colno,
 
 			/* Deparse */
 			str = deparse_expression_pretty(node, context, false, false,
-											prettyFlags, 0);
+											prettyFlags, 0, NULL);
 			if (isConstraint)
 				appendStringInfo(&buf, " WHERE (%s)", str);
 			else
@@ -1601,7 +1636,8 @@ pg_get_querydef(Query *query, bool pretty)
 	initStringInfo(&buf);
 
 	get_query_def(query, &buf, NIL, NULL, true,
-				  prettyFlags, WRAP_COLUMN_DEFAULT, 0);
+				  prettyFlags, WRAP_COLUMN_DEFAULT, 0,
+				  NULL);
 
 	return buf.data;
 }
@@ -1813,7 +1849,7 @@ pg_get_statisticsobj_worker(Oid statextid, bool columns_only, bool missing_ok)
 		int			prettyFlags = PRETTYFLAG_PAREN;
 
 		str = deparse_expression_pretty(expr, context, false, false,
-										prettyFlags, 0);
+										prettyFlags, 0, NULL);
 
 		if (colno > 0)
 			appendStringInfoString(&buf, ", ");
@@ -1889,7 +1925,7 @@ pg_get_statisticsobjdef_expressions(PG_FUNCTION_ARGS)
 		int			prettyFlags = PRETTYFLAG_INDENT;
 
 		str = deparse_expression_pretty(expr, context, false, false,
-										prettyFlags, 0);
+										prettyFlags, 0, NULL);
 
 		astate = accumArrayResult(astate,
 								  PointerGetDatum(cstring_to_text(str)),
@@ -2061,7 +2097,7 @@ pg_get_partkeydef_worker(Oid relid, int prettyFlags,
 
 			/* Deparse */
 			str = deparse_expression_pretty(partkey, context, false, false,
-											prettyFlags, 0);
+											prettyFlags, 0, NULL);
 			/* Need parens if it's not a bare function call */
 			if (looks_like_function(partkey))
 				appendStringInfoString(&buf, str);
@@ -2118,7 +2154,7 @@ pg_get_partition_constraintdef(PG_FUNCTION_ARGS)
 	prettyFlags = PRETTYFLAG_INDENT;
 	context = deparse_context_for(get_relation_name(relationId), relationId);
 	consrc = deparse_expression_pretty((Node *) constr_expr, context, false,
-									   false, prettyFlags, 0);
+									   false, prettyFlags, 0, NULL);
 
 	PG_RETURN_TEXT_P(string_to_text(consrc));
 }
@@ -2508,7 +2544,7 @@ pg_get_constraintdef_worker(Oid constraintId, bool fullCommand,
 				}
 
 				consrc = deparse_expression_pretty(expr, context, false, false,
-												   prettyFlags, 0);
+												   prettyFlags, 0, NULL);
 
 				/*
 				 * Now emit the constraint definition, adding NO INHERIT if
@@ -2782,7 +2818,7 @@ pg_get_expr_worker(text *expr, Oid relid, int prettyFlags)
 
 	/* Deparse */
 	str = deparse_expression_pretty(node, context, false, false,
-									prettyFlags, 0);
+									prettyFlags, 0, NULL);
 
 	if (rel != NULL)
 		relation_close(rel, AccessShareLock);
@@ -3597,7 +3633,8 @@ print_function_sqlbody(StringInfo buf, HeapTuple proctup)
 			/* It seems advisable to get at least AccessShareLock on rels */
 			AcquireRewriteLocks(query, false, false);
 			get_query_def(query, buf, list_make1(&dpns), NULL, false,
-						  PRETTYFLAG_INDENT, WRAP_COLUMN_DEFAULT, 1);
+						  PRETTYFLAG_INDENT, WRAP_COLUMN_DEFAULT, 1,
+						  NULL);
 			appendStringInfoChar(buf, ';');
 			appendStringInfoChar(buf, '\n');
 		}
@@ -3611,7 +3648,8 @@ print_function_sqlbody(StringInfo buf, HeapTuple proctup)
 		/* It seems advisable to get at least AccessShareLock on rels */
 		AcquireRewriteLocks(query, false, false);
 		get_query_def(query, buf, list_make1(&dpns), NULL, false,
-					  0, WRAP_COLUMN_DEFAULT, 0);
+					  0, WRAP_COLUMN_DEFAULT, 0,
+					  NULL);
 	}
 }
 
@@ -3655,7 +3693,32 @@ deparse_expression(Node *expr, List *dpcontext,
 				   bool forceprefix, bool showimplicit)
 {
 	return deparse_expression_pretty(expr, dpcontext, forceprefix,
-									 showimplicit, 0, 0);
+									 showimplicit, 0, 0, NULL);
+}
+
+/*
+ * deparse_expression_redacted	- deparse an expression for a redacted EXPLAIN
+ *
+ * Identical to deparse_expression() except that it carries a RedactCtx down
+ * into the walk, so the leaf functions that print a name or a value can
+ * substitute a pseudonym for it.
+ *
+ * Passing NULL is well defined and means "do not redact", which makes this a
+ * safe drop-in wherever the caller may or may not be redacting.
+ *
+ * Nothing in the tree calls this yet.  The substitution the RedactCtx enables
+ * is added one emission site at a time in later work, and EXPLAIN goes on
+ * suppressing expressions outright until all of those sites are done -- so this
+ * entry point exists ahead of its callers deliberately, and adding it changes
+ * no output.
+ */
+char *
+deparse_expression_redacted(Node *expr, List *dpcontext,
+							bool forceprefix, bool showimplicit,
+							struct RedactCtx *redact)
+{
+	return deparse_expression_pretty(expr, dpcontext, forceprefix,
+									 showimplicit, 0, 0, redact);
 }
 
 /* ----------
@@ -3680,7 +3743,8 @@ deparse_expression(Node *expr, List *dpcontext,
 static char *
 deparse_expression_pretty(Node *expr, List *dpcontext,
 						  bool forceprefix, bool showimplicit,
-						  int prettyFlags, int startIndent)
+						  int prettyFlags, int startIndent,
+						  struct RedactCtx *redact)
 {
 	StringInfoData buf;
 	deparse_context context;
@@ -3699,6 +3763,7 @@ deparse_expression_pretty(Node *expr, List *dpcontext,
 	context.inGroupBy = false;
 	context.varInOrderBy = false;
 	context.appendparents = NULL;
+	context.redact = redact;
 
 	get_rule_expr(expr, &context, showimplicit);
 
@@ -3761,6 +3826,24 @@ deparse_context_for(const char *aliasname, Oid relid)
 List *
 deparse_context_for_plan_tree(PlannedStmt *pstmt, List *rtable_names)
 {
+	return deparse_context_for_plan_tree_redacted(pstmt, rtable_names, NULL);
+}
+
+/*
+ * deparse_context_for_plan_tree_redacted
+ *
+ * As deparse_context_for_plan_tree(), but with a RedactCtx available while the
+ * column names are assigned.
+ *
+ * A separate entry point is needed because column names are settled here, under
+ * set_simple_column_names() -> set_relation_column_names(), and not during the
+ * per-expression deparse.  Installing the handle only on the expression call
+ * would therefore be too late for every column name in the plan.
+ */
+List *
+deparse_context_for_plan_tree_redacted(PlannedStmt *pstmt, List *rtable_names,
+									   struct RedactCtx *redact)
+{
 	deparse_namespace *dpns;
 
 	dpns = palloc0_object(deparse_namespace);
@@ -3789,6 +3872,8 @@ deparse_context_for_plan_tree(PlannedStmt *pstmt, List *rtable_names)
 	}
 	else
 		dpns->appendrels = NULL;	/* don't need it */
+
+	dpns->redact = redact;
 
 	/*
 	 * Set up column name aliases, ignoring any join RTEs; they don't matter
@@ -3862,6 +3947,26 @@ set_deparse_context_plan(List *dpcontext, Plan *plan, List *ancestors)
 List *
 select_rtable_names_for_explain(List *rtable, Bitmapset *rels_used)
 {
+	return select_rtable_names_for_explain_redacted(rtable, rels_used, NULL);
+}
+
+/*
+ * select_rtable_names_for_explain_redacted
+ *
+ * As select_rtable_names_for_explain(), but with a RedactCtx available while
+ * the alias for each range-table entry is chosen.
+ *
+ * The handle has to arrive here, rather than at deparse time, because this is
+ * where the names are decided.  set_rtable_names() also appends _1, _2 suffixes
+ * to break ties between colliding aliases, so a pseudonym substituted afterwards
+ * would either collide or acquire a meaningless suffix.  Substituting during
+ * assignment avoids both, and makes the tie-breaking a no-op, since generated
+ * names do not collide.
+ */
+List *
+select_rtable_names_for_explain_redacted(List *rtable, Bitmapset *rels_used,
+										 struct RedactCtx *redact)
+{
 	deparse_namespace dpns;
 
 	memset(&dpns, 0, sizeof(dpns));
@@ -3869,6 +3974,7 @@ select_rtable_names_for_explain(List *rtable, Bitmapset *rels_used)
 	dpns.subplans = NIL;
 	dpns.ctes = NIL;
 	dpns.appendrels = NULL;
+	dpns.redact = redact;
 	set_rtable_names(&dpns, NIL, rels_used);
 	/* We needn't bother computing column aliases yet */
 
@@ -5477,7 +5583,9 @@ make_ruledef(StringInfo buf, HeapTuple ruletup, TupleDesc rulettc,
 		 */
 		query = getInsertSelectQuery(query, NULL);
 
-		/* Must acquire locks right away; see notes in get_query_def() */
+		/*
+		 * Must acquire locks right away; see notes in get_query_def()
+		 */
 		AcquireRewriteLocks(query, false, false);
 
 		context.buf = buf;
@@ -5493,6 +5601,7 @@ make_ruledef(StringInfo buf, HeapTuple ruletup, TupleDesc rulettc,
 		context.inGroupBy = false;
 		context.varInOrderBy = false;
 		context.appendparents = NULL;
+		context.redact = NULL;
 
 		set_deparse_for_query(&dpns, query, NIL);
 
@@ -5516,7 +5625,8 @@ make_ruledef(StringInfo buf, HeapTuple ruletup, TupleDesc rulettc,
 		{
 			query = (Query *) lfirst(action);
 			get_query_def(query, buf, NIL, viewResultDesc, true,
-						  prettyFlags, WRAP_COLUMN_DEFAULT, 0);
+						  prettyFlags, WRAP_COLUMN_DEFAULT, 0,
+						  NULL);
 			if (prettyFlags)
 				appendStringInfoString(buf, ";\n");
 			else
@@ -5530,7 +5640,8 @@ make_ruledef(StringInfo buf, HeapTuple ruletup, TupleDesc rulettc,
 
 		query = (Query *) linitial(actions);
 		get_query_def(query, buf, NIL, viewResultDesc, true,
-					  prettyFlags, WRAP_COLUMN_DEFAULT, 0);
+					  prettyFlags, WRAP_COLUMN_DEFAULT, 0,
+					  NULL);
 		appendStringInfoChar(buf, ';');
 	}
 
@@ -5604,7 +5715,8 @@ make_viewdef(StringInfo buf, HeapTuple ruletup, TupleDesc rulettc,
 	ev_relation = table_open(ev_class, AccessShareLock);
 
 	get_query_def(query, buf, NIL, RelationGetDescr(ev_relation), true,
-				  prettyFlags, wrapColumn, 0);
+				  prettyFlags, wrapColumn, 0,
+				  NULL);
 	appendStringInfoChar(buf, ';');
 
 	table_close(ev_relation, AccessShareLock);
@@ -5631,7 +5743,8 @@ make_viewdef(StringInfo buf, HeapTuple ruletup, TupleDesc rulettc,
 static void
 get_query_def(Query *query, StringInfo buf, List *parentnamespace,
 			  TupleDesc resultDesc, bool colNamesVisible,
-			  int prettyFlags, int wrapColumn, int startIndent)
+			  int prettyFlags, int wrapColumn, int startIndent,
+			  struct RedactCtx *redact)
 {
 	deparse_context context;
 	deparse_namespace dpns;
@@ -5685,6 +5798,7 @@ get_query_def(Query *query, StringInfo buf, List *parentnamespace,
 	context.inGroupBy = false;
 	context.varInOrderBy = false;
 	context.appendparents = NULL;
+	context.redact = redact;
 
 	set_deparse_for_query(&dpns, query, parentnamespace);
 
@@ -5835,7 +5949,8 @@ get_with_clause(Query *query, deparse_context *context)
 		get_query_def((Query *) cte->ctequery, buf, context->namespaces, NULL,
 					  true,
 					  context->prettyFlags, context->wrapColumn,
-					  context->indentLevel);
+					  context->indentLevel,
+					  context->redact);
 		if (PRETTY_INDENT(context))
 			appendContextKeyword(context, "", 0, 0, 0);
 		appendStringInfoChar(buf, ')');
@@ -6457,7 +6572,8 @@ get_setop_query(Node *setOp, Query *query, deparse_context *context)
 		get_query_def(subquery, buf, context->namespaces,
 					  context->resultDesc, context->colNamesVisible,
 					  context->prettyFlags, context->wrapColumn,
-					  context->indentLevel);
+					  context->indentLevel,
+					  context->redact);
 		if (need_paren)
 			appendStringInfoChar(buf, ')');
 	}
@@ -6937,6 +7053,7 @@ get_window_frame_options_for_explain(int frameOptions,
 	context.inGroupBy = false;
 	context.varInOrderBy = false;
 	context.appendparents = NULL;
+	context.redact = NULL;
 
 	get_window_frame_options(frameOptions, startOffset, endOffset, &context);
 
@@ -7062,7 +7179,8 @@ get_insert_query_def(Query *query, deparse_context *context)
 		get_query_def(select_rte->subquery, buf, context->namespaces, NULL,
 					  false,
 					  context->prettyFlags, context->wrapColumn,
-					  context->indentLevel);
+					  context->indentLevel,
+					  context->redact);
 	}
 	else if (values_rte)
 	{
@@ -11760,7 +11878,8 @@ get_json_constructor(JsonConstructorExpr *ctor, deparse_context *context,
 
 		get_query_def(query, buf, context->namespaces, NULL, false,
 					  context->prettyFlags, context->wrapColumn,
-					  context->indentLevel);
+					  context->indentLevel,
+					  context->redact);
 
 		get_json_format(ctor->format, buf);
 		get_json_constructor_options(ctor, buf);
@@ -12036,7 +12155,8 @@ get_sublink_expr(SubLink *sublink, deparse_context *context)
 
 	get_query_def(query, buf, context->namespaces, NULL, false,
 				  context->prettyFlags, context->wrapColumn,
-				  context->indentLevel);
+				  context->indentLevel,
+				  context->redact);
 
 	if (need_paren)
 		appendStringInfoString(buf, "))");
@@ -12596,7 +12716,8 @@ get_from_clause_item(Node *jtnode, Query *query, deparse_context *context)
 				get_query_def(rte->subquery, buf, context->namespaces, NULL,
 							  true,
 							  context->prettyFlags, context->wrapColumn,
-							  context->indentLevel);
+							  context->indentLevel,
+							  context->redact);
 				appendStringInfoChar(buf, ')');
 				break;
 			case RTE_FUNCTION:

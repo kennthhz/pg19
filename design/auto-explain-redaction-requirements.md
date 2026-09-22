@@ -68,6 +68,78 @@ performance analysis.
   be re-executable.
 - No retroactive redaction of already-written log files.
 
+## 3.1 Deferred candidates
+
+Recorded here rather than dropped, because each was investigated far enough to
+establish feasibility and the reasoning is worth keeping.
+
+### 3.1.1 Redacted query text (deferred — technically feasible)
+
+FR-23 omits `Query Text` entirely. A future version could instead log the
+statement with its identifiers and literals replaced by the *same* pseudonyms the
+plan uses, giving a reader the shape of the statement without its content.
+
+**Feasible, and the machinery already exists.** `get_query_def()`
+(`ruleutils.c:5632`) already reverse-compiles a `Query` into SQL text — it is what
+`pg_get_viewdef` uses. Re-parsing `queryDesc->sourceText` into a `Query` at log
+time and deparsing it with a `RedactCtx` installed would route every name and
+constant through the same leaf emitters this design already modifies
+(`get_variable`, `get_const_expr`, `generate_relation_name`,
+`generate_function_name`), so no new redaction logic would be required.
+
+**The binding constraint is consistency, and it selects the approach.** The text
+and the plan must agree: a record where the plan says `t1` and the text says `t7`
+is worse than one with no text at all, because it invites a wrong conclusion.
+Reverse-compiling from the tree gets this for free, since both passes share one
+`RedactCtx` keyed by OID. Two cheaper alternatives were considered and do not
+compose:
+
+- *Constant-location splicing*, as `pg_stat_statements` does with
+  `jstate->clocations` and `generate_normalized_query()`. Cheap and already proven
+  in the tree, but it reaches literals only — every identifier survives.
+- *Lexing the original text* and swapping identifier tokens. Preserves the
+  author's formatting, and is a genuinely different proposition from the
+  string-scrubbing rejected in the implementation design (which concerned the
+  *finished plan output*, where names sit inside rendered expressions across four
+  formats). It fails on consistency: a lexer has only an identifier's text, while
+  pseudonyms are keyed by OID, and text→OID is ambiguous as soon as the same name
+  exists in two schemas or an alias shadows a table. Resolving that is name
+  resolution, which is the parser's job — so it reduces to the tree approach.
+
+**Costs to weigh when it is picked up.** A parse per logged record, on the
+record-emission path. Output is canonicalised SQL rather than the author's
+original text, so comments and formatting are lost. And a second consumer of the
+`RedactCtx` means its lifetime rules get a second caller to satisfy.
+
+**Why it might be worth it.** The query text is the only place that names objects
+the planner optimised away; the plan cannot show those by definition. A reviewer
+who needs to know what a statement *asked for*, rather than what was executed,
+has no other source.
+
+### 3.1.2 Rendering of `Query Parameters` (open question, not yet decided)
+
+D10 and FR-22 omit the property outright. That decision has been challenged and
+is not settled. Two objections stand:
+
+- The stated reason — that `$1, $2` discloses `params->numParams` — is weak
+  relative to what the design deliberately keeps. Row counts, costs and plan
+  shape describe the workload far more precisely than a parameter count, and §9
+  already accepts plan-shape disclosure.
+- It is inconsistent with FR-21, which renders an inline literal as `?` *plus its
+  type label* (`?::text`). The same secret therefore discloses more when written
+  into the SQL than when bound as a parameter, and nothing justifies the
+  asymmetry.
+
+The sound part of D10 is narrower than it claims: with
+`log_parameter_max_length = 0` the property is already suppressed, so printing
+`$1, $2` under redaction would disclose more than that configuration discloses
+today, and enabling a protection must never increase disclosure. That is
+satisfied by respecting `maxlen` rather than by omitting unconditionally — place
+the redaction test *after* the existing `maxlen == 0` check.
+
+Resolving this requires amending FR-22 and D10 and is a prerequisite to changing
+the code.
+
 ## 4. Definitions
 
 - **Exempt object** — an object whose **namespace** is `pg_catalog`,

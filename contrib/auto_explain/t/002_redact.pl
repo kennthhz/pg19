@@ -915,4 +915,98 @@ like(
 	qr/log_redact is enabled, but log_min_duration_statement is also active/,
 	'FR-75: a logging setting that bypasses redaction is reported');
 
+# ---------------------------------------------------------------------------
+# T06: every deparse_context in ruleutils.c must initialise its redact field.
+#
+# The redaction handle is carried as a field on a stack-allocated struct that
+# each site fills in field by field.  Adding a field to such a struct does not
+# default it to NULL -- it leaves it holding whatever was on the stack.  A site
+# that forgets it would therefore dereference a garbage pointer, or worse, treat
+# garbage as a live context and redact against it.
+#
+# One site already zeroes the struct outright (get_range_partbound_string), which
+# is why the check accepts either an explicit assignment or a memset.
+#
+# This is a source-level check, which is unusual for a TAP test and deserves a
+# word.  T06 changes no output at all, so there is nothing observable to assert
+# against: the handle has no consumers until later work adds them.  A source
+# check is the only thing that can catch a new site before it becomes a silent
+# leak, and the failure message names the line so the fix is obvious.
+#
+# Skipped rather than failed when the source cannot be located, since a vpath
+# build does not export the source directory to TAP tests.
+SKIP:
+{
+	my $src = "$ENV{top_builddir}/src/backend/utils/adt/ruleutils.c";
+	skip "ruleutils.c not found at $src (vpath build?)", 2 unless -f $src;
+
+	open my $fh, '<', $src or die "could not open $src: $!";
+	my @lines = <$fh>;
+	close $fh;
+
+	# Find each local deparse_context, then look forward within its function for
+	# an initialisation of the redact field.
+	my @sites;
+	my @uninitialised;
+	for my $i (0 .. $#lines)
+	{
+		next unless $lines[$i] =~ /^\s+deparse_context\s+context;/;
+		my $lineno = $i + 1;
+		push @sites, $lineno;
+
+		my $found = 0;
+		for my $j ($i .. $#lines)
+		{
+			# stop at the start of the next function definition
+			last if $j > $i && $lines[$j] =~ /^\}/;
+			if (   $lines[$j] =~ /context\.redact\s*=/
+				|| $lines[$j] =~
+				/memset\(&context, 0, sizeof\(deparse_context\)\)/)
+			{
+				$found = 1;
+				last;
+			}
+		}
+		push @uninitialised, $lineno unless $found;
+	}
+
+	cmp_ok(scalar(@sites), '>', 0,
+		'T06: found the deparse_context construction sites in ruleutils.c');
+
+	# Every *_redacted entry point must actually use the handle it accepts.
+	#
+	# This looks like a check nothing could fail, and it is here because the
+	# first version of T06 failed it: two of the three entry points took a
+	# RedactCtx and never passed it on.  They compiled, they were exported, and a
+	# caller handing one a real context would have got unredacted names back.
+	#
+	# The compiler cannot see that mistake -- an unused parameter is legal -- and
+	# it is precisely the silent failure in the unsafe direction that threading
+	# the handle was chosen to avoid.  So it gets its own assertion.
+	my @deaf;
+	for my $i (0 .. $#lines)
+	{
+		next unless $lines[$i] =~ /^([a-z_]+_redacted)\(/;
+		my $fname = $1;
+
+		# walk to the opening brace, then scan the body
+		my $j = $i;
+		$j++ while $j <= $#lines && $lines[$j] !~ /^\{/;
+		my $used = 0;
+		for my $k ($j .. $#lines)
+		{
+			last if $k > $j && $lines[$k] =~ /^\}/;
+			$used = 1 if $lines[$k] =~ /\bredact\b/;
+		}
+		push @deaf, "$fname (line " . ($i + 1) . ")" unless $used;
+	}
+	is_deeply(\@deaf, [],
+		'T06: every *_redacted entry point passes its handle on rather than ignoring it'
+	);
+	is_deeply(\@uninitialised, [],
+		'T06: every deparse_context initialises its redact field (sites at lines '
+		  . join(', ', @sites)
+		  . ')');
+}
+
 done_testing();

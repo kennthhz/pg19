@@ -34,6 +34,29 @@ extern char *pg_get_partkeydef_columns(Oid relid, bool pretty);
 extern char *pg_get_partconstrdef_string(Oid partitionId, char *aliasname);
 
 extern char *pg_get_constraintdef_command(Oid constraintId);
+
+/*
+ * Redaction-aware variants, for EXPLAIN records that must not disclose the
+ * application's schema or data.  Each takes a RedactCtx; passing NULL means
+ * "do not redact" and makes the variant behave exactly as its plain
+ * counterpart, which is what every existing caller in the tree relies on.
+ *
+ * Named by struct tag rather than through the RedactCtx typedef so that this
+ * header does not acquire a dependency on commands/explain_redact.h.  The type
+ * is opaque either way.
+ */
+struct RedactCtx;
+
+extern char *deparse_expression_redacted(Node *expr, List *dpcontext,
+										 bool forceprefix, bool showimplicit,
+										 struct RedactCtx *redact);
+extern List *select_rtable_names_for_explain_redacted(List *rtable,
+													  Bitmapset *rels_used,
+													  struct RedactCtx *redact);
+extern List *deparse_context_for_plan_tree_redacted(PlannedStmt *pstmt,
+													List *rtable_names,
+													struct RedactCtx *redact);
+
 extern char *deparse_expression(Node *expr, List *dpcontext,
 								bool forceprefix, bool showimplicit);
 extern List *deparse_context_for(const char *aliasname, Oid relid);
