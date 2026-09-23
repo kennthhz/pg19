@@ -29,14 +29,19 @@ SELECT bool_and(p ~ '^[a-z]+[0-9]+$') AS oid_kinds_wellformed
               900000001,900000001,900000001,900000001]::oid[])) AS p;
 
 -- The locally-keyed kinds too.  The first draft checked only the nine OID kinds,
--- which left eleven of the twenty unverified -- including the column form, whose
+-- which left eight of the seventeen unverified -- including the column form, whose
 -- qualified shape does NOT match the bare pattern and needs its own rule.
+--
+-- The list is shorter than it once was: 'argname', 'xmlname' and 'pathname' went
+-- with the RedactKind enumerators behind them (T13).  Nothing assigned those
+-- kinds, and the XML/JSON constructs whose names they were meant to cover are
+-- collapsed to a placeholder now, so there is no name left to key.  Adding them
+-- back here would raise "unrecognized redact kind" rather than test anything.
 SELECT bool_and(p ~ '^[a-z]+[0-9]+$') AS local_kinds_wellformed
   FROM unnest(test_redact_local_seq(
-        ARRAY['alias','cte','enr','subplan','window','field','argname',
-              'xmlname','pathname','cursor'],
-        ARRAY[1,1,1,1,1,1,1,1,1,1],
-        ARRAY[0,0,0,0,0,0,0,0,0,0])) AS p;
+        ARRAY['alias','cte','enr','subplan','window','field','cursor'],
+        ARRAY[1,1,1,1,1,1,1],
+        ARRAY[0,0,0,0,0,0,0])) AS p;
 
 -- Columns are qualified, so FR-41's bare pattern does not apply to them; the
 -- rule is <pseudonym>_c<n>, which still needs no quoting.  Stated explicitly so
@@ -97,10 +102,9 @@ SELECT test_redact_counters_restart('zsec_t02.zsec_a'::regclass)
 -- whole reason they need a second entry point.
 --
 SELECT test_redact_local_seq(
-        ARRAY['alias','cte','enr','subplan','window','field','argname',
-              'xmlname','pathname','cursor'],
-        ARRAY[1,1,1,1,1,1,1,1,1,1],
-        ARRAY[0,0,0,0,0,0,0,0,0,0]) AS local_kinds;
+        ARRAY['alias','cte','enr','subplan','window','field','cursor'],
+        ARRAY[1,1,1,1,1,1,1],
+        ARRAY[0,0,0,0,0,0,0]) AS local_kinds;
 
 --
 -- Columns are qualified by their relation's pseudonym, so a reader can see which
@@ -452,12 +456,23 @@ SELECT test_redact_deparse(
          'SELECT JSON_QUERY(''{"a":1}''::jsonb, ''$.a'') FROM zsec_c', true)
          AS redacted_json_query;
 
--- Not covered here, and deliberately: the remaining showtype = -1 callers are
--- get_values_def(), which prints a VALUES list's rows, and
--- get_range_partbound_string(), which prints a partition bound.  Neither is
--- reachable from a plan -- EXPLAIN prints no VALUES rows and no partition bounds
--- -- and the second zeroes its own deparse context, so it never carries the
--- handle.  Both are noted in ruleutils.c at the point where it would matter.
+-- UPDATED BY T13, and it is a loss rather than a wash.  T13 collapses a JsonExpr
+-- to JSONEXPR(...), so the redacted row above no longer reaches either showtype
+-- mode: the subtree that held the labelled context item and the unlabelled path
+-- spec is not deparsed at all any more.  The plain row still shows both modes
+-- side by side, and that is what the pair demonstrates now -- the redacted half
+-- has become a T13 assertion.  The property T09 established is unchanged in the
+-- code; what changed is that this fixture stopped witnessing it.
+--
+-- Also not covered here, and deliberately: get_values_def(), which prints a
+-- VALUES list's rows, and get_range_partbound_string(), which prints a partition
+-- bound.  Neither is reachable from a plan -- EXPLAIN prints no VALUES rows and
+-- no partition bounds -- and the second zeroes its own deparse context, so it
+-- never carries the handle.  Both are noted in ruleutils.c at the point where it
+-- would matter.  That leaves get_coercion_expr()'s same-type length-coercion
+-- branch as the one showtype = -1 caller still reachable under redaction, and it
+-- has no fixture here; finding a query whose plan keeps such a coercion over a
+-- Const, rather than folding it, is T09's business and not T13's.
 
 --
 -- T10: relation, function and operator names inside expressions.
@@ -555,6 +570,89 @@ SELECT what,
 -- a generated name against.  Asserted rather than left to inspection.
 SELECT test_redact_deparse('SELECT c_first::zsec_t02.zsec_dom FROM zsec_c', true)
          NOT LIKE '%zsec_t02%' AS user_type_not_schema_qualified;
+
+--
+-- T13: XML and JSON constructs are collapsed behind a placeholder.
+--
+-- Unlike T09-T11 there is no pseudonym to inspect.  The guard prints one token
+-- and returns without deparsing the subtree, so every name inside the construct
+-- is absent from the output rather than renamed, and the placeholder itself is
+-- the positive assertion (FR-95, FR-96).
+--
+-- Every fixture therefore carries a non-collapsed sibling in the same target
+-- list -- a plain column reference -- whose pseudonym must still print.  Without
+-- it, a result showing no leaked name could not be told apart from output that
+-- was blanked wholesale, which is exactly how the FR-95/FR-96 rows of
+-- src/test/regress/sql/explain_redact.sql pass today: T04 suppresses every
+-- expression property, so the marker is absent because nothing is printed at
+-- all.  This is the vehicle that can tell the two apart.
+--
+-- One XmlExpr op per distinct deparse shape.  XMLELEMENT, XMLFOREST and XMLPI
+-- are deliberately absent, and not for lack of interest: each maps an SQL
+-- identifier to an XML name during parse analysis, and
+-- map_sql_identifier_to_xml_name() is compiled out on a build without libxml, so
+-- on such a build those three cannot be parsed, let alone planned.  Every op
+-- below parses everywhere.  Nothing is lost by that, because the placeholder
+-- does not depend on which op produced it -- which is also why IS DOCUMENT, the
+-- one shape with no keyword of its own, needs no special case.
+--
+-- Declaring and selecting an xml column needs no libxml; only parsing an xml
+-- literal does.  So these columns are portable even though their type is not
+-- fully functional on every build.
+ALTER TABLE zsec_t02.zsec_c ADD COLUMN c_xml xml;
+ALTER TABLE zsec_t02.zsec_c ADD COLUMN c_xml2 xml;
+ALTER TABLE zsec_t02.zsec_c ADD COLUMN c_json jsonb;
+
+-- The expected file pins the whole redacted string, so "collapsed to exactly
+-- XMLEXPR(...)" is asserted rather than "contains XMLEXPR": a construct that was
+-- half deparsed, or one that kept a trailing fragment, would not match.
+SELECT what,
+       test_redact_deparse(qry, false) AS plain,
+       test_redact_deparse(qry, true)  AS redacted
+  FROM (VALUES
+    ('IS DOCUMENT',  'SELECT c_second, c_xml IS DOCUMENT FROM zsec_c'),
+    ('JSON_EXISTS',  'SELECT c_second, json_exists(c_json, ''$.a'') FROM zsec_c'),
+    -- The negative control, and it is the reason the collapse can be called
+    -- targeted rather than blanket.  JSON_OBJECT is a JsonConstructorExpr, not a
+    -- JsonExpr: it carries no raw identifier of its own, its key is a Const, and
+    -- it recurses through get_rule_expr() -- so it keeps its shape, its key
+    -- becomes "?" under T09 and its value keeps its column pseudonym.  No guard,
+    -- and none needed.  If this row ever collapses too, the guards are catching
+    -- more than FR-95/FR-96 ask for.
+    ('JSON_OBJECT not collapsed',
+     'SELECT c_second, json_object(''k1'': c_second) FROM zsec_c'),
+    -- PASSING carries a user-written label, which is the whole point of FR-96.
+    -- Asserted again below on the label string itself.
+    ('JSON_QUERY PASSING label',
+     'SELECT c_second, json_query(c_json, ''$.a'' PASSING c_second AS zsec_lbl) FROM zsec_c'),
+    ('JSON_VALUE',   'SELECT c_second, json_value(c_json, ''$.a'' RETURNING text) FROM zsec_c'),
+    ('XMLCONCAT',    'SELECT c_second, xmlconcat(c_xml, c_xml2) FROM zsec_c'),
+    ('XMLPARSE',     'SELECT c_second, xmlparse(DOCUMENT c_second) FROM zsec_c'),
+    ('XMLROOT',      'SELECT c_second, xmlroot(c_xml, version ''1.0'') FROM zsec_c'),
+    ('XMLSERIALIZE', 'SELECT c_second, xmlserialize(CONTENT c_xml AS text) FROM zsec_c')
+  ) AS t(what, qry)
+ ORDER BY what COLLATE "C";
+
+-- FR-96 on the label itself.  The pair is the assertion: unredacted output must
+-- contain "zsec_lbl", redacted output must not.  Asked as two booleans because a
+-- bare NOT LIKE would also be satisfied by a harness that returned nothing, and
+-- because the label is a raw identifier on the JsonExpr rather than a Const, so
+-- FR-24's placeholder never reached it.
+SELECT test_redact_deparse(
+         'SELECT c_second, json_query(c_json, ''$.a'' PASSING c_second AS zsec_lbl) FROM zsec_c',
+         false) LIKE '%zsec_lbl%' AS passing_label_leaks_unredacted;
+SELECT test_redact_deparse(
+         'SELECT c_second, json_query(c_json, ''$.a'' PASSING c_second AS zsec_lbl) FROM zsec_c',
+         true) NOT LIKE '%zsec_lbl%' AS passing_label_absent_redacted;
+
+-- Not covered here, and knowingly: the third guard, in get_tablefunc(), which
+-- collapses XMLTABLE and JSON_TABLE.  A TableFunc lives in a range-table entry,
+-- never in a target list, so this harness -- which deparses the top plan node's
+-- target list -- cannot reach it, and the "Table Function Call" property it would
+-- print is suppressed by T04 until T15-T21.  It ships as an untested guard and is
+-- carried as such into T21; see the task plan.  The two constructs above and
+-- below it share the same one-token-and-return shape, so what is untested is the
+-- placement of that guard, not the collapse itself.
 
 RESET search_path;
 DROP SCHEMA zsec_t02 CASCADE;

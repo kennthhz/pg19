@@ -732,17 +732,111 @@ without it that return path is untested; the assignment form
 `SET zcol_comp.zfield_ssn = …`; a named-argument call, using a `plpgsql`
 function so inlining does not remove the `FuncExpr`.
 
-#### T13 — Layer B: XML and JSON names
+#### T13 — Layer B: XML and JSON constructs
 
-**Delivers.** `T_XmlExpr` name and `arg_names` (`:10165`, `:10186`);
-`XMLNAMESPACES` prefix (`:12080`); tablefunc column names (`:12122`,
-`:12319`); `JSON_TABLE` root path `AS` (`:12393`), `NESTED PATH AS`
-(`:12166`), `PLAN` clause names (`:12234`), `PASSING … AS` (`:12418` and
-`:10638`).
+*(rev. T13: rescoped from names to constructs. The original plan listed the
+nine sites below and pseudonymized the name at each; the implementation
+collapses the whole construct instead. Requirements FR-95 and FR-96 carry the
+rescope and the reasoning, which is that pseudonymizing the names inside an XML
+or JSON payload — a corner case — needed ten guarded sites, five helpers, a
+pre-order walk of the path tree and a range-table pointer search with a known
+failure mode under parameterized `LATERAL`, where collapsing needs three
+guards and is leak-proof by inspection. Sites withdrawn: `T_XmlExpr` name and
+`arg_names`, `XMLNAMESPACES` prefix, tablefunc column names, `JSON_TABLE` root
+path `AS`, `NESTED PATH AS`, `PLAN` clause names, both `PASSING … AS`. They are
+all inside a collapsed subtree and are not reached under redaction.)*
 
-**Tests.** Requirements §10.2 FR-95 and FR-96 fixtures. Note the `XmlExpr`
-fixture is placed in `Filter`, which is **not** `VERBOSE`-gated — that is the
-point of it.
+**Delivers.** Three guards. No helpers, no new pseudonym kind, no counter.
+
+| Guard | Placeholder |
+|---|---|
+| `get_rule_expr()` `case T_XmlExpr:` | `XMLEXPR(...)` |
+| `get_rule_expr()` `case T_JsonExpr:` | `JSONEXPR(...)` |
+| `get_tablefunc()`, ahead of its `functype` dispatch | `XMLTABLE(...)` / `JSON_TABLE(...)` |
+
+Each prints its placeholder and returns without deparsing the subtree, so every
+name inside is absent rather than pseudonymized. "Skipped" here means omitted
+from the output; it never means left printing raw.
+
+Five points that carry the design:
+
+- The third guard belongs to `get_tablefunc()` rather than to `get_rule_expr()`'s
+  `case T_TableFunc:`, so both of today's callers are covered and a third is
+  covered by default. The other caller is `get_from_clause_item()`, deparsing a
+  table function in a query's `FROM` clause — not reachable from EXPLAIN while
+  redacted query text is deferred (requirements §3.1.1), which is precisely why
+  the guard must not sit in the caller that *is* reachable.
+- `T_XmlExpr` gets one fixed token instead of its op's own keyword because
+  `IS_DOCUMENT` has no keyword of its own: it deparses as `arg IS DOCUMENT`. A
+  per-op placeholder therefore could not be one self-contained `NAME(...)`
+  shape for every op, and that shape is what lets `isSimpleNode()` go on
+  classifying an `XmlExpr` as function-like, leaving every parenthesization
+  rule alone. `get_tablefunc()`'s two constructs both do spell as `NAME(...)`,
+  so there the placeholder names the construct.
+- No guard for `T_JsonConstructorExpr` (`JSON_OBJECT`, `JSON_ARRAY`, …) or for
+  `T_JsonIsPredicate`. Both route to `get_json_constructor()`, which prints no
+  identifier of its own — no `quote_identifier`, no `strVal` — and recurses
+  through `get_rule_expr()`, so a `JSON_OBJECT` key, being a `Const`, already
+  comes out as `?` under T09.
+- Removals, not additions: `REDACT_XMLNAME`, `REDACT_PATHNAME` and
+  `REDACT_ARGNAME` leave `explain_redact.h` with this task. Nothing assigns
+  them, and an enumerator advertising coverage the code does not have is the
+  same false-promise failure that produced the suite's vacuous verdicts. One
+  consequence for **T12**, whose scope is otherwise untouched: its FR-94
+  `T_NamedArgExpr` guard must *omit* the `name =>` decoration rather than
+  pseudonymize the label — which is what FR-94's treatment already permits,
+  and the label never survives into a plan tree anyway.
+- Zero deletions. Every guard is an insertion; no line that exists at HEAD is
+  modified. That makes `log_redact = off` output unchanged **by construction**
+  rather than by comparison, which is a stronger guarantee than the byte
+  comparison T09–T11 relied on and the reason this task can skip it.
+
+**Tests.** Requirements §10.2 FR-95 and FR-96, as amended. Three things differ
+from what this section used to say.
+
+FR-95 needs **no** libxml, measured. What libxml gates is the parse-time
+mapping of an SQL identifier to an XML name, so `XMLELEMENT`, `XMLFOREST` and
+`XMLPI` cannot be parsed without it — but `XMLCONCAT`, `XMLSERIALIZE`,
+`XMLPARSE`, `XMLROOT`, `IS DOCUMENT` and `XMLTABLE` all plan and deparse, and
+the placeholder does not depend on which op it was. So the fixtures belong in
+the regression file and must fail rather than skip.
+
+The `Filter` placement this section called "the point of it" is unavailable in
+the deparse harness, which sees only the top plan node's target list. It is the
+same node and the same guard from the `SELECT` list; the `Filter` shape remains
+right for the EXPLAIN vehicle after T21.
+
+Every assertion needs a non-collapsed sibling in the same list whose column
+pseudonym still prints, or it cannot be told apart from T04's wholesale
+blanking — the vacuity pattern this work has hit four times. Delivered as nine
+rows plus two booleans in `src/test/modules/test_explain_redact`, one per
+distinct deparse shape, each carrying a `t1.t1_c2` sibling, with `JSON_OBJECT`
+as the negative control that still prints `JSON_OBJECT(?::unknown : t1.t1_c2
+…)` and so shows the collapse is targeted rather than blanket.
+
+**Decided, not left open:** the `get_tablefunc()` guard ships **untested**. A
+`TableFunc` lives in a range-table entry, never in a target list, so the deparse
+harness cannot reach it, and `Table Function Call` prints nothing until T21.
+Adding a harness entry point for it was considered and rejected — it is a new
+test-only deparse path built to observe one guard whose body is the same
+one-token-and-return as the two guards that *are* tested, so what would be
+covered is the guard's placement, not the collapse. T21 un-suppresses the
+property and gets the assertion for free; it is listed there as inherited work.
+
+Two consequences outside this task's own fixtures, both recorded where they
+happen rather than absorbed silently:
+
+- T09's `showtype = -1` fixture used `JSON_QUERY` as its vehicle, so its
+  redacted half now reads `JSONEXPR(...)` and no longer witnesses that mode.
+  Every `-1` call site was re-checked: what remains reachable from a plan under
+  redaction is `get_coercion_expr()`'s same-type length coercion over a `Const`,
+  and it has no fixture. Annotated at the fixture; a replacement belongs to T09.
+- The two FR-96 rows in `src/test/regress/expected/explain_redact.out` report
+  `clean` vacuously, since T04 blanks the property the label would sit in. The
+  verdict is annotated at the catalog entries and the vacuity is now measured by
+  two queries after the sweep, rather than the row being left to read as
+  verification. Repairing the sweep so that a suppressed property reports as
+  such — 33 rows share the defect — is its own task.
 
 #### T14 — Layer B: remaining leaf sites
 
@@ -927,7 +1021,11 @@ T02  RedactCtx ──► T03 ExplainState ──► T04 total suppression ──
 ```
 
 Stage 3 tasks (T07–T14) have no ordering constraint among themselves beyond
-T07 before T08, so they can be parallelised across people. Stage 4 tasks
+T07 before T08, so they can be parallelised across people. T13's edges are
+unchanged by its rescope, and it is now the most loosely coupled of them: the
+collapse reads nothing but the `context->redact != NULL` test that T06 puts in
+place — no pseudonym counter, no key domain, no agreement with any other task's
+naming — so it can land anywhere after T06. Stage 4 tasks
 T15–T19 are likewise independent of each other. Two orderings are mandatory:
 T20 before T21, and **T04a before any Stage 4 task** — otherwise the narrowing
 tasks are validated against thirty fixtures instead of the whole suite, which is

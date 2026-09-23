@@ -30,8 +30,18 @@
  *
  * OID-keyed kinds have a catalog entry, so exemption can be decided by looking
  * up the object's namespace (D7).  Locally-keyed kinds have no catalog object
- * at all -- a subquery's column alias, a window name, a JSON path label -- so
- * they are always redacted, there being nothing to exempt them against.
+ * at all -- a subquery's column alias, a window name, a composite type's field
+ * name -- so they are always redacted, there being nothing to exempt them
+ * against.
+ *
+ * There is deliberately no kind for the names inside an XML or JSON construct.
+ * Those constructs are not pseudonymized name by name: the deparser replaces
+ * the whole construct with a placeholder and never descends into it (FR-95,
+ * FR-96), so the element and attribute names, XMLNAMESPACES prefixes, path
+ * labels, PLAN names, PASSING labels and tablefunc column names it carries are
+ * never printed and never need a counter.  REDACT_XMLNAME, REDACT_PATHNAME and
+ * REDACT_ARGNAME existed here for that abandoned approach and were removed with
+ * it rather than left behind advertising coverage that does not exist.
  */
 typedef enum RedactKind
 {
@@ -54,9 +64,6 @@ typedef enum RedactKind
 	REDACT_SUBPLAN,				/* sp1, ...  FR-90 */
 	REDACT_WINDOW,				/* w1, ...   FR-91 */
 	REDACT_FIELD,				/* fld1, ... FR-93 */
-	REDACT_ARGNAME,				/* arg1, ... FR-94 */
-	REDACT_XMLNAME,				/* xml1, ... FR-95 */
-	REDACT_PATHNAME,			/* path1, ... FR-96 */
 	REDACT_CURSOR,				/* cur1, ... FR-97 */
 
 	REDACT_NKINDS				/* must be last */

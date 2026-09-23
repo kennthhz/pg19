@@ -62,9 +62,6 @@ static const struct
 	{"subplan", REDACT_SUBPLAN},
 	{"window", REDACT_WINDOW},
 	{"field", REDACT_FIELD},
-	{"argname", REDACT_ARGNAME},
-	{"xmlname", REDACT_XMLNAME},
-	{"pathname", REDACT_PATHNAME},
 	{"cursor", REDACT_CURSOR},
 };
 

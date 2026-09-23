@@ -10436,6 +10436,47 @@ get_rule_expr(Node *node, deparse_context *context,
 			break;
 
 		case T_XmlExpr:
+
+			/*
+			 * Under redaction an XML expression is not deparsed at all: we
+			 * print a placeholder and drop the subtree (FR-95).
+			 *
+			 * Why the whole construct goes rather than just its sensitive
+			 * parts: nearly everything an XML construct carries is text the
+			 * user wrote.  XMLELEMENT and XMLPI name an element, XMLFOREST
+			 * and XMLATTRIBUTES label attributes, and none of those names
+			 * belongs to a database object, so there is no catalog entry
+			 * behind them and nothing stable to key a pseudonym on.  XML
+			 * payloads are a corner case that does not earn a naming scheme
+			 * of their own, and eliding the construct is leak-proof by
+			 * inspection.  Note that "skipped" here means omitted from the
+			 * output; it never means left printing raw.
+			 *
+			 * The keyword is safe to keep and worth keeping.  It is SQL
+			 * vocabulary, not user data -- the same reason this code still
+			 * prints built-in function and operator names -- and it tells a
+			 * reader what kind of thing stood here instead of leaving an
+			 * unexplained gap.  It is also plainly not the "?" that replaces
+			 * a redacted constant.
+			 *
+			 * One fixed token, not the op's own keyword (XMLELEMENT,
+			 * XMLSERIALIZE, ...), because IS_DOCUMENT has no keyword of its
+			 * own: it deparses as "arg IS DOCUMENT".  An op-accurate
+			 * placeholder could therefore not be one self-contained NAME(...)
+			 * shape for every op, and that shape is what lets isSimpleNode()
+			 * go on calling an XmlExpr "function-like", leaving every
+			 * parenthesization rule alone.
+			 *
+			 * What we give up is diagnostic detail: a Var inside the
+			 * construct would otherwise have printed as its column pseudonym
+			 * and shown which columns fed it.  That is the accepted cost of
+			 * collapsing.
+			 */
+			if (context->redact != NULL)
+			{
+				appendStringInfoString(buf, "XMLEXPR(...)");
+				break;
+			}
 			{
 				XmlExpr    *xexpr = (XmlExpr *) node;
 				bool		needcomma = false;
@@ -10910,6 +10951,23 @@ get_rule_expr(Node *node, deparse_context *context,
 			break;
 
 		case T_JsonExpr:
+
+			/*
+			 * Collapsed under redaction, for the reason spelled out at
+			 * T_XmlExpr above (FR-96).  A JSON_EXISTS, JSON_QUERY or
+			 * JSON_VALUE expression carries a path expression and the labels
+			 * given to its PASSING arguments.  The path is a constant and
+			 * would already print as "?", but the labels are raw identifiers
+			 * the user chose, so the construct goes as a whole.
+			 *
+			 * One token for all three ops, so that the op-to-keyword mapping
+			 * just below has no second copy here to be kept in step with it.
+			 */
+			if (context->redact != NULL)
+			{
+				appendStringInfoString(buf, "JSONEXPR(...)");
+				break;
+			}
 			{
 				JsonExpr   *jexpr = (JsonExpr *) node;
 
@@ -12879,6 +12937,42 @@ get_json_table(TableFunc *tf, deparse_context *context, bool showimplicit)
 static void
 get_tablefunc(TableFunc *tf, deparse_context *context, bool showimplicit)
 {
+	/*
+	 * XMLTABLE and JSON_TABLE are collapsed under redaction (FR-95, FR-96).
+	 * They carry more user-chosen names than any other expression: the column
+	 * names of the table they produce, XMLNAMESPACES prefixes, the label on
+	 * the root path and on every NESTED PATH, those same labels repeated in a
+	 * PLAN clause, and PASSING argument labels.  Pseudonymizing all of them,
+	 * and keeping every appearance of a label agreeing with the others and
+	 * every COLUMNS entry agreeing with the column names printed elsewhere in
+	 * the plan, is machinery this corner case does not justify.  As at
+	 * T_XmlExpr in get_rule_expr(), "skipped" here means omitted from the
+	 * output; it never means left printing raw.
+	 *
+	 * The guard belongs to this function rather than to its call sites so
+	 * that a new call site is covered by default.  Both of today's callers
+	 * need it: get_rule_expr()'s T_TableFunc case, and get_from_clause_item()
+	 * deparsing a table function in the FROM clause of a whole query.  The
+	 * latter is not reachable from EXPLAIN yet -- redacted query text is
+	 * deferred -- which is exactly why the guard should not be sitting in the
+	 * other caller.
+	 *
+	 * Which of the two constructs it was costs nothing to say and is worth
+	 * saying, and both spell as a self-contained NAME(...), so here the
+	 * placeholder does follow the construct -- unlike the T_XmlExpr case,
+	 * where one op has no keyword of its own to follow.  The if/else-if
+	 * mirrors the live code below deliberately: an unrecognized functype
+	 * prints nothing there and prints nothing here.
+	 */
+	if (context->redact != NULL)
+	{
+		if (tf->functype == TFT_XMLTABLE)
+			appendStringInfoString(context->buf, "XMLTABLE(...)");
+		else if (tf->functype == TFT_JSON_TABLE)
+			appendStringInfoString(context->buf, "JSON_TABLE(...)");
+		return;
+	}
+
 	/* XMLTABLE and JSON_TABLE are the only existing implementations.  */
 
 	if (tf->functype == TFT_XMLTABLE)

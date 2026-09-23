@@ -73,9 +73,6 @@ static const char *const redact_prefix[REDACT_NKINDS] = {
 	"sp",						/* REDACT_SUBPLAN */
 	"w",						/* REDACT_WINDOW */
 	"fld",						/* REDACT_FIELD */
-	"arg",						/* REDACT_ARGNAME */
-	"xml",						/* REDACT_XMLNAME */
-	"path",						/* REDACT_PATHNAME */
 	"cur"						/* REDACT_CURSOR */
 };
 

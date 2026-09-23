@@ -261,8 +261,8 @@ has a test in §10.
 | FR-92 | The relation reference names listed by the `Replaces` property (emitted when a scan/join/aggregate was replaced by a `Result` node). | per FR-13 |
 | FR-93 | Composite-type field names: the field name printed for a field selection (`(col).field`), and the field name printed for composite/array assignment in an `INSERT`/`UPDATE` target list that EXPLAIN displays. These are resolved from the composite type's tuple descriptor, from a row expression's column-name list, or from the RTE's column list — **never** through the ordinary column-name path, so FR-12's treatment does not reach them. | `fld1`, `fld2`, … per record; a field of a redacted composite type is never printed in full |
 | FR-94 | Named-argument labels in a function call (`f(argname => …)`). *(Corrected by T01: **not reachable from EXPLAIN.** The parser resolves named notation to positional order and discards the `NamedArgExpr` wrapper, so `f(argname => x)` deparses as `f(x)` — verified with arguments given out of order, the case that forces reordering and so had the best chance of preserving the labels. ruleutils' `T_NamedArgExpr` branch therefore serves raw parse trees, such as a stored default printed by `pg_get_expr()`, not plan trees. Implement as a **guard**, like FR-98c, and keep the negative control pinned so that if labels ever start surviving into plans it fails rather than shipping silently.)* | `arg1`, `arg2`, … — or the `name =>` decoration omitted entirely (positional rendering), which is also acceptable since redacted output need not re-parse (§3) |
-| FR-95 | XML construction names: the `XMLELEMENT`/`XMLPI` element name, the `XMLATTRIBUTES`/`XMLFOREST` attribute labels, and `XMLNAMESPACES` prefixes. These are plain strings on the expression node, **not** constants, so FR-21 does not reach them. Note these appear in `Filter`, which is not `VERBOSE`-gated — not only in the `VERBOSE`-only table-function property. | `xml1`, `xml2`, … or omitted |
-| FR-96 | JSON/XML path *labels* and `PASSING` labels: the `… AS <name>` given to a `JSON_TABLE` root path, to each `NESTED PATH`, to each name in a `PLAN` clause, and to each `PASSING` argument of `JSON_TABLE`/`JSON_QUERY`/`JSON_VALUE`/`JSON_EXISTS`/`XMLTABLE`. FR-24 covers the path *string* because it is a constant; these labels are raw identifiers. | `path1`, `path2`, … / `arg1`, … per FR-94 |
+| FR-95 | XML construction names: the `XMLELEMENT`/`XMLPI` element name, the `XMLATTRIBUTES`/`XMLFOREST` attribute labels, `XMLNAMESPACES` prefixes, and the `COLUMNS` column names of an `XMLTABLE`. These are plain strings on the expression node, **not** constants, so FR-21 does not reach them. Note these appear in `Filter`, which is not `VERBOSE`-gated — not only in the `VERBOSE`-only table-function property. | the construct is **collapsed**: an `XmlExpr` prints as `XMLEXPR(...)`, an `XMLTABLE` table function as `XMLTABLE(...)`, and nothing inside either is deparsed, so none of these names is printed at all. *(rev. T13: was `xml1`, `xml2`, … Pseudonymizing the names **inside** XML and JSON payloads was abandoned as a corner case that did not pay for itself. It took ten guarded deparse sites, five helpers, a pre-order walk of the path tree to keep a `PLAN` clause agreeing with the path labels it names, and a search of the range table for the node's own `varno` to keep a `COLUMNS` entry agreeing with the `Output` list — and that last one has a failure mode, measured as reachable, where a parameterized `LATERAL` scan copies the `TableFunc`, the pointer search finds nothing, and the two disagree. Collapsing costs three guards and is leak-proof by inspection. The keyword is kept, not blanked: it is SQL vocabulary rather than user data, on the same footing as the `pg_catalog` function and operator names §10.4 pins as still printing, and it tells a reader what kind of thing stood here instead of leaving an unexplained gap. **Given up deliberately:** a `Var` inside a collapsed construct no longer prints its column pseudonym, so the record no longer shows which columns fed the construct.)* |
+| FR-96 | JSON/XML path *labels* and `PASSING` labels: the `… AS <name>` given to a `JSON_TABLE` root path, to each `NESTED PATH`, to each name in a `PLAN` clause, and to each `PASSING` argument of `JSON_TABLE`/`JSON_QUERY`/`JSON_VALUE`/`JSON_EXISTS`/`XMLTABLE`, plus a `JSON_TABLE` `COLUMNS` column name. FR-24 covers the path *string* because it is a constant; these labels are raw identifiers. | collapsed exactly as in FR-95: a `JSON_QUERY`/`JSON_VALUE`/`JSON_EXISTS` expression prints as `JSONEXPR(...)` and a `JSON_TABLE` table function as `JSON_TABLE(...)`. *(rev. T13: was `path1`, `path2`, … / `arg1`, …; same rationale and same deliberate loss as FR-95, whose note carries both. `JSON_OBJECT` and `JSON_ARRAY` are **not** collapsed and need no guard — they carry no raw identifier, their keys are `Const`s, and they already print as `JSON_OBJECT(?::unknown : t1_c1 …)` under FR-21.)* |
 | FR-97 | Cursor names, printed as `CURRENT OF <name>` inside the `TID Cond` of an `UPDATE`/`DELETE … WHERE CURRENT OF`. Cursor names are application-chosen identifiers. | `cur1`, `cur2`, … |
 | FR-98 | Names and values that reach output through a *second*, non-primary code path, and are therefore missed by a fix applied only at the primary path: (a) the `COLLATE` and `USING` decorations appended to sort keys, which are assembled from a raw collation-name and a raw operator-name lookup **after** expression deparsing has finished; (b) collation names attached by an explicit `COLLATE` expression and by an `ON CONFLICT` inference element; (c) operator-class names, including their schema qualification, printed for an inference element; (d) constants read directly out of the node datum by the SQL-syntax function printer (`EXTRACT(<field> FROM …)`, `IS <form> NORMALIZED`, `NORMALIZE(…, <form>)`). | per FR-19 / FR-20 / FR-21 as applicable; `opc1` for operator classes |
 | FR-99 | Sequence names. A serial/identity default is printed as `nextval('<sequence>')` in an `INSERT` target list. *(Amends FR-10's object list, which did not name sequences.)* | per FR-10 (`t1`); note the pseudonym is emitted **inside** a quoted literal, so the surrounding `nextval('…')` shape must be preserved (FR-61) |
@@ -284,11 +284,11 @@ has a test in §10.
 
 | ID | Requirement |
 |---|---|
-| FR-40 | Within one redacted record, the same object always maps to the same pseudonym, and different objects map to different pseudonyms (per namespace: `t*`, `i*`, `f*`, `cte*`, `enr*`, `trg*`, `con*`, `ty*`, `op*`, `a*`, and *(rev. code audit)* `sp*`, `w*`, `fld*`, `arg*`, `xml*`, `path*`, `cur*`, `coll*`, `opc*`). |
+| FR-40 | Within one redacted record, the same object always maps to the same pseudonym, and different objects map to different pseudonyms (per namespace: `t*`, `i*`, `f*`, `cte*`, `enr*`, `trg*`, `con*`, `ty*`, `op*`, `a*`, and *(rev. code audit)* `sp*`, `w*`, `fld*`, `cur*`, `coll*`, `opc*` *(rev. T13: `arg*`, `xml*` and `path*` dropped from this list. No code assigns them: FR-94's labels never survive into a plan tree, and FR-95/FR-96's names are now collapsed rather than pseudonymized. The matching `RedactKind` enumerators were deleted rather than left advertising coverage that does not exist.)*). |
 | FR-41 | Pseudonyms are ASCII, match `[a-z]+[0-9]+`, and never require quoting. |
 | FR-42 | Pseudonym assignment is deterministic for a given plan (traversal order), so identical queries produce comparable records. **This is retained deliberately and it does mean that two records for the same query shape carry the same pseudonyms**; the residual correlation is accepted and recorded in §9 *(rev. code audit: resolved against FR-45 by D8)* |
 | FR-45 | The pseudonym mapping holds **no state that outlives one record**: it is freshly allocated when record generation starts and discarded afterwards, never persisted, never cached across statements, and never carried from one record to the next. Consequently a *global* or session-lifetime counter is forbidden — pseudonym numbering must restart at 1 for each record, so that pseudonyms in unrelated records cannot be ordered or joined, and so that memory is bounded by one plan. *(rev. code audit: v1.1 additionally implied that the same table would get **different** pseudonyms in two records of the same session, which contradicts FR-42 and is not achievable while keeping FR-42's comparability. Narrowed by D8; the corresponding v1.1 acceptance test is withdrawn — see §8.7.)* |
-| FR-46 | The pseudonym key domain must be able to name every object that can be printed *(rev. code audit)*: relation pseudonyms key on the range-table entry, not solely on a relation OID, and column pseudonyms key on **(range-table index, attribute number)** within the deparse namespace, not on `(relid, attno)` — because subquery, join, function, `VALUES`, CTE, ENR and tablefunc entries have no relid and no catalog attribute number, yet their column names are printed (FR-12). Where a name has no OID-bearing object at all (composite fields per FR-93, window names per FR-91, path labels per FR-96), the key is the node identity that produced it. |
+| FR-46 | The pseudonym key domain must be able to name every object that can be printed *(rev. code audit)*: relation pseudonyms key on the range-table entry, not solely on a relation OID, and column pseudonyms key on **(range-table index, attribute number)** within the deparse namespace, not on `(relid, attno)` — because subquery, join, function, `VALUES`, CTE, ENR and tablefunc entries have no relid and no catalog attribute number, yet their column names are printed (FR-12). Where a name has no OID-bearing object at all (composite fields per FR-93, window names per FR-91), the key is the node identity that produced it. *(rev. T13: FR-96's path labels were the third example here and are no longer keyed at all — the construct carrying them is collapsed, so nothing keys them.)* |
 | FR-43 | No object OIDs, no physical attnos, no catalog metadata *identifiers* (relfilenode, table size), and no raw identifiers may appear anywhere in a redacted record as a side effect of redaction. (Statistics-*derived numbers* — row estimates, widths — are knowingly retained; see §9.) *(rev. security review: wording narrowed to identifying metadata)* |
 | FR-44 | The mapping from object → pseudonym lives only for the duration of producing the record and is never logged. |
 | FR-47 | Pseudonyms must be assigned **before** any name-uniquifying pass runs *(rev. code audit)*. Both the relation-alias assignment and the column-alias assignment append `_1`, `_2`, … suffixes to disambiguate colliding names; if pseudonyms are substituted after that pass, the suffixes fight the pseudonym counters and can produce either collisions (violating FR-40) or fragments of the real name (violating FR-41). |
@@ -576,27 +576,37 @@ SELECT zid FROM zcustomers WHERE zfunc_secret(zarg_secret => zcol_ssn);
 Assert: no `zarg_secret`; the printed call is `f1(arg1 => t1_c1)` or
 `f1(t1_c1)`, both acceptable per FR-94.
 
-**FR-95 — XML construction names.** [V]
-Sites: ruleutils.c:10165 (element/PI name), 10186 (attribute labels),
-12080 (`XMLNAMESPACES` prefix). Placed in `Filter` deliberately — that
-property is **not** `VERBOSE`-gated, so this leaks in a default-configuration
-record.
+**FR-95 — XML constructs.** [V] *(rev. T13: collapsed, not pseudonymized.)*
+Sites: `get_rule_expr()` `case T_XmlExpr:`, and `get_tablefunc()` — the latter
+covers `XMLTABLE` for both of its callers, so there is no longer one site per
+name. The fixture schema needs one more column for this entry, `zcol_xml xml`
+(declaring and selecting an `xml` column needs no libxml; only parsing an
+`xml` *literal* does).
 
 ```sql
-SELECT zid FROM zcustomers
- WHERE xmlelement(name zelem_secret,
-                  xmlattributes(zcol_ssn AS zattr_secret)) IS NOT NULL;
-
+-- XmlExpr.  In the SELECT list, because that is the only place the deparse
+-- harness can see (it deparses the top node's target list); an XmlExpr in a
+-- Filter is the same node and the same guard.
+SELECT xmlconcat(zcol_xml, zcol_xml) FROM zcustomers;
+-- XMLTABLE: needs VERBOSE (the Table Function Call property)
 SELECT * FROM XMLTABLE(XMLNAMESPACES ('http://x' AS zns_secret),
-                       '/r' PASSING '<r/>'::xml
+                       '/r' PASSING zcol_xml
                        COLUMNS zxcol_secret text PATH '.');
 ```
-Assert: no `zelem_secret`, `zattr_secret`, `zns_secret`, `zxcol_secret`.
-The second fixture needs `VERBOSE` (the `Table Function Call` property).
+Assert: no `zns_secret`, no `zxcol_secret` — and, since the construct is
+collapsed rather than rewritten name by name, assert the placeholder: the
+first prints exactly `XMLEXPR(...)`, the second `XMLTABLE(...)`. There is no
+pseudonym to check, so the placeholder *is* the positive assertion. Pair each
+with a non-XML sibling in the same target list whose column pseudonym must
+still print (`t1_c1, XMLEXPR(...)`), or a green result cannot be told apart
+from output that was blanked wholesale.
 
-**FR-96 — JSON/XML path and `PASSING` labels.** [V]
-Sites: ruleutils.c:12393 (root path `AS`), 12166 (`NESTED PATH AS`), 12234
-(`PLAN` clause), 12418 and 10638 (`PASSING … AS`).
+**FR-96 — JSON constructs.** [V] *(rev. T13: collapsed, not pseudonymized.)*
+Sites: `get_rule_expr()` `case T_JsonExpr:`, and the same `get_tablefunc()`
+guard as FR-95, which covers `JSON_TABLE`. The five separate label sites the
+pseudonym design listed here (root path `AS`, `NESTED PATH AS`, `PLAN` clause,
+two `PASSING … AS`) are all inside the collapsed subtree and are no longer
+reached under redaction.
 
 ```sql
 SELECT * FROM JSON_TABLE('{"a":1,"b":[{"c":2}]}'::jsonb, '$' AS zpath_secret
@@ -607,8 +617,19 @@ SELECT * FROM JSON_TABLE('{"a":1,"b":[{"c":2}]}'::jsonb, '$' AS zpath_secret
 SELECT JSON_QUERY('{"a":1}'::jsonb, '$.a' PASSING 5 AS zpass_secret);
 ```
 Assert: no `zpath_secret`, `znest_secret`, `zjcol_secret`, `zjc2_secret`,
-`zpass_secret`. Note FR-24 already covered the path *string* `'$.a'` because
-it is a `Const`; these are the `AS` labels beside it.
+`zpass_secret`, and the surviving keyword: `JSON_TABLE(...)` for the first,
+`JSONEXPR(...)` for the second. FR-24's point still holds — the path *string*
+`'$.a'` was already a `Const` — but under the collapse it is not printed at
+all, as `?` or otherwise. Same anti-vacuity pairing as FR-95.
+
+Reachability caveat, measured, and it constrains how this entry can be tested
+before T15–T21: `EXPLAIN (REDACT, VERBOSE)` currently suppresses every
+expression property wholesale, so `Table Function Call` prints nothing at all
+and any assertion made through it passes vacuously. And the deparse harness
+cannot reach a `TableFunc` either — it lives in a range-table entry, never in
+a target list. So the `XMLEXPR(...)` / `JSONEXPR(...)` halves are testable
+today and the `XMLTABLE(...)` / `JSON_TABLE(...)` halves need either a new
+harness entry point or deferral until the properties are un-suppressed.
 
 **FR-97 — cursor name.** [V]
 Site: ruleutils.c:10403, reached as a `TID Cond`.
@@ -887,12 +908,14 @@ parallel run and one generic-plan run.
 > it exists to produce and asserts membership, which turned all five red at once
 > and will catch the next one when it is written.
 >
-> **Build-feature gap found by T01.** Two requirements cannot be verified at all
-> on a default build:
+> **Build-feature gap found by T01 — and closed.** T01 believed two requirements
+> could not be verified at all on a default build. Both rows have since been
+> measured and neither claim survived, so the table is now a record of two
+> phantom gaps rather than a list of real ones:
 >
 > | Requirement | Needs | Consequence if absent |
 > |---|---|---|
-> | FR-95 (XML construction names) | `--with-libxml` | `xmlelement`, `XMLTABLE`, `XMLNAMESPACES` all raise "unsupported XML feature"; the choke points at ruleutils.c:10165/10186/12080 are unreachable |
+> | FR-95 (XML constructs) | ~~`--with-libxml`~~ **nothing** | **Corrected by T13, measured on a `USE_LIBXML = 0` build.** The claim was too broad, and the reason it was wrong is instructive: what libxml gates is narrower than "XML". The failure is raised by `map_sql_identifier_to_xml_name()` (xml.c) during **parse analysis**, so the constructs that turn a user identifier into an XML name — `XMLELEMENT`, `XMLFOREST`, `XMLPI` — cannot even be parsed here. Everything else can: `XMLCONCAT`, `XMLSERIALIZE`, `XMLPARSE`, `XMLROOT` and `IS DOCUMENT` all plan and deparse, and so does `XMLTABLE`, including an `XMLNAMESPACES` prefix and `COLUMNS` names, which off-mode prints in full (`Table Function Call: XMLTABLE(XMLNAMESPACES ('http://x'::text AS zns_secret), … COLUMNS zxcol_secret text PATH …)`). Since the collapse emits one placeholder regardless of which op it was, FR-95 is fully verifiable without libxml. The unparseable ops mattered only to the abandoned pseudonym design, which had to redact each name individually. |
 > | FR-98d, `IS NORMALIZED` / `normalize()` half | *nothing* | **Corrected by T01:** these are implemented in `src/common/unicode_norm.c` and need no ICU at all. The original ICU gate skipped an assertion that would have run. |
 >
 > Detecting the libxml build is harder than it looks, and T01 got it wrong twice
@@ -903,13 +926,22 @@ parallel run and one generic-plan run.
 > libxml was compiled in; only the runtime fails. No catalog probe can answer
 > the question, because the question is about the build. Use
 > `check_pg_config('#define USE_LIBXML 1')`, which reads `USE_LIBXML` out of the
-> installed header.
+> installed header. *(Kept as a record of the trap, but T13 removed the only
+> reason to run the probe: no FR-95 fixture needs to be gated on the build any
+> more, so none should be — a gated fixture is a fixture that can skip, and a
+> skip counts as a pass.)*
 >
-> These fixtures live in the TAP test rather than a regression file precisely so
-> they can be **skipped rather than failed**, and so the skip is visible in the
-> test output instead of hiding behind a pass. **CI must include at least one
-> build configured with both options**, or FR-95 ships unverified while the
-> suite reports green.
+> ~~These fixtures live in the TAP test rather than a regression file precisely
+> so they can be skipped rather than failed.~~ *(rev. T13.)* FR-95's fixtures
+> belong in the regression file with everything else and must **fail** rather
+> than skip, because they now run everywhere. Nothing in FR-95 or FR-96 is
+> gated on a build option. Write them with a parseable op — `XMLCONCAT` or
+> `XMLSERIALIZE` over an `xml` column, not `XMLELEMENT` — and they exercise the
+> same single guard that `XMLELEMENT` would reach on a libxml build. The
+> remaining CI requirement is the narrow one: a libxml build is still the only
+> place `XMLELEMENT`/`XMLFOREST`/`XMLPI` can be *parsed*, which is worth one
+> confirmation that those ops reach the same guard, not a precondition for
+> FR-95 being verified.
 
 ### 10.4 Negative controls — output that must **not** change
 

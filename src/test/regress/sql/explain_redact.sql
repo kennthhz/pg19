@@ -261,6 +261,19 @@ INSERT INTO zsec_fixtures (fr, note, opts, zsec_expect, qry) VALUES
 -- NB: the FR-94 "named argument label" fixture is NOT here either; see the
 -- negative-control section.
 -- FR-96: JSON path and PASSING labels.
+--
+-- READ THE REDACTED VERDICT FOR THESE TWO ROWS AS "NO SIGNAL", NOT AS "VERIFIED".
+-- Both labels live inside an expression property, and T04 suppresses every
+-- expression property wholesale until T15-T21, so the sweep below greps a plan
+-- from which the marker is absent because nothing was printed at all.  The
+-- unredacted rows in the positive-control phase are genuine -- the marker is
+-- found there -- but the inverted rows are vacuous, and T13 made no attempt to
+-- fix that here because the fix is a change to the sweep's design, which belongs
+-- to its own task.  Demonstrated immediately after the sweep rather than merely
+-- asserted.  The real coverage for FR-95/FR-96 is
+-- src/test/modules/test_explain_redact, which deparses the expression directly
+-- and can therefore see the XMLEXPR(...) / JSONEXPR(...) placeholder that proves
+-- the construct was collapsed rather than blanked.
 ('FR-96', 'JSON_TABLE path labels',   'COSTS OFF, VERBOSE', 'zsec_path',
  'SELECT * FROM JSON_TABLE(''{"a":1,"b":[{"c":2}]}''::jsonb, ''$'' AS zsec_path COLUMNS (zsec_jcol int PATH ''$.a'', NESTED PATH ''$.b[*]'' AS zsec_nest COLUMNS (zsec_jc2 int PATH ''$.c'')))'),
 ('FR-96', 'JSON_QUERY PASSING label', 'COSTS OFF, VERBOSE', 'zsec_pass',
@@ -643,6 +656,29 @@ SELECT f.fr,
  GROUP BY f.fr, f.note, f.qry
  ORDER BY f.fr COLLATE "C", f.note COLLATE "C", f.qry COLLATE "C";
 
+-- The two FR-96 rows in that result read "clean" and carry no signal, for the
+-- reason recorded at their catalog entries.  Shown rather than claimed: the
+-- property that would carry each label is printed without REDACT and is absent
+-- with it, so the sweep had nothing to grep either way.  Both counts must be
+-- non-zero on the left and zero on the right; a zero on the left would mean the
+-- fixture had stopped reaching the property for some unrelated reason, which
+-- would make the right-hand zero mean nothing.
+--
+-- This is the same vacuity as 33 other rows of this file, T05's plan_record and
+-- T01's positive control.  Only the two rows T13 owns are annotated; the rest
+-- need their own task.
+SELECT (SELECT count(*) FROM zsec_plan(q, 'COSTS OFF, VERBOSE') AS l
+         WHERE l LIKE '%Table Function Call%')         AS tfc_plain,
+       (SELECT count(*) FROM zsec_plan(q, 'COSTS OFF, VERBOSE, REDACT') AS l
+         WHERE l LIKE '%Table Function Call%')         AS tfc_redacted
+  FROM (SELECT qry FROM zsec_fixtures
+         WHERE note = 'JSON_TABLE path labels') AS f(q);
+SELECT (SELECT count(*) FROM zsec_plan(q, 'COSTS OFF, VERBOSE') AS l
+         WHERE l LIKE '%Output:%')                     AS output_plain,
+       (SELECT count(*) FROM zsec_plan(q, 'COSTS OFF, VERBOSE, REDACT') AS l
+         WHERE l LIKE '%Output:%')                     AS output_redacted
+  FROM (SELECT qry FROM zsec_fixtures
+         WHERE note = 'JSON_QUERY PASSING label') AS f(q);
 -- The GUC-dependent fixtures, redacted.  Same reason they are separate above:
 -- they cannot share a run without changing every other fixture's plan.
 SET enable_seqscan = off;
