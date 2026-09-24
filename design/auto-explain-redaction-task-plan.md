@@ -154,7 +154,8 @@ changes.
 The fixture catalog is a hand-built list derived from reading the source, and no
 amount of care makes a hand-built list provably complete. Four mechanisms
 compensate, in increasing order of strength. It is worth being explicit about
-which of them are guarantees and which are only good practice.
+which of them are guarantees and which are only good practice — and, since T18,
+which of them is not yet connected to anything.
 
 **Marking discipline (T01, mechanical).** Every fixture object carries the
 `zsec_` marker and every stored value carries `zsecdata-`, and a catalog query
@@ -183,6 +184,18 @@ both hand-built inputs at once: the fixture list and the marker.
 emission site rather than grepping the finished record, so a failure names a line
 instead of a symptom — and it fires for *any* query touching marked objects, not
 only for the fixtures, so it catches paths the catalog missed.
+
+> ***(rev. T18: as of this commit it fires for nothing.
+> `explain_redact_tripwire()` has **no caller anywhere in the backend** — confirmed
+> tree-wide; its only caller in the tree is its own unit test at
+> `src/test/modules/test_explain_redact/test_explain_redact.c:326`. The function
+> exists and works; nothing invokes it at an emission site. So of the four
+> mechanisms listed here, this one currently contributes **no** coverage, and the
+> completeness argument above should be read as resting on three. Recorded rather
+> than fixed: wiring it up is its own task and a decision about where the call
+> sites belong, not a side effect of T18. Note that this also means nothing in the
+> suite would fail if the tripwire were deleted, which is worth knowing before
+> anyone treats its presence as evidence of anything.)***
 
 **Periodic re-audit of the source enumeration (judgement, not a gate).** The
 residual weakness is not detection, it is enumeration: did we find every place in
@@ -1393,11 +1406,95 @@ dumps below them, which now carry the pseudonyms.
 
 #### T18 — Trigger section
 
-`report_triggers()` → `trgN`, `conN`, `tN`, all six sites.
+`report_triggers()` → `trgN`, `conN`, `tN`, all six sites: explain.c:1368, 1372,
+1374 (text, direct `es->str` appends) and 1385, 1387, 1388 (structured).
 
-**Tests.** Requires `log_analyze = on` **and** `log_triggers = on` — this
-surface is unreachable otherwise (design §1.2). Assert timings and `Calls`
-survive (FR-38).
+**Structure: resolve all three names up front, then delete every redaction
+special case.** T04 left four suppressions here — an `if (!es->redact)` around the
+two catalog lookups, a redaction-specific `"Trigger"` print arm ahead of the
+upstream verbose/conname test, an `if (!es->redact)` around the three
+`ExplainPropertyText` calls, and a widened `if (show_relname && relname != NULL)`.
+Resolving `tgname`, `conname` and `relname` before any printing lets all four go,
+so the printing logic is upstream's byte for byte and the pseudonyms substitute
+into it. That is not tidiness; see the shape hazard below.
+
+**Hazard: `pfree`.** The string `explain_redact_name()` returns is owned by the
+`RedactCtx` (the LIFETIME note in explain_redact.h), and the map returns the *same
+buffer* for a repeated `(kind, oid)`. So `pfree(conname)` would free into the
+pseudonym map, and a second trigger on the same constraint would then read freed
+memory. Keep a separate `char *conname_alloc`, set only on the
+`get_constraint_name()` path, and free that. `conname` becomes `const char *` so
+the compiler holds the line.
+
+**Hazard: shape.** Do **not** print `Trigger trgN` unconditionally. T01 measured
+that a constraint trigger without `VERBOSE` prints only
+`Trigger for constraint <conname>` — its own name is deliberately omitted — so an
+unconditional arm would make the redacted record show *more* structure than the
+plain one. Leaving `if (es->verbose || conname == NULL)` alone preserves it
+exactly, and that is the reason for resolving up front rather than branching at
+the print site.
+
+**Exemption.** Neither a trigger nor a constraint can be reached except through a
+user relation, so neither is ever exempt: `redact_object_namespace()` has no case
+for `REDACT_TRIGGER` or `REDACT_CONSTRAINT` and both fall through to "not exempt".
+Ask `explain_redact_name()` for a name, not for a decision. The relation is an
+ordinary relation and that same call decides its exemption itself.
+
+**Tests — the vehicle is the regression suite, not TAP.** *(rev. T18: this entry
+used to read "Requires `log_analyze = on` **and** `log_triggers = on` — this
+surface is unreachable otherwise (design §1.2)". The premise is wrong and is
+corrected in §1.2: `ExplainPrintTriggers` has a second caller, in `ExplainOnePlan()`
+at explain.c:645, gated on `es->analyze` **alone** — so
+`EXPLAIN (ANALYZE, REDACT, COSTS OFF, TIMING OFF)` reaches the section with no GUC
+at all. The regression file is the better vehicle because it can pin the emitted
+line instead of scraping a log.)*
+
+Use `TIMING OFF`: it takes the `: calls=N` arm, which is stable in an expected
+file, whereas `TIMING ON` prints a machine-dependent float. `BUFFERS OFF` too —
+ANALYZE enables buffers by default, and `zsec_plan()` strips a `Buffers:` line but
+not the `I/O Timings:` line that hangs off it.
+
+What the tests must cover, with the finding that makes each one necessary:
+
+* **Both name paths at both verbosities** — two triggers, one plain and one
+  constraint-backed, with distinguishable names, or the suite silently covers one
+  of the two. Prefer a real `FOREIGN KEY` to `CREATE CONSTRAINT TRIGGER`: the
+  latter gives the trigger and the constraint the same name, so `trgN` and `conN`
+  cannot be told apart.
+* **Shape preservation**, counted rather than eyeballed. The
+  constraint-trigger-without-`VERBOSE` cell is the one that catches a regression.
+* **FR-40 linkage** — and note that the obvious fixture cannot test it.
+  `ExplainPrintTriggers()` sets
+  `show_relname = (list_length(resultrels) > 1 || routerels != NIL || targrels != NIL)`,
+  so a single-result-relation `INSERT` prints **no relation at all** on its trigger
+  lines in text. A two-partition `UPDATE` is the clean case: two result relations,
+  and both leaves appear in the plan as scan targets for the `tN` to agree with.
+* **FR-38** — `Calls` must survive, and `Time` must survive when timing is on.
+  Assert against raw output, not through `zsec_plan()`, which rewrites every digit
+  to `N` and would make `calls=N` vacuous.
+* **All four formats.** `Trigger Name`, `Constraint Name` and `Relation` are
+  separate properties in json/xml/yaml and, unlike text, are printed
+  *unconditionally* rather than gated on `VERBOSE`. Match XML as
+  `Trigger[- ]Name`: an XML tag cannot contain a space, so it is `<Trigger-Name>`.
+* **Tuple routing.** Under routing the trigger fires on the **leaf**, so `on tN`
+  is the leaf's pseudonym and agrees with a scan line only if the leaf appears in
+  the plan — which for an `INSERT` it does not. Plain output has the same shape, so
+  nothing is disclosed; worth a fixture so it is not reported as a bug later.
+* **A foreign key's internal trigger name must be filtered.** PostgreSQL names it
+  from the constraint's OID (`RI_ConstraintTrigger_c_46760`), so the *unredacted*
+  `VERBOSE` line cannot be pinned as it stands. `zsec_plan()` does not catch it: it
+  rewrites a digit run only at a word boundary, and these digits follow an
+  underscore.
+* Keep the auto_explain TAP coverage — it is the channel the feature exists for,
+  and `log_timing` is on by default there, so it is where the `time=` half of the
+  section gets exercised at all. **`002_redact.pl` asserts
+  `qr{Trigger: (?:time=[\d.]+ )?calls=\d+}`, which matched T04's nameless line and
+  does not match T18's; it must be updated, not deleted.**
+* Sweep bookkeeping: FR-17 is listed in explain_redact.sql as waiting on T18, but
+  it had **no row in the fixture sweep to convert** — the file had classed it with
+  FR-22/FR-23 as unreachable from plain `EXPLAIN`. T18 adds one, genuine in both
+  directions from birth. Sweep 29 → 30 rows; inverted rows carrying real signal
+  15/34 → 16/35.
 
 #### T19 — Sub-plan labels and window names
 

@@ -216,15 +216,34 @@ its expressions, which are byte-identical with and without ANALYZE. No part
 of the redaction design needs to inspect a counter.
 
 **One exception, and it is load-bearing: the trigger section exists only
-under ANALYZE.** auto_explain calls `ExplainPrintTriggers` only when
-`es->analyze && auto_explain_log_triggers`, and `report_triggers()` emits
-`trig->tgname`, `get_constraint_name()` and `RelationGetRelationName()` — in
-text format by direct buffer appends at explain.c:1134, 1138, 1140, and as
-`Trigger Name` / `Constraint Name` / `Relation` properties at explain.c:1151,
-1153, 1154. Consequence for verification: **FR-17 cannot be exercised at all
-unless the test runs with ANALYZE *and* `log_triggers` enabled.** A test
-matrix that only covers non-ANALYZE plans will report full coverage while
-leaving trigger, constraint and relation names entirely untested.
+under ANALYZE.** `report_triggers()` emits `trig->tgname`,
+`get_constraint_name()` and `RelationGetRelationName()` — in text format by
+direct buffer appends at explain.c:1368, 1372, 1374, and as `Trigger Name` /
+`Constraint Name` / `Relation` properties at explain.c:1385, 1387, 1388.
+
+`ExplainPrintTriggers` has **two** callers, and they are gated differently:
+
+| caller | gate |
+|---|---|
+| `contrib/auto_explain/auto_explain.c:637` | `es->analyze && auto_explain_log_triggers` |
+| `ExplainOnePlan()`, explain.c:645 | `es->analyze` **alone** |
+
+Consequence for verification: **FR-17 needs ANALYZE, and nothing more than
+ANALYZE.** A test matrix that only covers non-ANALYZE plans will report full
+coverage while leaving trigger, constraint and relation names entirely untested —
+but a matrix that runs `EXPLAIN (ANALYZE, REDACT)` exercises the section without
+any GUC, which makes the regression suite a valid vehicle for this requirement and
+the better one, since it can pin the emitted line instead of scraping a log.
+
+> ***(rev. T18: this paragraph previously said auto_explain calls
+> `ExplainPrintTriggers` "only when `es->analyze && auto_explain_log_triggers`"
+> — true of that caller — and then drew the conclusion that "**FR-17 cannot be
+> exercised at all unless the test runs with ANALYZE *and* `log_triggers`
+> enabled**". Both the implied exclusivity and the conclusion were wrong: the core
+> caller has no GUC. T18 acted on the correction and made
+> `src/test/regress/sql/explain_redact.sql` the primary vehicle for FR-17, keeping
+> the auto_explain TAP coverage alongside it. The six line numbers above were also
+> stale by about 230 lines — they read 1134/1138/1140 and 1151/1153/1154.)***
 
 ## 2. Architecture
 
@@ -407,8 +426,11 @@ Carried over from v1.1:
   emitted 4895) and `ExplainIndexScanDetails` (4550, 4569).
 - `report_triggers()`: pseudonymize `tgname` → `trgN`, constraint name →
   `conN`, relation name → `tN` (FR-17). Six sites, two branches:
-  explain.c:1134, 1138, 1140 (text, direct `es->str` appends) and 1151, 1153,
-  1154 (structured). **Reachable only under ANALYZE + `log_triggers`** (§1.2).
+  explain.c:1368, 1372, 1374 (text, direct `es->str` appends) and 1385, 1387,
+  1388 (structured). **Reachable under ANALYZE**; `log_triggers` is additionally
+  required only on the auto_explain path (§1.2) *(rev. T18: line numbers were
+  stale by ~230 lines, and "only under ANALYZE + `log_triggers`" overstated the
+  gate)*.
 - Custom-scan provider name: blank `methods->CustomName` where `pname` is
   built in the `T_CustomScan` arm, and skip the `Custom Plan Provider`
   property (explain.c:1663) (FR-28).
@@ -708,10 +730,13 @@ directly to `es->str` in text mode. The Phase 1 checklist above names
 FR-90, FR-91 and FR-92 and must be in the Phase 1 diff too, or Phase 1 ships
 a record that still carries CTE names, window names and relation aliases.
 
-**Phase 1's test matrix must include an ANALYZE fixture with
-`log_triggers` enabled.** `ExplainPrintTriggers` is unreachable otherwise
-(§1.2), so a matrix of non-ANALYZE plans will pass while FR-17 is entirely
-unexercised.
+**Phase 1's test matrix must include an ANALYZE fixture.** A matrix of
+non-ANALYZE plans will pass while FR-17 is entirely unexercised. *(rev. T18: this
+used to read "an ANALYZE fixture with `log_triggers` enabled", on the premise that
+"`ExplainPrintTriggers` is unreachable otherwise". It is reachable otherwise —
+`ExplainOnePlan()` calls it on `es->analyze` alone (§1.2) — so ANALYZE is the
+requirement and `log_triggers` is needed only to additionally cover the
+auto_explain path, which the TAP file does.)*
 
 ## 7. Alternatives considered and rejected
 

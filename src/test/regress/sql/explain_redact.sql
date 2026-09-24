@@ -87,6 +87,28 @@ ANALYZE zsec_orders;
 CREATE TABLE zsec_parted (zsec_k int, zsec_ssn text) PARTITION BY RANGE (zsec_k);
 CREATE TABLE zsec_parted_p1 PARTITION OF zsec_parted FOR VALUES FROM (0) TO (10);
 
+-- Trigger fixtures for FR-17 *(rev. T18)*.
+--
+-- A dedicated table, not zsec_customers: the FR-17 sweep row runs with ANALYZE,
+-- so its INSERT really executes, five times over (once for the positive control
+-- and once per format for the inverted sweep).  Hung on zsec_customers that
+-- would change the row counts every other fixture reports.
+--
+-- Created up here rather than beside the rest of the T18 section so that the
+-- marking-discipline query below actually checks these names -- which is also
+-- why the T18 section re-runs that query for the objects it does create late.
+CREATE TABLE zsec_trig_tab (zsec_k int, zsec_note text);
+CREATE FUNCTION zsec_trig_fn() RETURNS trigger
+    LANGUAGE plpgsql AS $$ BEGIN RETURN NULL; END $$;
+-- A PLAIN trigger, so its own name is printed without VERBOSE and the positive
+-- control has an identifier to find.  The constraint-backed half of the section
+-- cannot be a sweep fixture at all: without VERBOSE report_triggers() prints
+-- only the constraint name, so a sweep row expecting the trigger name would fail
+-- the positive control, and one expecting the constraint name would not exercise
+-- the trigger-name path.  Both halves are covered in the T18 section instead.
+CREATE TRIGGER zsec_trig_plain AFTER INSERT ON zsec_trig_tab
+    FOR EACH ROW EXECUTE FUNCTION zsec_trig_fn();
+
 --
 -- The detector.
 --
@@ -205,6 +227,17 @@ INSERT INTO zsec_fixtures (fr, note, opts, zsec_expect, qry) VALUES
 -- NB: the FR-16 "index name" scan fixture is NOT here.  It needs the planner
 -- pushed off a sequential scan, which is a GUC, so it lives in its own section
 -- below alongside the other GUC-dependent fixtures.
+-- FR-17: the trigger section.  *(rev. T18: this row is NEW.  The file used to
+-- state that FR-17 was out of reach here and leave it to TAP; the gate it cited
+-- belongs to auto_explain's caller, not to the section -- see the corrected note
+-- further down.  ExplainOnePlan() reaches report_triggers() on es->analyze
+-- alone, so ANALYZE in the opts column is all this row needs, and it is genuine
+-- from birth rather than promoted: the trigger name is printed without REDACT
+-- and pseudonymized with it.  TIMING OFF and BUFFERS OFF because a float and a
+-- buffer count cannot be pinned in an expected file.)*
+('FR-17', 'trigger name', 'ANALYZE, COSTS OFF, TIMING OFF, BUFFERS OFF',
+ 'zsec_trig_plain',
+ 'INSERT INTO zsec_trig_tab VALUES (1, ''zsecdata-trig'')'),
 -- FR-18/20/21: names and values inside expressions.
 ('FR-18', 'user function name',       'COSTS OFF', 'zsec_func',
  'SELECT zsec_id FROM zsec_customers WHERE zsec_func(zsec_ssn)'),
@@ -228,10 +261,17 @@ INSERT INTO zsec_fixtures (fr, note, opts, zsec_expect, qry) VALUES
  'SELECT zsec_id FROM zsec_customers WHERE zsec_ssn = ''zsec_val_secret'''),
 ('FR-21', 'enum literal',             'COSTS OFF', 'zsec_val_b',
  'SELECT zsec_id FROM zsec_customers WHERE zsec_kind = ''zsec_val_b'''),
--- FR-22/FR-23 (query text, parameter values) and FR-17 (the trigger section)
--- are not reachable from plain EXPLAIN: the first two are emitted only by
--- auto_explain, and the third needs ANALYZE plus log_triggers.  They are
--- covered by contrib/auto_explain/t/002_redact.pl instead.
+-- FR-22/FR-23 (query text, parameter values) are not reachable from plain
+-- EXPLAIN at all: both are emitted only by auto_explain, so they are covered by
+-- contrib/auto_explain/t/002_redact.pl instead.
+--
+-- *(rev. T18: this comment used to put FR-17, the trigger section, in the same
+-- category "because it needs ANALYZE plus log_triggers".  That is the
+-- auto_explain caller's gate, not the section's.  ExplainPrintTriggers() has a
+-- second caller in ExplainOnePlan() (explain.c:645) gated on es->analyze ALONE,
+-- so EXPLAIN (ANALYZE, REDACT) reaches report_triggers() from right here.  FR-17
+-- is not in the sweep because the sweep runs without ANALYZE, not because it is
+-- out of reach; it has its own section at the end of this file.)*
 -- FR-46: columns of RTEs that have no relid.  Each is a separate case on
 -- purpose -- combined into one query, a single passing path would mask a
 -- failing one.
@@ -733,6 +773,23 @@ SELECT f.fr,
 --
 -- The sweep is 29 rows now rather than 28, and the count of inverted rows in
 -- this file that carry real signal is 15 of 34.
+--
+-- T18 added one and converted none *(rev. T18)*:
+--
+--   FR-17 trigger name  -> Trigger Name / Constraint Name / Relation  (NEW ROW)
+--
+-- Converted none is the finding, not an omission.  FR-17 is listed above as
+-- waiting on T18, but it had NO ROW IN THE SWEEP to convert -- the file had
+-- placed it with FR-22 and FR-23 as unreachable from plain EXPLAIN, on a gate
+-- that turns out to be auto_explain's rather than the section's.  So there was
+-- never a vacuous FR-17 row here that T18 could make genuine; there was a gap
+-- where a row should have been.  The new row is genuine in both directions from
+-- the start: the positive control finds "zsec_trig_plain" in the unredacted
+-- record, and the inverted sweep sees "trg1" in its place rather than a section
+-- that was never printed.
+--
+-- The sweep is 30 rows now, and the count of inverted rows in this file that
+-- carry real signal is 16 of 35.
 --
 -- The FR-18 row is new because the existing one could not be promoted.  "FR-18
 -- user function name" puts the name in a Filter, and an expression property is
@@ -1888,6 +1945,468 @@ SELECT zsec_fmt AS format, zsec_redacted AS redact,
 -- has is already silent, so an "f1" here would be the one trace of an extension
 -- in a record with none.
 --
+--
+-- ===========================================================================
+-- T18: the trigger section -- trigger name, constraint name, relation.
+--
+-- THE VEHICLE IS THIS FILE, AND THAT IS A CORRECTION.
+--
+-- Every earlier revision of this file said the trigger section could not be
+-- reached from EXPLAIN and left FR-17 entirely to
+-- contrib/auto_explain/t/002_redact.pl, on the grounds that it needs ANALYZE
+-- *and* log_triggers.  log_triggers gates auto_explain's caller.
+-- ExplainPrintTriggers() has a second caller, in ExplainOnePlan() at
+-- explain.c:645, gated on es->analyze alone -- so
+-- EXPLAIN (ANALYZE, REDACT) prints the section right here, and the regression
+-- suite is the better vehicle for it: the TAP file has to scrape a log, while
+-- this file can pin the line.  The TAP coverage is kept, because auto_explain is
+-- the channel the feature exists for, but it is no longer the only coverage.
+--
+-- Three names, and they are disclosed under DIFFERENT conditions, which is the
+-- thing a test at one verbosity gets half-right:
+--
+--   trigger name    -> "trgN".  In TEXT, printed only when VERBOSE is set OR the
+--                      trigger has no constraint.  In the structured formats,
+--                      always.
+--   constraint name -> "conN".  Printed whenever there is one, both modes.
+--   relation        -> "tN".    In TEXT, only when show_relname is set; in the
+--                      structured formats, always.
+--
+-- So the matrix below is two triggers (one plain, one constraint-backed) times
+-- two verbosities, times four formats -- not because symmetry is tidy, but
+-- because three of those four text cells print a different set of names.
+--
+-- WHAT MUST NOT HAPPEN HERE: this section must not become deletion.  Calls is
+-- the entire reason anyone turns the trigger section on, and Time with it.  Both
+-- are asserted present and numeric, against raw output rather than through
+-- zsec_plan(), which rewrites every digit to N and would make "calls=N" vacuous.
+-- ===========================================================================
+--
+-- TIMING OFF throughout, deliberately.  With timing on the line ends
+-- "time=0.123 calls=1" and the float is a machine-dependent value that no
+-- expected file can pin; TIMING OFF takes the ": calls=N" arm of the same
+-- branch.  BUFFERS OFF because ANALYZE enables buffers by default in this
+-- branch, and zsec_plan() strips a "Buffers:" line but not the "I/O Timings:"
+-- line that hangs off it.
+--
+-- A second table for the constraint-backed trigger.  A real FOREIGN KEY rather
+-- than CREATE CONSTRAINT TRIGGER, because an FK is the shape users actually have
+-- and it names the constraint independently of the trigger, so "trgN" and "conN"
+-- can be told apart.  (The TAP file uses CREATE CONSTRAINT TRIGGER, where the
+-- constraint and the trigger necessarily share one name -- fine there, useless
+-- for distinguishing two pseudonyms.)
+CREATE TABLE zsec_t18_parent (zsec_pk int PRIMARY KEY);
+INSERT INTO zsec_t18_parent VALUES (1), (2), (3);
+CREATE TABLE zsec_t18_tab (zsec_k int, zsec_note text);
+CREATE TRIGGER zsec_t18_plaintrig AFTER INSERT ON zsec_t18_tab
+    FOR EACH ROW EXECUTE FUNCTION zsec_trig_fn();
+ALTER TABLE zsec_t18_tab ADD CONSTRAINT zsec_t18_fk
+    FOREIGN KEY (zsec_k) REFERENCES zsec_t18_parent(zsec_pk);
+--
+-- THE FOUR TEXT LINES, verbatim, plain beside redacted.
+--
+-- Printing all four rather than asserting on them is the point: the shape is
+-- what is being checked, and a regex would let a changed shape through as long
+-- as it still matched.  Read the plain block and the redacted block as a pair --
+-- each redacted line must have the same tokens as the plain line above it, with
+-- the names swapped and nothing added or dropped.
+--
+-- In particular: the constraint trigger without VERBOSE prints "Trigger for
+-- constraint conN" with NO trigger pseudonym, exactly as plain mode prints no
+-- trigger name there.  That cell is the one a redaction-specific print arm gets
+-- wrong -- an arm that always emitted the trigger pseudonym would make the
+-- redacted record show MORE structure than the record it stands for, which is
+-- the direction requirements section 10.4 warns about in reverse.
+--
+SELECT * FROM zsec_plan('INSERT INTO zsec_t18_tab VALUES (1, ''zsecdata-a'')',
+                        'ANALYZE, COSTS OFF, TIMING OFF, BUFFERS OFF');
+-- The internal name is filtered, and it is the reason this line needs filtering
+-- at all.  A foreign key's enforcement trigger is named by PostgreSQL from the
+-- CONSTRAINT'S OID -- "RI_ConstraintTrigger_c_46760" -- so the real name printed
+-- here changes on every initdb and no expected file can hold it.  zsec_plan()
+-- does not catch it: that helper rewrites a digit run only at a word boundary,
+-- and the digits here follow an underscore, which is a word character.
+--
+-- Worth seeing rather than skipping, because this is the line that shows what
+-- VERBOSE adds in plain mode -- a second name, the trigger's own -- which is
+-- exactly what the redacted VERBOSE line below has to add too, as "trg1".
+SELECT regexp_replace(l, 'RI_ConstraintTrigger_[ac]_[0-9]+',
+                      'RI_ConstraintTrigger_c_OID') AS zsec_plan_verbose
+  FROM zsec_plan('INSERT INTO zsec_t18_tab VALUES (1, ''zsecdata-a'')',
+                 'ANALYZE, COSTS OFF, TIMING OFF, BUFFERS OFF, VERBOSE') l;
+SELECT * FROM zsec_plan('INSERT INTO zsec_t18_tab VALUES (1, ''zsecdata-a'')',
+                        'ANALYZE, COSTS OFF, TIMING OFF, BUFFERS OFF, REDACT');
+SELECT * FROM zsec_plan('INSERT INTO zsec_t18_tab VALUES (1, ''zsecdata-a'')',
+                        'ANALYZE, COSTS OFF, TIMING OFF, BUFFERS OFF, REDACT, VERBOSE');
+--
+-- The same four cells as assertions, so a failure says which one broke rather
+-- than leaving a reader to diff two blocks of plan text.
+--
+-- The plain-trigger row and the constraint-trigger row are separated by matching
+-- on the "for constraint" token, which only the latter carries.
+--
+SELECT v.verbosity,
+       CASE
+         WHEN plain_line IS NULL
+           THEN 'FAIL: no plain-trigger line -- assertion is vacuous'
+         WHEN plain_line ~ 'zsec_'
+           THEN 'FAIL: marker in the plain-trigger line'
+         WHEN plain_line !~ '^Trigger trg[0-9]+: calls='
+           THEN 'FAIL: plain trigger does not show its pseudonym: ' || plain_line
+         ELSE 'ok: plain trigger shows trgN at this verbosity'
+       END AS plain_trigger,
+       CASE
+         WHEN con_line IS NULL
+           THEN 'FAIL: no constraint-trigger line -- assertion is vacuous'
+         WHEN con_line ~ 'zsec_'
+           THEN 'FAIL: marker in the constraint-trigger line'
+         WHEN v.is_verbose AND con_line !~ '^Trigger trg[0-9]+ for constraint con[0-9]+: calls='
+           THEN 'FAIL: VERBOSE must show both names: ' || con_line
+         WHEN NOT v.is_verbose AND con_line !~ '^Trigger for constraint con[0-9]+: calls='
+           THEN 'FAIL: without VERBOSE the trigger name must be omitted: ' || con_line
+         ELSE 'ok: constraint trigger names exactly what plain mode names'
+       END AS constraint_trigger
+  FROM (VALUES ('without VERBOSE', false, 'ANALYZE, COSTS OFF, TIMING OFF, BUFFERS OFF, REDACT'),
+               ('with VERBOSE',    true,  'ANALYZE, COSTS OFF, TIMING OFF, BUFFERS OFF, REDACT, VERBOSE'))
+         AS v(verbosity, is_verbose, opts),
+       LATERAL (SELECT
+                  (SELECT btrim(l) FROM zsec_plan('INSERT INTO zsec_t18_tab VALUES (1, ''zsecdata-b'')', v.opts) l
+                    WHERE l LIKE '%Trigger%' AND l NOT LIKE '%for constraint%') AS plain_line,
+                  (SELECT btrim(l) FROM zsec_plan('INSERT INTO zsec_t18_tab VALUES (1, ''zsecdata-b'')', v.opts) l
+                    WHERE l LIKE '%Trigger%' AND l LIKE '%for constraint%') AS con_line) s
+ ORDER BY v.verbosity COLLATE "C";
+--
+-- SHAPE PRESERVATION, counted rather than eyeballed.
+--
+-- The redacted record must not print more structure than the plain one.  Token
+-- counts are the cheapest faithful measure: the constraint-trigger line without
+-- VERBOSE is four tokens plain ("Trigger for constraint <name>:") and must be
+-- four tokens redacted, not five.  This is the cell where an unconditional
+-- "Trigger trgN" arm would show up as 5 against 4.
+--
+SELECT v.what,
+       (SELECT array_length(regexp_split_to_array(btrim(l), '\s+'), 1)
+          FROM zsec_plan(v.qry, v.plain_opts) l
+         WHERE l LIKE '%Trigger%' AND l LIKE '%for constraint%') AS plain_tokens,
+       (SELECT array_length(regexp_split_to_array(btrim(l), '\s+'), 1)
+          FROM zsec_plan(v.qry, v.plain_opts || ', REDACT') l
+         WHERE l LIKE '%Trigger%' AND l LIKE '%for constraint%') AS redacted_tokens
+  FROM (VALUES
+        ('constraint trigger, no VERBOSE',
+         'INSERT INTO zsec_t18_tab VALUES (1, ''zsecdata-c'')',
+         'ANALYZE, COSTS OFF, TIMING OFF, BUFFERS OFF'),
+        ('constraint trigger, VERBOSE',
+         'INSERT INTO zsec_t18_tab VALUES (1, ''zsecdata-c'')',
+         'ANALYZE, COSTS OFF, TIMING OFF, BUFFERS OFF, VERBOSE')
+       ) AS v(what, qry, plain_opts)
+ ORDER BY v.what COLLATE "C";
+--
+-- FR-38: REDACTION IS NOT DELETION.  Calls survives, and Time survives when
+-- timing is on.
+--
+-- Asserted against raw output, not through zsec_plan(): that helper rewrites
+-- every digit to "N", so "calls=N" would pass whether a number had been printed
+-- or not.  Matched as [0-9]+ here, which is the whole point.
+--
+SELECT CASE
+         WHEN b !~ 'Trigger'          THEN 'FAIL: no trigger section -- assertion is vacuous'
+         WHEN b !~ 'calls=[0-9]+'     THEN 'FAIL: Calls did not survive redaction'
+         ELSE 'ok: calls=<number> present in a redacted record'
+       END AS calls_survives_timing_off,
+       substring(b from 'calls=[0-9]+') AS the_token
+  FROM (SELECT zsec_explain_blob('INSERT INTO zsec_t18_tab VALUES (1, ''zsecdata-d'')',
+                                 'ANALYZE, COSTS OFF, TIMING OFF, BUFFERS OFF, REDACT')) AS s(b);
+-- With timing ON both counters print.  The float itself is not pinned -- only
+-- that it is there and is a number -- because its value is machine-dependent.
+SELECT CASE
+         WHEN b !~ 'Trigger'                          THEN 'FAIL: no trigger section -- assertion is vacuous'
+         WHEN b !~ 'time=[0-9]+\.[0-9]+ calls=[0-9]+' THEN 'FAIL: Time and Calls did not both survive'
+         ELSE 'ok: time=<float> calls=<number> present in a redacted record'
+       END AS time_and_calls_survive_timing_on
+  FROM (SELECT zsec_explain_blob('INSERT INTO zsec_t18_tab VALUES (1, ''zsecdata-e'')',
+                                 'ANALYZE, COSTS OFF, BUFFERS OFF, REDACT')) AS s(b);
+--
+-- ALL FOUR FORMATS.  Trigger Name, Constraint Name and Relation are three
+-- separate properties in json/xml/yaml, written by ExplainPropertyText rather
+-- than appended to the buffer -- and, unlike text, printed UNCONDITIONALLY
+-- rather than gated on VERBOSE.  A text-only check therefore leaves the widest
+-- surface of this section untested: the trigger name reaches a structured record
+-- even in the cell where text omits it.
+--
+-- Six clauses.  The first two are the requirement; the next three are
+-- anti-vacuity guards, one per property, because a record that emitted none of
+-- them would satisfy "no marker" for free -- which is the state this section was
+-- in before T18.
+--
+SELECT fmt.name AS format,
+       CASE
+         WHEN b LIKE '%zsec_t18_plaintrig%' THEN 'FAIL: real trigger name present'
+         WHEN b LIKE '%zsec_t18_fk%'        THEN 'FAIL: real constraint name present'
+         WHEN b LIKE '%zsec_%'              THEN 'FAIL: marker present'
+         WHEN b !~ '\mtrg[0-9]+\M'          THEN 'FAIL: no trigger pseudonym -- assertion is vacuous'
+         WHEN b !~ '\mcon[0-9]+\M'          THEN 'FAIL: no constraint pseudonym -- assertion is vacuous'
+         -- Case-insensitive: the structured formats emit a "Calls" property while
+         -- text appends "calls=".  One clause for both, so the anti-vacuity
+         -- guard is not silently text-only or silently structured-only.
+         WHEN b !~* 'calls'                 THEN 'FAIL: no firing count -- redaction became deletion'
+         ELSE 'ok: trgN, conN, firing count kept, no real name'
+       END AS verdict
+  FROM (VALUES ('json'), ('text'), ('xml'), ('yaml')) AS fmt(name),
+       LATERAL (SELECT zsec_explain_blob('INSERT INTO zsec_t18_tab VALUES (1, ''zsecdata-f'')',
+                                         'ANALYZE, COSTS OFF, TIMING OFF, BUFFERS OFF, REDACT, VERBOSE, FORMAT ' || fmt.name)) AS s(b)
+ ORDER BY fmt.name COLLATE "C";
+-- And the property TAGS themselves must all three still be emitted in the
+-- structured formats, in the cell where TEXT omits the trigger name.  This is
+-- the half of the format split that the text assertions above cannot see: if
+-- "Trigger Name" went missing from json under REDACT, every text assertion in
+-- this section would still pass.
+SELECT fmt.name AS format,
+       CASE
+         -- "Trigger[- ]Name", not a LIKE on "Trigger Name": an XML tag cannot
+         -- contain a space, so ExplainPropertyText writes <Trigger-Name> there
+         -- and <Trigger Name> nowhere.  A LIKE reported the XML row as a
+         -- dropped property when the property was present all along.
+         WHEN b !~ 'Trigger[- ]Name'    THEN 'FAIL: Trigger Name property dropped'
+         WHEN b !~ 'Constraint[- ]Name' THEN 'FAIL: Constraint Name property dropped'
+         WHEN b !~ 'Relation'           THEN 'FAIL: Relation property dropped'
+         WHEN b LIKE '%zsec_%'          THEN 'FAIL: marker present'
+         ELSE 'ok: all three properties emitted without VERBOSE, all pseudonymous'
+       END AS verdict
+  FROM (VALUES ('json'), ('xml'), ('yaml')) AS fmt(name),
+       LATERAL (SELECT zsec_explain_blob('INSERT INTO zsec_t18_tab VALUES (1, ''zsecdata-g'')',
+                                         'ANALYZE, COSTS OFF, TIMING OFF, BUFFERS OFF, REDACT, FORMAT ' || fmt.name)) AS s(b)
+ ORDER BY fmt.name COLLATE "C";
+--
+-- FR-40: THE "on tN" MUST BE THE SAME tN THE SCAN LINE PRINTS.
+--
+-- This is the property that makes the section readable at all.  A trigger line
+-- naming a relation the rest of the record does not name tells the reader
+-- nothing; the pseudonym has to be the same one, and it is, because both sites
+-- key REDACT_RELATION on the same OID and the map returns one entry per key.
+--
+-- Reaching the "on tN" clause at all took finding out why the obvious fixture
+-- does not.  ExplainPrintTriggers() sets
+--
+--     show_relname = (list_length(resultrels) > 1 || routerels != NIL || targrels != NIL)
+--
+-- so a single-result-relation INSERT -- the fixture above -- prints NO relation
+-- on its trigger lines, in text.  All four text lines above are therefore
+-- silent on FR-40 and would have been mistaken for coverage of it.
+--
+-- An UPDATE of a two-partition table is the clean case: two result relations, so
+-- show_relname is set, and both leaves appear in the plan as scan targets, so
+-- the tN on each trigger line has a scan line to agree with.
+--
+CREATE TABLE zsec_t18_p (zsec_k int, zsec_note text) PARTITION BY RANGE (zsec_k);
+CREATE TABLE zsec_t18_p1 PARTITION OF zsec_t18_p FOR VALUES FROM (0) TO (10);
+CREATE TABLE zsec_t18_p2 PARTITION OF zsec_t18_p FOR VALUES FROM (10) TO (20);
+INSERT INTO zsec_t18_p VALUES (1, 'zsecdata-p1'), (11, 'zsecdata-p2');
+CREATE TRIGGER zsec_t18_p1_trg AFTER UPDATE ON zsec_t18_p1
+    FOR EACH ROW EXECUTE FUNCTION zsec_trig_fn();
+CREATE TRIGGER zsec_t18_p2_trg AFTER UPDATE ON zsec_t18_p2
+    FOR EACH ROW EXECUTE FUNCTION zsec_trig_fn();
+SELECT * FROM zsec_plan('UPDATE zsec_t18_p SET zsec_note = zsec_note',
+                        'ANALYZE, COSTS OFF, TIMING OFF, BUFFERS OFF');
+SELECT * FROM zsec_plan('UPDATE zsec_t18_p SET zsec_note = zsec_note',
+                        'ANALYZE, COSTS OFF, TIMING OFF, BUFFERS OFF, REDACT');
+-- The linkage itself, as a set comparison rather than a line dump: every relation
+-- named on a trigger line must also be named on a scan line, and there must be
+-- more than one of them or the assertion is satisfied by a single-partition plan
+-- that could not have got it wrong.
+SELECT CASE
+         WHEN trig_rels IS NULL OR array_length(trig_rels, 1) IS NULL
+           THEN 'FAIL: no relation on any trigger line -- assertion is vacuous'
+         WHEN array_length(trig_rels, 1) < 2
+           THEN 'FAIL: only one trigger relation -- the agreement is trivial'
+         WHEN scan_rels IS NULL
+           THEN 'FAIL: no scan line named a relation -- assertion is vacuous'
+         WHEN NOT (trig_rels <@ scan_rels)
+           THEN 'FAIL: trigger names ' || array_to_string(trig_rels, ',')
+                || ' but the scans name ' || array_to_string(scan_rels, ',')
+         ELSE 'ok: every trigger relation is a relation the plan scans ('
+              || array_to_string(trig_rels, ',') || ')'
+       END AS fr40_trigger_relation_linkage
+  FROM (SELECT
+          (SELECT array_agg(DISTINCT m[1] ORDER BY m[1])
+             FROM zsec_plan(q, 'ANALYZE, COSTS OFF, TIMING OFF, BUFFERS OFF, REDACT') l,
+                  LATERAL regexp_matches(l, '^Trigger .* on (t[0-9]+):') m) AS trig_rels,
+          (SELECT array_agg(DISTINCT m[1] ORDER BY m[1])
+             FROM zsec_plan(q, 'ANALYZE, COSTS OFF, TIMING OFF, BUFFERS OFF, REDACT') l,
+                  LATERAL regexp_matches(l, 'Seq Scan on (t[0-9]+)') m) AS scan_rels
+          FROM (VALUES ('UPDATE zsec_t18_p SET zsec_note = zsec_note')) v(q)) s;
+-- The same linkage in a structured format, where the trigger's relation is a
+-- "Relation" property and the scan's is "Relation Name" -- two different property
+-- writers, so text agreeing does not make json agree.
+SELECT CASE
+         WHEN b !~ '"?Relation"?' THEN 'FAIL: no Relation property -- assertion is vacuous'
+         WHEN (SELECT count(DISTINCT m[1]) FROM regexp_matches(b, 'Relation(?: Name)?"?[>: ]+"?(t[0-9]+)', 'g') m) <> 1
+           THEN 'FAIL: the trigger relation and the scan relation are different pseudonyms'
+         ELSE 'ok: one relation, one pseudonym, across both property writers'
+       END AS fr40_json_linkage
+  FROM (SELECT zsec_explain_blob('INSERT INTO zsec_t18_tab VALUES (1, ''zsecdata-h'')',
+                                 'ANALYZE, COSTS OFF, TIMING OFF, BUFFERS OFF, REDACT, FORMAT json')) AS s(b);
+--
+-- TUPLE ROUTING: the one case where "on tN" names a relation the plan does not.
+--
+-- Under routing the trigger fires on the LEAF, so the relation on the trigger
+-- line is the leaf's pseudonym -- and for an INSERT the leaf is not in the plan
+-- at all, so that pseudonym appears nowhere else in the record.  FR-40 still
+-- holds (one object, one pseudonym); what does not hold is the stronger reading
+-- of it that the assertion above tests, that a trigger relation is always
+-- findable elsewhere in the record.
+--
+-- Recorded as a fixture rather than a note because the shape looks like a bug and
+-- is not: the plain output has the identical structure -- "on zsec_t18_r1" under
+-- a plan that says zsec_t18_r -- so redaction is being faithful to something
+-- upstream already does.  Both halves are printed so the agreement is visible
+-- rather than asserted.
+--
+CREATE TABLE zsec_t18_r (zsec_k int, zsec_note text) PARTITION BY RANGE (zsec_k);
+CREATE TABLE zsec_t18_r1 PARTITION OF zsec_t18_r FOR VALUES FROM (0) TO (10);
+CREATE TRIGGER zsec_t18_r1_trg AFTER INSERT ON zsec_t18_r1
+    FOR EACH ROW EXECUTE FUNCTION zsec_trig_fn();
+SELECT * FROM zsec_plan('INSERT INTO zsec_t18_r VALUES (1, ''zsecdata-r'')',
+                        'ANALYZE, COSTS OFF, TIMING OFF, BUFFERS OFF');
+SELECT * FROM zsec_plan('INSERT INTO zsec_t18_r VALUES (2, ''zsecdata-r'')',
+                        'ANALYZE, COSTS OFF, TIMING OFF, BUFFERS OFF, REDACT');
+SELECT CASE
+         WHEN trig_rel IS NULL  THEN 'FAIL: no relation on the trigger line -- routing did not set show_relname'
+         WHEN target_rel IS NULL THEN 'FAIL: no Insert target -- assertion is vacuous'
+         WHEN trig_rel = target_rel
+           THEN 'CHANGED: the leaf and the parent now share a pseudonym -- routing no longer distinguishes them'
+         ELSE 'ok: trigger fires on the leaf (' || trig_rel
+              || '), the plan names the parent (' || target_rel
+              || ') -- same shape as unredacted'
+       END AS routing_leaf_pseudonym
+  FROM (SELECT
+          (SELECT m[1] FROM zsec_plan(q, 'ANALYZE, COSTS OFF, TIMING OFF, BUFFERS OFF, REDACT') l,
+                LATERAL regexp_matches(l, '^Trigger .* on (t[0-9]+):') m) AS trig_rel,
+          (SELECT m[1] FROM zsec_plan(q, 'ANALYZE, COSTS OFF, TIMING OFF, BUFFERS OFF, REDACT') l,
+                LATERAL regexp_matches(l, 'Insert on (t[0-9]+)') m) AS target_rel
+          FROM (VALUES ('INSERT INTO zsec_t18_r VALUES (3, ''zsecdata-r'')')) v(q)) s;
+--
+-- A CONSEQUENCE OF RESOLVING UP FRONT, pinned as a decision rather than found
+-- later as a surprise.
+--
+-- report_triggers() resolves all three names BEFORE deciding what to print, so a
+-- constraint trigger consumes a trigger pseudonym even in the run that does not
+-- print one.  The no-VERBOSE record therefore reads "Trigger trg2" with no trg1
+-- anywhere in it -- a visible gap in the numbering.
+--
+-- Deliberate, and the alternative is worse: allocating at print time would give
+-- the SAME trigger a different pseudonym at different verbosities, and FR-40 is
+-- exactly the rule that one object has one name.  The gap discloses nothing the
+-- line beside it does not already disclose -- the reader has already been told a
+-- constraint trigger fired.  Asserted so that a later edit which "tidies" the
+-- numbering has to come here and read this.
+--
+SELECT CASE
+         WHEN novrb IS NULL OR vrb IS NULL
+           THEN 'FAIL: missing a plain-trigger line -- assertion is vacuous'
+         WHEN novrb <> vrb
+           THEN 'CHANGED: the plain trigger is ' || novrb || ' without VERBOSE and '
+                || vrb || ' with it -- pseudonyms are now allocated at print time'
+         ELSE 'ok: the same trigger keeps pseudonym ' || novrb
+              || ' at both verbosities, so the unprinted one leaves a gap'
+       END AS pseudonym_stable_across_verbosity
+  FROM (SELECT
+          (SELECT m[1] FROM zsec_plan(q, 'ANALYZE, COSTS OFF, TIMING OFF, BUFFERS OFF, REDACT') l,
+                LATERAL regexp_matches(l, '^Trigger (trg[0-9]+): calls') m) AS novrb,
+          (SELECT m[1] FROM zsec_plan(q, 'ANALYZE, COSTS OFF, TIMING OFF, BUFFERS OFF, REDACT, VERBOSE') l,
+                LATERAL regexp_matches(l, '^Trigger (trg[0-9]+): calls') m) AS vrb
+          FROM (VALUES ('INSERT INTO zsec_t18_tab VALUES (1, ''zsecdata-i'')')) v(q)) s;
+--
+-- FR-61 for this section: a trigger group opened and not closed corrupts the
+-- structured formats and is invisible in text.  report_triggers() opens a group
+-- per trigger and ExplainPrintTriggers() wraps them all in one more, and T18
+-- removed code from between those calls.
+--
+SELECT jsonb_typeof(zsec_explain_blob('INSERT INTO zsec_t18_tab VALUES (1, ''zsecdata-j'')',
+                                      'ANALYZE, COSTS OFF, TIMING OFF, BUFFERS OFF, REDACT, FORMAT json')::jsonb)
+       AS redacted_trigger_json_parses_as,
+       zsec_explain_blob('INSERT INTO zsec_t18_tab VALUES (1, ''zsecdata-j'')',
+                         'ANALYZE, COSTS OFF, TIMING OFF, BUFFERS OFF, REDACT, FORMAT xml') ~ '^<explain.*</explain>\s*$'
+       AS xml_ok,
+       zsec_explain_blob('INSERT INTO zsec_t18_tab VALUES (1, ''zsecdata-j'')',
+                         'ANALYZE, COSTS OFF, TIMING OFF, BUFFERS OFF, REDACT, FORMAT yaml') ~ '^- Plan:'
+       AS yaml_ok;
+--
+-- EXEMPTION: a trigger and a constraint are never exempt.
+--
+-- report_triggers() asks explain_redact_name() for a name and never for a
+-- decision, because neither object can be reached except through a user
+-- relation.  redact_object_namespace() has no case for REDACT_TRIGGER or
+-- REDACT_CONSTRAINT and both fall through to "not exempt", which the test module
+-- asserts directly (test_redact_exempt).  What is asserted here is the
+-- consequence a user sees: there is no catalog trigger to write a fixture
+-- against, so the negative control is that the relation beside it obeys the
+-- ordinary exemption rule -- a redacted trigger line on a redacted relation, and
+-- nothing borrowing a real name from the catalog.
+--
+-- Recorded rather than faked: a fixture asserting "no pg_catalog trigger was
+-- pseudonymized" would be asserting the absence of a string from output that was
+-- never going to contain it, which is the vacuity this file is organised against.
+--
+-- The marking-discipline query, re-run.  *(rev. T18.)*
+--
+-- The copy near the top of this file says it is "Placed after the LAST object is
+-- created".  That stopped being true at T15: zsec_memo_*, zsec_enr_*, zsec_srf
+-- and zsec_enr17_* are all created after it and are checked by nothing, and T18's
+-- objects would have joined them.  Run again here, so the invariant the file
+-- claims actually holds over the whole file rather than over its first third.
+-- Must return nothing.
+--
+-- Triggers are deliberately not in scope, here or above: PostgreSQL names the
+-- internal RI triggers of a foreign key itself ("RI_ConstraintTrigger_c_NNNN"),
+-- so the marker convention cannot apply to them.  The T18 fixtures' own trigger
+-- names are marked, and the assertions above name them literally, which is what
+-- makes a leak of one visible.
+--
+-- THE HARNESS IS EXCLUDED, AND THAT IS A CORRECTION TO THE COPY ABOVE.  That one
+-- says it "must return nothing"; it returns eight rows -- the parameter names of
+-- zsec_leaks/zsec_plan and the columns of zsec_fixtures.  Those are test
+-- plumbing, not fixtures: no plan under test scans zsec_fixtures or mentions
+-- "query_text", so an unmarked name there is not a blind spot.  The enforcement
+-- still worked, because the output is pinned and any NEW unmarked name changes
+-- it -- but "must return nothing" was not true, and a reader checking the claim
+-- against the expected file would find eight rows and not know which of them were
+-- supposed to be there.  This copy names the plumbing explicitly and so can
+-- genuinely assert emptiness.  zsec_func's "zsec_arg" is deliberately still in
+-- scope: it is FR-94's fixture and it is marked.
+--
+SELECT kind, name FROM (
+    SELECT 'relation' AS kind, c.relname::text AS name
+      FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+     WHERE n.nspname = 'zsec_ns'
+    UNION ALL
+    SELECT 'column', a.attname::text
+      FROM pg_attribute a
+      JOIN pg_class c ON c.oid = a.attrelid
+      JOIN pg_namespace n ON n.oid = c.relnamespace
+     WHERE n.nspname = 'zsec_ns' AND a.attnum > 0 AND NOT a.attisdropped
+       AND c.relkind NOT IN ('S', 'i')
+       -- The fixture catalog itself: harness, and never scanned by a fixture.
+       AND c.relname <> 'zsec_fixtures'
+    UNION ALL
+    SELECT 'function', p.proname::text
+      FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
+     WHERE n.nspname = 'zsec_ns'
+    UNION ALL
+    SELECT 'constraint', con.conname::text
+      FROM pg_constraint con JOIN pg_namespace n ON n.oid = con.connamespace
+     WHERE n.nspname = 'zsec_ns'
+    UNION ALL
+    SELECT 'argument name', unnest(p.proargnames)::text
+      FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
+     WHERE n.nspname = 'zsec_ns' AND p.proargnames IS NOT NULL
+       -- The harness helpers.  Their parameters are named for what they take,
+       -- and none of them reaches a plan.
+       AND p.proname NOT IN ('zsec_leaks', 'zsec_plan', 'zsec_explain_blob',
+                             'zsec_index_verdict')
+) obj
+ WHERE name !~ '^_?zsec_'
+ ORDER BY kind COLLATE "C", name COLLATE "C";
+
 --
 -- Parallel plans.  A worker's section is produced by the same ExplainNode code,
 -- but with es->str temporarily pointed at a per-worker buffer, so it is worth

@@ -96,9 +96,16 @@
 #                              no client EXPLAIN produces this property
 #   FR-22  Query Parameters    bind parameter VALUES -- the one leak class that is
 #                              data rather than schema
-#   FR-17  the trigger section reachable only with log_analyze AND log_triggers,
-#                              so a matrix of non-ANALYZE plans never executes
-#                              report_triggers() at all
+#   FR-17  the trigger section needs log_analyze AND log_triggers here, so a
+#                              matrix of non-ANALYZE plans never executes
+#                              report_triggers() at all.  NOT exclusive to this
+#                              file: ExplainOnePlan() reaches the same function
+#                              on es->analyze alone, so the regression file
+#                              covers it too and is the primary vehicle since
+#                              T18.  What is exclusive here is the auto_explain
+#                              channel itself -- log_timing is on by default in
+#                              it, so this is where the trigger section's "time="
+#                              half is exercised.
 #   FR-26  the Settings block  needs log_settings; discloses search_path
 #   FR-37  Query Identifier    needs log_verbose and compute_query_id; its value
 #                              varies per build, so an expected-output file
@@ -279,10 +286,15 @@ $node->start;
 # are not kept in lockstep.  They test different channels and need different
 # objects: the regression file needs a collation, an enum, a domain, a composite
 # type and partitioned tables to reach the deparse paths that print type and
-# collation names, none of which this file asserts on; this file needs triggers,
-# which the regression file cannot reach because the trigger section requires
-# ANALYZE plus log_triggers.  Forcing parity would mean carrying objects in each
-# file that its own assertions never touch.
+# collation names, none of which this file asserts on.  Forcing parity would mean
+# carrying objects in each file that its own assertions never touch.
+#
+# *(rev. T18: this used to justify the divergence by saying this file "needs
+# triggers, which the regression file cannot reach because the trigger section
+# requires ANALYZE plus log_triggers".  The regression file does reach it -- that
+# gate is auto_explain's caller, not the section's -- and since T18 it has its own
+# trigger fixtures and its own T18 section.  The divergence is still fine, for the
+# reason above; the reason given was wrong.)*
 #
 # What IS shared, and what actually matters, is the marker convention: zsec_ on
 # every identifier and zsecdata- on every stored value.  That invariant is
@@ -420,11 +432,18 @@ ok( scalar(grep { /^zsecdata-ssn-0007$/ } @param_leaks) > 0,
 # FR-17: the trigger section.
 #
 # report_triggers() prints the trigger name, the constraint name, and the
-# relation the trigger is on.  Reaching it needs log_analyze AND log_triggers
-# together, which makes it the clearest example of a leak that a plausible test
-# matrix misses completely: with either GUC off the section is not emitted at
-# all, so a suite of non-ANALYZE plans would report full coverage while these
-# three names went entirely untested.
+# relation the trigger is on.  Reaching it THROUGH AUTO_EXPLAIN needs log_analyze
+# AND log_triggers together, which makes it the clearest example of a leak that a
+# plausible test matrix misses completely: with either GUC off the section is not
+# emitted at all, so a suite of non-ANALYZE plans would report full coverage while
+# these three names went entirely untested.
+#
+# *(rev. T18: the "AND log_triggers" is this caller's gate and was previously
+# written as the section's.  ExplainPrintTriggers() also has a caller in
+# ExplainOnePlan() gated on es->analyze alone, so EXPLAIN (ANALYZE) reaches the
+# section with no GUC at all.  The assertions here are unchanged and still worth
+# making -- they are the auto_explain channel -- but they are no longer the only
+# coverage of FR-17.)*
 #
 # The two names are also disclosed under DIFFERENT conditions, which is why there
 # are two triggers here and two verbosity settings below.
@@ -474,8 +493,10 @@ like(
 	'FR-17: VERBOSE discloses the trigger name as well as the constraint name'
 );
 
-# Confirm the converse, which is the reason FR-17 needs its own configuration:
-# without log_triggers the section is absent entirely.
+# Confirm the converse, which is the reason FR-17 needs its own configuration IN
+# THIS FILE: without log_triggers auto_explain does not call
+# ExplainPrintTriggers(), so the section is absent from the log entirely.  Says
+# nothing about the interactive path, which has no such GUC.
 $log = query_log(
 	$node,
 	"SET search_path = zsec_ns, public; INSERT INTO zsec_customers (zsec_ssn) VALUES ('y');",
@@ -728,7 +749,15 @@ is_deeply([ leaked(plan_record($log)) ],
 	[],
 	'FR-22 redacted: the bound parameter value does not reach the record');
 
-# FR-17: the trigger section keeps its counters and loses its three names.
+# FR-17: the trigger section keeps its counters and replaces its three names with
+# pseudonyms.
+#
+# *(rev. T18: the shape asserted here CHANGED.  Under T04 the section printed a
+# nameless "Trigger: calls=1" -- the names were suppressed outright -- and the
+# assertion below matched exactly that.  T18 prints "Trigger trg2: time=0.008
+# calls=1", so the old regex no longer matches and would have failed.  Updated
+# rather than deleted: the counters it guarded still need guarding, and the
+# pseudonyms now need it too.)*
 $log = query_log(
 	$node,
 	"SET search_path = zsec_ns, public; INSERT INTO zsec_customers (zsec_ssn) VALUES ('zsecdata-t04');",
@@ -741,11 +770,55 @@ is_deeply(
 	[],
 	'FR-17 redacted: trigger, constraint and relation names are all withheld'
 );
+
+# The plain trigger, which has no constraint, so its own name prints at every
+# verbosity -- as a pseudonym.  Both counters are on the same line, and this is
+# the assertion that makes redaction-is-not-deletion concrete for this section:
+# log_timing is on by default in auto_explain, so unlike the regression file this
+# is where the "time=" half is exercised at all.
 like(
 	$log,
-	qr{Trigger: (?:time=[\d.]+ )?calls=\d+},
-	'FR-17 redacted: the firing count still prints -- redaction is not deletion'
+	qr{Trigger trg\d+: time=[\d.]+ calls=\d+},
+	'FR-17 redacted: plain trigger is trgN and keeps both counters');
+
+# The constraint trigger without VERBOSE: the constraint pseudonym prints and the
+# trigger pseudonym must NOT, because that is what plain mode does here.  Asserted
+# with a negated character class rather than a bare "for constraint" match, so a
+# stray "Trigger trgN for constraint conN" on this line fails instead of passing
+# on the substring.
+like(
+	$log,
+	qr{Trigger for constraint con\d+: time=[\d.]+ calls=\d+},
+	'FR-17 redacted: constraint trigger omits its own name without VERBOSE, as plain mode does'
 );
+
+# And the real names are gone from the section specifically, not merely absent
+# from a record that lost the section.  leaked() above covers the whole record;
+# these two name the strings.
+unlike($log, qr/zsec_plaintrig|zsec_ctrig/,
+	'FR-17 redacted: neither real trigger name reaches the log');
+
+# With VERBOSE the constraint trigger discloses BOTH names in plain mode, so both
+# must be pseudonyms here -- and they must be DIFFERENT pseudonyms, one from the
+# trigger map and one from the constraint map.  The fixture is a CREATE CONSTRAINT
+# TRIGGER, so the two real names are identical ("zsec_ctrig" for both); a
+# single-map implementation would therefore print one pseudonym twice and no
+# marker-based check would notice.
+$vlog = query_log(
+	$node,
+	"SET search_path = zsec_ns, public; INSERT INTO zsec_customers (zsec_ssn) VALUES ('zsecdata-t04v');",
+	{
+		'auto_explain.log_analyze' => 'on',
+		'auto_explain.log_triggers' => 'on',
+		'auto_explain.log_verbose' => 'on'
+	});
+like(
+	$vlog,
+	qr{Trigger trg\d+ for constraint con\d+: time=[\d.]+ calls=\d+},
+	'FR-17 redacted: VERBOSE shows both names, and each comes from its own map'
+);
+is_deeply([ leaked(plan_record($vlog)) ],
+	[], 'FR-17 redacted: VERBOSE discloses no marker either');
 
 # FR-37: queryId goes.  compute_query_id is on for this cluster, so the property
 # would otherwise be emitted whenever log_verbose is.

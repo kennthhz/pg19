@@ -1297,8 +1297,10 @@ report_triggers(ResultRelInfo *rInfo, bool show_relname, ExplainState *es)
 	{
 		Trigger    *trig = rInfo->ri_TrigDesc->triggers + nt;
 		TriggerInstrumentation *tginstr = rInfo->ri_TrigInstrument + nt;
-		char	   *relname;
-		char	   *conname = NULL;
+		const char *tgname;
+		const char *relname;
+		const char *conname = NULL;
+		char	   *conname_alloc = NULL;
 
 		/*
 		 * We ignore triggers that were never invoked; they likely aren't
@@ -1310,30 +1312,50 @@ report_triggers(ResultRelInfo *rInfo, bool show_relname, ExplainState *es)
 		ExplainOpenGroup("Trigger", NULL, true, es);
 
 		/*
-		 * This section reports what the statement's triggers did.  Three
-		 * things in it come from the user's schema: the trigger's name, the
-		 * name of the constraint it implements, and the table it fires on.
-		 * The timings and the firing count -- the reason anyone turns this on
-		 * -- reveal nothing.  So the names go and the numbers stay.
+		 * Three things in this section come from the user's schema: the
+		 * trigger's name, the name of the constraint it implements, and the
+		 * table it fires on.  Under redaction each becomes a pseudonym.  The
+		 * timings and the firing count -- the reason anyone turns this
+		 * section on at all -- name nothing and are printed either way.
 		 *
-		 * The two lookups are skipped rather than done and thrown away, which
-		 * leaves both variables NULL.  That lets the printing code below test
-		 * the variable rather than repeat the redaction check.
+		 * All three names are resolved here, before any printing, so that the
+		 * code below is the same in both modes.  That is not tidiness: the
+		 * text branch deliberately prints less than everything it holds, and
+		 * a redaction-specific print arm would have got that wrong.  Without
+		 * VERBOSE, a trigger that implements a constraint prints only "for
+		 * constraint ...", with its own name left out -- so an arm that
+		 * always printed the trigger pseudonym would make a redacted record
+		 * show more structure than the plain one it stands for.
 		 *
-		 * Worth knowing when changing any of this: the section only appears
-		 * when ANALYZE and auto_explain.log_triggers are both on.  A test
-		 * that runs a plain EXPLAIN never gets here and will pass without
-		 * having executed a line of it, which is why these sites are covered
-		 * by a TAP test instead.
+		 * A trigger and a constraint are never exempt.  Neither can be
+		 * reached except through a relation the user owns, so there is no
+		 * pg_catalog case to recognise here, and explain_redact_name() is
+		 * asked for a name rather than for a decision.  The relation is an
+		 * ordinary relation and that same call decides its exemption itself.
+		 *
+		 * Keying the relation on its OID is what makes this section relatable
+		 * to the rest of the record (FR-40): ExplainTargetRel() names the
+		 * same table from the same OID, so the "on tN" here is the "tN" the
+		 * scan line above prints.
 		 */
-		if (!es->redact)
+		if (es->redact)
 		{
-			relname = RelationGetRelationName(rInfo->ri_RelationDesc);
+			RedactCtx  *ctx = explain_redact_context(es);
+
+			tgname = explain_redact_name(ctx, REDACT_TRIGGER, trig->tgoid);
+			relname = explain_redact_name(ctx, REDACT_RELATION,
+										  RelationGetRelid(rInfo->ri_RelationDesc));
 			if (OidIsValid(trig->tgconstraint))
-				conname = get_constraint_name(trig->tgconstraint);
+				conname = explain_redact_name(ctx, REDACT_CONSTRAINT,
+											  trig->tgconstraint);
 		}
 		else
-			relname = NULL;
+		{
+			tgname = trig->tgname;
+			relname = RelationGetRelationName(rInfo->ri_RelationDesc);
+			if (OidIsValid(trig->tgconstraint))
+				conname = conname_alloc = get_constraint_name(trig->tgconstraint);
+		}
 
 		/*
 		 * In text format, we avoid printing both the trigger name and the
@@ -1342,15 +1364,13 @@ report_triggers(ResultRelInfo *rInfo, bool show_relname, ExplainState *es)
 		 */
 		if (es->format == EXPLAIN_FORMAT_TEXT)
 		{
-			if (es->redact)
-				appendStringInfoString(es->str, "Trigger");
-			else if (es->verbose || conname == NULL)
-				appendStringInfo(es->str, "Trigger %s", trig->tgname);
+			if (es->verbose || conname == NULL)
+				appendStringInfo(es->str, "Trigger %s", tgname);
 			else
 				appendStringInfoString(es->str, "Trigger");
 			if (conname)
 				appendStringInfo(es->str, " for constraint %s", conname);
-			if (show_relname && relname != NULL)
+			if (show_relname)
 				appendStringInfo(es->str, " on %s", relname);
 			if (es->timing)
 				appendStringInfo(es->str, ": time=%.3f calls=%" PRId64 "\n",
@@ -1362,13 +1382,10 @@ report_triggers(ResultRelInfo *rInfo, bool show_relname, ExplainState *es)
 		}
 		else
 		{
-			if (!es->redact)
-			{
-				ExplainPropertyText("Trigger Name", trig->tgname, es);
-				if (conname)
-					ExplainPropertyText("Constraint Name", conname, es);
-				ExplainPropertyText("Relation", relname, es);
-			}
+			ExplainPropertyText("Trigger Name", tgname, es);
+			if (conname)
+				ExplainPropertyText("Constraint Name", conname, es);
+			ExplainPropertyText("Relation", relname, es);
 			if (es->timing)
 				ExplainPropertyFloat("Time", "ms",
 									 INSTR_TIME_GET_MILLISEC(tginstr->instr.total), 3,
@@ -1376,8 +1393,18 @@ report_triggers(ResultRelInfo *rInfo, bool show_relname, ExplainState *es)
 			ExplainPropertyInteger("Calls", NULL, tginstr->firings, es);
 		}
 
-		if (conname)
-			pfree(conname);
+		/*
+		 * Only the string get_constraint_name() palloc'd is ours to free.  A
+		 * pseudonym belongs to the RedactCtx and lives until the context does
+		 * (see the LIFETIME note in explain_redact.h); freeing one would
+		 * corrupt the pseudonym map, and because the same constraint OID
+		 * hands back the same cached buffer, the next trigger sharing that
+		 * constraint would read freed memory.  Hence the second variable
+		 * rather than a test on es->redact -- conname is const, so the
+		 * compiler holds the line here too.
+		 */
+		if (conname_alloc)
+			pfree(conname_alloc);
 
 		ExplainCloseGroup("Trigger", NULL, true, es);
 	}

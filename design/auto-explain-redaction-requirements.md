@@ -1035,10 +1035,22 @@ that they stopped being vacuous. The one thing in the file that did assert the
 opposite of the new behaviour was a comment — “Scan direction survives an index
 scan even though the index name does not” — and it is corrected in place.
 
-**FR-17 — trigger section, reachable only under ANALYZE.** [V]
-Site: `report_triggers()`, explain.c:1134/1138/1140 (text) and 1151/1153/1154
-(structured). `ExplainPrintTriggers` is called only when
-`es->analyze && auto_explain_log_triggers`.
+**FR-17 — trigger section, reachable under ANALYZE.** [V]
+Site: `report_triggers()`, explain.c:1368/1372/1374 (text) and 1385/1387/1388
+(structured). `ExplainPrintTriggers` has **two** callers:
+`contrib/auto_explain/auto_explain.c:637`, gated on
+`es->analyze && auto_explain_log_triggers`, and `ExplainOnePlan()` at
+explain.c:645, gated on **`es->analyze` alone**.
+
+> ***(rev. T18: this entry used to say the function "is called only when
+> `es->analyze && auto_explain_log_triggers`". That is the auto_explain caller's
+> gate, stated as though it were the section's. The core caller needs no GUC, so
+> interactive `EXPLAIN (ANALYZE, REDACT)` reaches `report_triggers()` and the
+> regression suite can cover this requirement — which, since T18, it does: the
+> primary coverage is now the T18 section of
+> `src/test/regress/sql/explain_redact.sql`, with a genuine (not vacuous) row in
+> the inverted fixture sweep, and `contrib/auto_explain/t/002_redact.pl` keeps the
+> auto_explain channel. The line numbers were also stale by about 230 lines.)***
 
 ```sql
 CREATE FUNCTION ztrigfunc_secret() RETURNS trigger
@@ -1050,8 +1062,26 @@ Run with `auto_explain.log_analyze = on`, `auto_explain.log_triggers = on`,
 `log_redact = on`, then `INSERT INTO zsec_customers …`.
 Assert: no trigger name, no constraint name, no trigger-function name, no
 relation name; the timing and `Calls` values are still present (FR-38).
-**A test matrix without this configuration reports success while FR-17 is
-completely unexercised.**
+**A test matrix without ANALYZE reports success while FR-17 is completely
+unexercised.** *(rev. T18: "without this configuration" previously meant ANALYZE
+plus `log_triggers`. ANALYZE alone is what the section actually needs;
+`log_triggers` is additionally required only on the auto_explain path.)*
+
+> **Verified by T18, on the tree rather than from the requirement.** All three
+> names are pseudonymized and both counters survive. Two findings worth carrying:
+>
+> * The relation is printed in text **only when `show_relname` is set**, which
+>   `ExplainPrintTriggers()` computes as
+>   `list_length(resultrels) > 1 || routerels != NIL || targrels != NIL`. The
+>   obvious single-table fixture therefore prints no relation at all and is silent
+>   on the FR-40 linkage; a multi-partition `UPDATE` is the case that exercises
+>   it. In the structured formats `Relation` is always printed.
+> * Under tuple routing the trigger fires on the **leaf**, so the relation
+>   pseudonym on the trigger line is the leaf's — and for an `INSERT` the leaf is
+>   not in the plan, so that pseudonym appears nowhere else in the record. FR-40
+>   still holds; the stronger reading of it (every trigger relation is findable
+>   elsewhere in the record) does not. Plain output has the same shape, so nothing
+>   is disclosed.
 
 > **Refined by T01: the trigger name and the constraint name are disclosed
 > under different conditions**, so one fixture at one verbosity misses one of
@@ -1111,14 +1141,15 @@ emission sites are gated:
 | format | `text`, `json`, `xml`, `yaml` | text bypasses the property functions (FR-63) |
 | `VERBOSE` | off, on | gates `Output`, `Function Call`, `Table Function Call`, `Schema`, `Query Identifier` |
 | `ANALYZE` | off, on | gates the entire trigger section (FR-17) and all counters |
-| `log_triggers` | off, on | with ANALYZE, gates `report_triggers()` |
+| `log_triggers` | off, on | on the auto_explain path only, gates `report_triggers()`; the core caller needs no GUC *(rev. T18)* |
 | `log_settings` | off, on | gates the `Settings` section (FR-26) |
 | parallelism | serial, `debug_parallel_query = on` | gates per-worker blocks and the `es->str` swap |
 | plan type | custom, generic (`plan_cache_mode`) | custom inlines `Const`s; generic prints `$N` |
 
 The minimum honest matrix is: all four formats × {VERBOSE off, on} for every
-fixture, plus the ANALYZE + `log_triggers` combination for FR-17, plus one
-parallel run and one generic-plan run.
+fixture, plus ANALYZE for FR-17 — interactively, and additionally with
+`log_triggers` to cover the auto_explain path *(rev. T18)* — plus one parallel run
+and one generic-plan run.
 
 > **Fixtures corrected by T01 after review.** Five catalog entries did not reach
 > the path they named, and passed only on the incidental table and column names
