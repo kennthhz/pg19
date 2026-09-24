@@ -829,6 +829,30 @@ without it that return path is untested; the assignment form
 `SET zcol_comp.zfield_ssn = …`; a named-argument call, using a `plpgsql`
 function so inlining does not remove the `FuncExpr`.
 
+*(rev. T12, landed out of order ahead of T21b because a composite field name is
+printed inside an expression and the guard must precede the flip. **Every line
+number in this section is stale by ten tasks and the route list is wrong in two
+ways.** Re-anchored: `get_name_for_var_field()` at `:8475`, printed at `:10164`;
+`processIndirection()` at `:14049`; `T_NamedArgExpr` at `:9842`. There is no
+`resname` read anywhere in `get_name_for_var_field()` — the "sub-target-list
+resnames" route is `RowExpr->colnames`, because `pullup_replace_vars()` builds
+that list from a flattened subquery's target list, so the plan's routes 1 and 4
+are one site. The fourth distinct site is the **second** `TupleDescAttr(…)->attname`
+read, at the very end of the function after the RECORD drill-down.
+
+Reachability was measured, not argued, and two of this section's four test
+shapes do not work. `(zc).zcol_ssn` reaches nothing:
+`ParseComplexProjection()` short-circuits `(whole-row-Var).field` to a plain
+`Var`, so no `FieldSelect` is built. `get_rte_attribute_name()` needs a
+whole-row `Var` of type **RECORD** behind an enclosing `Var`, with `OFFSET 0`
+to stop the pull-up that would let `eval_const_expressions()` fold the
+`FieldSelect` away. The assignment form is a negative control, per FR-93. Routes
+1, 2 and 3 are reached by module fixtures; route 4 ships as a guard, shown live
+by an unconditional probe from `pg_get_viewdef()` and unreachable from a plan
+tree because `rte->subquery` is NULL there. FR-94 omits the `name =>` decoration
+rather than pseudonymizing it, and is a guard for a path EXPLAIN cannot reach.
+Zero deletions in `ruleutils.c`, as T13 and T14 achieved.)*
+
 #### T13 — Layer B: XML and JSON constructs
 
 *(rev. T13: rescoped from names to constructs. The original plan listed the

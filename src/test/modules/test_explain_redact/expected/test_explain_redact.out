@@ -845,6 +845,195 @@ SELECT test_redact_deparse('SELECT c_first::zsec_t02.zsec_dom FROM zsec_c', true
 (1 row)
 
 --
+-- T12: composite-type field names, and the named-argument label.
+--
+-- Landed after T13-T21a rather than in sequence.  It is here in the file, in
+-- task order, because that is how it reads; it is in the tree now because T21b
+-- turns expression output back on and a composite field name is printed inside
+-- an expression.
+--
+-- FOUR ROUTES, AND WHICH ONE EACH FIXTURE ACTUALLY TAKES WAS MEASURED, NOT
+-- ARGUED.  get_name_for_var_field() returns a field name from four separate
+-- places and they share nothing but the caller, so a guard at one of them covers
+-- none of the others.  The routes were distinguished by tagging each guard with a
+-- NOTICE, running every candidate shape, and reading which tag fired -- the same
+-- method T19 used, and for the same reason: two of T01's six predicted fixtures
+-- did not reach the code they were written for.
+--
+--   route 1, RowExpr->colnames -- reached by fixture 02.  The colnames come from
+--       a pulled-up subquery's target-list RESNAMES: pullup_replace_vars() turns
+--       a whole-row reference to a flattened subquery into a RowExpr carrying
+--       them.  That is the "sub-target-list resnames" source the task plan listed
+--       as a separate fourth route; it is this one.  The OFFSET 0 matters -- it
+--       stops the OUTER subquery being pulled up too, which would let
+--       eval_const_expressions() fold FieldSelect-over-RowExpr down to the plain
+--       column and print no field name at all.
+--
+--   route 2, the tuple descriptor's attname, mid-function -- reached by fixtures
+--       01 and 04.  The ordinary case: a field of a named composite type.
+--
+--   route 3, get_rte_attribute_name() -- reached by fixture 03, and by nothing
+--       simpler.  It needs a whole-row Var of type RECORD, which means a
+--       whole-row reference to a CTE, subquery or function RTE, reached through
+--       an enclosing Var so that a FieldSelect exists at all.
+--
+--   route 4, the tuple descriptor's attname at the very end, after the RECORD
+--       drill-down -- SHIPS AS A GUARD, measured unreachable while redacting.  It
+--       is live code: an unconditional probe fires it from pg_get_viewdef() on a
+--       view whose subquery outputs a bare ROW(...).  It cannot fire from a plan
+--       tree, because there rte->subquery is NULL and the RTE_SUBQUERY arm
+--       recurses through the child plan's tlist instead of inspecting a
+--       sub-target-list entry.  Parse-tree deparse has no pseudonym map (redacted
+--       query text is deferred, requirements 3.1.1), so the guard is correct and
+--       unexercised.
+--
+-- THE REQUIREMENTS' OWN WHOLE-ROW FIXTURE DOES NOT REACH ROUTE 3, and FR-93 is
+-- corrected rather than transcribed.  "SELECT (zc).zsec_ssn FROM zsec_c zc"
+-- produces no FieldSelect at all: ParseComplexProjection() short-circuits
+-- (whole-row-Var).field straight to a plain Var for that column, so the query
+-- deparses as an ordinary column reference and the fixture would have passed
+-- while testing nothing.  Fixture 03 below is what reaches the route.
+--
+-- Each fixture carries a plain column reference in the same target list whose
+-- pseudonym still prints, so a clean result cannot be confused with the
+-- wholesale blanking T04 does.
+--
+-- A TABLE OF ITS OWN rather than two more columns on zsec_c, because a column
+-- pseudonym's number follows the relation's attribute numbers: adding c_comp to
+-- zsec_c renumbered c_when from t1_c10 to t1_c12 and rewrote four rows of the
+-- T14 section, which is noise in a diff and not a change anyone meant.
+CREATE TYPE zsec_t02.zsec_rec12 AS (zsec_fld_ssn text, zsec_fld_dob int);
+CREATE TYPE zsec_t02.zsec_rec12b AS (zsec_fld_ssn int);
+CREATE TABLE zsec_t02.zsec_cf (cf_first int,
+                               cf_second text,
+                               cf_comp zsec_t02.zsec_rec12,
+                               cf_comp2 zsec_t02.zsec_rec12b);
+-- plpgsql, so that inlining does not remove the FuncExpr the label hangs off.
+CREATE FUNCTION zsec_t02.zsec_f12(zsec_argname int) RETURNS int
+    LANGUAGE plpgsql AS 'BEGIN RETURN zsec_argname; END';
+SELECT what,
+       test_redact_deparse(qry, false) AS plain,
+       test_redact_deparse(qry, true)  AS redacted
+  FROM (VALUES
+    ('01 field selection (route 2)',
+     'SELECT cf_second, (cf_comp).zsec_fld_ssn FROM zsec_cf'),
+    ('02 RowExpr colnames (route 1)',
+     'SELECT cf_second, (q.s).zsec_fld_ssn FROM zsec_cf, (SELECT s FROM (SELECT cf_second AS zsec_fld_ssn FROM zsec_cf) s OFFSET 0) q'),
+    ('03 whole-row RTE reference (route 3)',
+     'WITH w AS MATERIALIZED (SELECT cf_second AS zsec_fld_ssn FROM zsec_cf) SELECT cf_second, (q.s).zsec_fld_ssn FROM zsec_cf, (SELECT s FROM w s OFFSET 0) q'),
+    ('04 field of a pg_catalog composite',
+     'SELECT c.relname, (q.a).attname FROM pg_class c, (SELECT a FROM pg_attribute a OFFSET 0) q'),
+    ('05 named-argument label (FR-94)',
+     'SELECT cf_second, zsec_t02.zsec_f12(zsec_argname => cf_first) FROM zsec_cf')
+  ) AS t(what, qry)
+ ORDER BY what COLLATE "C";
+                 what                 |                            plain                             |               redacted               
+--------------------------------------+--------------------------------------------------------------+--------------------------------------
+ 01 field selection (route 2)         | zsec_cf.cf_second, (zsec_cf.cf_comp).zsec_fld_ssn            | t1.t1_c2, (t1.t1_c3).fld1
+ 02 RowExpr colnames (route 1)        | zsec_cf.cf_second, ((ROW(zsec_cf_1.cf_second))).zsec_fld_ssn | t1.t1_c2, ((ROW(t1_1.t1_1_c2))).fld1
+ 03 whole-row RTE reference (route 3) | zsec_cf.cf_second, (s.*).zsec_fld_ssn                        | t1.t1_c2, (a2.*).fld1
+ 04 field of a pg_catalog composite   | c.relname, (a.*).attname                                     | a1.relname, (a3.*).fld1
+ 05 named-argument label (FR-94)      | zsec_cf.cf_second, zsec_f12(zsec_cf.cf_first)                | t1.t1_c2, f1(t1.t1_c1)
+(5 rows)
+
+-- Name by name, because the pairs above are read by eye.  Each row: the real
+-- name must appear in the plain deparse, must be gone from the redacted one, and
+-- the pseudonym must be present -- the third clause is what stops the second
+-- from being satisfied by an empty string.
+--
+-- Row 05 is the exception and says so: there is no pseudonym, because FR-94's
+-- treatment OMITS the "name =>" decoration rather than renaming the label, so
+-- the assertion is on the positional call shape instead.
+SELECT what,
+       test_redact_deparse(qry, false) LIKE '%' || realname || '%' AS leaks_unredacted,
+       test_redact_deparse(qry, true)  NOT LIKE '%' || realname || '%' AS absent_redacted,
+       test_redact_deparse(qry, true)  ~ pseudo AS pseudonym_present
+  FROM (VALUES
+    ('01 field selection (route 2)', 'zsec_fld_ssn',
+     'SELECT cf_second, (cf_comp).zsec_fld_ssn FROM zsec_cf',
+     '\)\.fld[0-9]+'),
+    ('02 RowExpr colnames (route 1)', 'zsec_fld_ssn',
+     'SELECT cf_second, (q.s).zsec_fld_ssn FROM zsec_cf, (SELECT s FROM (SELECT cf_second AS zsec_fld_ssn FROM zsec_cf) s OFFSET 0) q',
+     '\)\.fld[0-9]+'),
+    ('03 whole-row RTE reference (route 3)', 'zsec_fld_ssn',
+     'WITH w AS MATERIALIZED (SELECT cf_second AS zsec_fld_ssn FROM zsec_cf) SELECT cf_second, (q.s).zsec_fld_ssn FROM zsec_cf, (SELECT s FROM w s OFFSET 0) q',
+     '\)\.fld[0-9]+'),
+    ('05 named-argument label (FR-94)', 'zsec_argname',
+     'SELECT cf_second, zsec_t02.zsec_f12(zsec_argname => cf_first) FROM zsec_cf',
+     '^[^=]*$')
+  ) AS t(what, realname, qry, pseudo)
+ ORDER BY what COLLATE "C";
+                 what                 | leaks_unredacted | absent_redacted | pseudonym_present 
+--------------------------------------+------------------+-----------------+-------------------
+ 01 field selection (route 2)         | t                | t               | t
+ 02 RowExpr colnames (route 1)        | t                | t               | t
+ 03 whole-row RTE reference (route 3) | t                | t               | t
+ 05 named-argument label (FR-94)      | f                | t               | t
+(4 rows)
+
+-- FR-94 IS A GUARD FOR A PATH EXPLAIN CANNOT REACH, and the plain half of row 05
+-- above is what proves it: the label is already gone WITHOUT redaction, because
+-- the parser resolves named notation to positional order and discards the
+-- NamedArgExpr wrapper.  So "leaks_unredacted" is FALSE there, alone among the
+-- rows, and that is the measurement rather than a failure.  Stated as its own
+-- assertion so the false is not read as a bug.
+SELECT test_redact_deparse(
+         'SELECT zsec_t02.zsec_f12(zsec_argname => cf_first) FROM zsec_cf', false)
+         AS named_arg_label_absent_even_unredacted;
+ named_arg_label_absent_even_unredacted 
+----------------------------------------
+ zsec_f12(zsec_cf.cf_first)
+(1 row)
+
+-- FR-40 for field names: the same field reached twice in one record is one
+-- pseudonym, a different field of the same type is a different one.  Asked with
+-- the repeat at the END so that a per-call counter would be visible.
+SELECT test_redact_deparse(
+         'SELECT (cf_comp).zsec_fld_ssn, (cf_comp).zsec_fld_dob, (cf_comp).zsec_fld_ssn FROM zsec_cf',
+         true) AS same_field_twice_one_pseudonym;
+          same_field_twice_one_pseudonym           
+---------------------------------------------------
+ (t1.t1_c3).fld1, (t1.t1_c3).fld2, (t1.t1_c3).fld1
+(1 row)
+
+-- The documented consequence of keying on a hash of the NAME rather than on
+-- (type, fieldno): two different composite types that happen to share a field
+-- name share its pseudonym.  That is concealment either way, and it is pinned
+-- here so the collapse is a decision on the record rather than a surprise.
+SELECT test_redact_deparse(
+         'SELECT (cf_comp).zsec_fld_ssn, (cf_comp2).zsec_fld_ssn FROM zsec_cf',
+         true) AS same_name_two_types_one_pseudonym;
+ same_name_two_types_one_pseudonym 
+-----------------------------------
+ (t1.t1_c3).fld1, (t1.t1_c4).fld1
+(1 row)
+
+-- NEGATIVE CONTROL, AND IT DOES NOT SAY WHAT THE TASK BRIEF EXPECTED.  A field
+-- of a pg_catalog composite type is NOT exempt: row 04 above prints "fld1" where
+-- a pg_catalog COLUMN in the same target list still prints "relname".  That is
+-- deliberate and it is the only self-consistent answer available.  Exemption is
+-- a question about a catalog OID, and of the four routes only route 2 has one --
+-- routes 1 and 3 hold a colnames list and an RTE.  Exempting where the OID
+-- happens to be at hand would make one field of one type print as its real name
+-- from one route and as fldN from another inside a single record, which is the
+-- contradiction FR-40 exists to forbid.  FR-93 grants no exemption either, and
+-- withholding more than required is the safe direction.
+--
+-- What the row still demonstrates is that the boundary is targeted rather than
+-- blanket: "relname" survives as a column, "attname" does not survive as a
+-- field, in one string.
+SELECT test_redact_deparse(
+         'SELECT c.relname, (q.a).attname FROM pg_class c, (SELECT a FROM pg_attribute a OFFSET 0) q',
+         true) LIKE '%relname%' AS catalog_column_still_prints,
+       test_redact_deparse(
+         'SELECT c.relname, (q.a).attname FROM pg_class c, (SELECT a FROM pg_attribute a OFFSET 0) q',
+         true) NOT LIKE '%attname%' AS catalog_composite_field_does_not;
+ catalog_column_still_prints | catalog_composite_field_does_not 
+-----------------------------+----------------------------------
+ t                           | t
+(1 row)
+
+--
 -- T13: XML and JSON constructs are collapsed behind a placeholder.
 --
 -- Unlike T09-T11 there is no pseudonym to inspect.  The guard prints one token
@@ -1502,7 +1691,7 @@ DROP TABLE zsec_t02.zsec_ts;
 DROP FUNCTION zsec_t02_blob(text, text);
 RESET search_path;
 DROP SCHEMA zsec_t02 CASCADE;
-NOTICE:  drop cascades to 13 other objects
+NOTICE:  drop cascades to 17 other objects
 DETAIL:  drop cascades to table zsec_t02.zsec_a
 drop cascades to table zsec_t02.zsec_b
 drop cascades to table zsec_t02.zsec_rt
@@ -1516,6 +1705,10 @@ drop cascades to type zsec_t02.zsec_enum2
 drop cascades to type zsec_t02.zsec_dom
 drop cascades to type zsec_t02.zsec_pair
 drop cascades to collation zsec_t02.zsec_coll2
+drop cascades to type zsec_t02.zsec_rec12
+drop cascades to type zsec_t02.zsec_rec12b
+drop cascades to table zsec_t02.zsec_cf
+drop cascades to function zsec_t02.zsec_f12(integer)
 DROP EXTENSION test_explain_redact;
 DROP EXTENSION test_extensible;
 DROP EXTENSION tsm_system_rows;

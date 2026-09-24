@@ -586,6 +586,8 @@ static char *redact_collation_name(Oid collid, struct RedactCtx *redact);
 static const char *redact_subplan_name(SubPlan *subplan,
 									   struct RedactCtx *redact);
 static const char *redact_window_name(Index winref, struct RedactCtx *redact);
+static const char *redact_field_name(const char *fieldname,
+									 struct RedactCtx *redact);
 static void add_cast_to(StringInfo buf, Oid typid);
 static char *generate_qualified_type_name(Oid typid);
 static text *string_to_text(char *str);
@@ -3803,10 +3805,10 @@ deparse_expression_pretty(Node *expr, List *dpcontext,
 	 * through plain deparse_expression() has the first and not the second, so
 	 * it would print pseudonymized column names next to real constants, real
 	 * function names and real operators.  Nothing would error and no property
-	 * would be missing, so the record would read as a working redaction.
-	 * That is the worst failure available here, which is why this errors
-	 * rather than asserting: the builds where it matters most are the ones
-	 * without asserts.
+	 * would be missing, so the record would read as a working redaction. That
+	 * is the worst failure available here, which is why this errors rather
+	 * than asserting: the builds where it matters most are the ones without
+	 * asserts.
 	 *
 	 * The question is asked of the namespace and never of the parameter.
 	 * deparse_expression() is public API -- pg_get_expr(), pg_get_viewdef(),
@@ -8438,6 +8440,22 @@ get_name_for_var_field(Var *var, int fieldno,
 	{
 		RowExpr    *r = (RowExpr *) var;
 
+		/*
+		 * Route 1 of the four ways this function reaches a field name, all of
+		 * which are pseudonymized under redaction (FR-93).  A fix at one
+		 * route does not cover the others: they return from four different
+		 * places and only share the caller.
+		 *
+		 * The bounds test is repeated rather than the return below being
+		 * wrapped, so that no line that exists unredacted is modified and
+		 * log_redact = off output is unchanged by construction.
+		 */
+		if (context->redact != NULL &&
+			fieldno > 0 && fieldno <= list_length(r->colnames))
+			return redact_field_name(strVal(list_nth(r->colnames,
+													 fieldno - 1)),
+									 context->redact);
+
 		if (fieldno > 0 && fieldno <= list_length(r->colnames))
 			return strVal(list_nth(r->colnames, fieldno - 1));
 	}
@@ -8475,6 +8493,19 @@ get_name_for_var_field(Var *var, int fieldno,
 		tupleDesc = get_expr_result_tupdesc((Node *) var, false);
 		/* Got the tupdesc, so we can extract the field name */
 		Assert(fieldno >= 1 && fieldno <= tupleDesc->natts);
+
+		/*
+		 * Route 2 of four (FR-93).  This is the ordinary case -- a field of a
+		 * named composite type, whose name comes off the type's tuple
+		 * descriptor.  The same expression appears again at the very bottom
+		 * of this function, reached after the drill-down, and that one is a
+		 * separate site needing its own guard.
+		 */
+		if (context->redact != NULL)
+			return redact_field_name(NameStr(TupleDescAttr(tupleDesc,
+														   fieldno - 1)->attname),
+									 context->redact);
+
 		return NameStr(TupleDescAttr(tupleDesc, fieldno - 1)->attname);
 	}
 
@@ -8579,6 +8610,16 @@ get_name_for_var_field(Var *var, int fieldno,
 	if (attnum == InvalidAttrNumber)
 	{
 		/* Var is whole-row reference to RTE, so select the right field */
+
+		/*
+		 * Route 3 of four (FR-93).  Reached only by a whole-row reference to
+		 * an RTE whose Var is of type RECORD, so the name comes from the
+		 * RTE's own column list rather than from any catalog type.
+		 */
+		if (context->redact != NULL)
+			return redact_field_name(get_rte_attribute_name(rte, fieldno),
+									 context->redact);
+
 		return get_rte_attribute_name(rte, fieldno);
 	}
 
@@ -8843,6 +8884,22 @@ get_name_for_var_field(Var *var, int fieldno,
 	tupleDesc = get_expr_result_tupdesc(expr, false);
 	/* Got the tupdesc, so we can extract the field name */
 	Assert(fieldno >= 1 && fieldno <= tupleDesc->natts);
+
+	/*
+	 * Route 4 of four (FR-93), and the reason the plan insists on counting
+	 * the sites rather than the expressions: this is textually the same read
+	 * as route 2 above but a different exit, taken after the RECORD
+	 * drill-down has run out of things to expand.  It is also where the
+	 * subquery and CTE arms of the switch land when the sub-target-list entry
+	 * they found is not a Var, which is the case the plan listed separately
+	 * as "sub-tlist resnames" -- there is no resname read anywhere in this
+	 * function, so that route is this one.
+	 */
+	if (context->redact != NULL)
+		return redact_field_name(NameStr(TupleDescAttr(tupleDesc,
+													   fieldno - 1)->attname),
+								 context->redact);
+
 	return NameStr(TupleDescAttr(tupleDesc, fieldno - 1)->attname);
 }
 
@@ -9842,6 +9899,34 @@ get_rule_expr(Node *node, deparse_context *context,
 		case T_NamedArgExpr:
 			{
 				NamedArgExpr *na = (NamedArgExpr *) node;
+
+				/*
+				 * Under redaction the "name =>" decoration is OMITTED rather
+				 * than pseudonymized, so the call prints positionally as
+				 * "f1(t1_c1)" (FR-94).  The label is a parameter name from
+				 * the function's own definition; spending a pseudonym
+				 * namespace on "f1(fld1 => t1_c1)" would conceal it while
+				 * telling the reader nothing, and redacted output does not
+				 * have to re-parse (§3). This is the disposition T13 settled
+				 * when it deleted REDACT_ARGNAME rather than leave an
+				 * enumerator nothing assigned.
+				 *
+				 * A GUARD FOR A PATH EXPLAIN CANNOT REACH, like the FR-15 and
+				 * FR-98c sites.  The parser resolves named notation to
+				 * positional order and discards the NamedArgExpr wrapper, so
+				 * no plan tree contains one -- T01 verified that with the
+				 * arguments given out of order, the case that forces the
+				 * reordering.  What this branch serves is a raw parse tree,
+				 * such as a stored default printed by pg_get_expr(), and a
+				 * redacted query text (§3.1.1, deferred) would reach it.
+				 * One branch is cheaper to own than an argued-safe raw
+				 * identifier.
+				 */
+				if (context->redact != NULL)
+				{
+					get_rule_expr((Node *) na->arg, context, showimplicit);
+					break;
+				}
 
 				appendStringInfo(buf, "%s => ", quote_identifier(na->name));
 				get_rule_expr((Node *) na->arg, context, showimplicit);
@@ -12306,6 +12391,57 @@ redact_window_name(Index winref, struct RedactCtx *redact)
 	return explain_redact_local(redact, REDACT_WINDOW, (int) winref, 0);
 }
 
+/*
+ * redact_field_name
+ *		Pseudonym for a composite-type field name (FR-93).
+ *
+ * A field name is not a column name, and FR-12's treatment does not reach it.
+ * The ordinary column path runs through set_relation_column_names() and is keyed
+ * on (range-table index, attribute number); a field name is resolved from a
+ * composite type's tuple descriptor, from a row expression's column-name list,
+ * or from an RTE's column list, none of which that key can name.  So it gets its
+ * own namespace, "fld1", "fld2", ...
+ *
+ * KEYED ON A HASH OF THE NAME, which is the T14 cursor and T17 CTE precedent and
+ * the ruleutils-side twin of explain.c's explain_redact_by_name().  FR-46 asks
+ * for the identity of the node that produced the name, and here that is all the
+ * producers have in common: get_name_for_var_field() reaches a field name by
+ * four separate exits and they share no key.  A named composite arrives with a
+ * tuple descriptor whose tdtypeid is the composite type, so (typeid, fieldno)
+ * would serve there -- but a Var of type RECORD has no type OID to offer, a
+ * RowExpr's colnames list has neither a type nor an attribute number, and
+ * processIndirection() holds (typrelid, fieldnum) from a different catalog
+ * lookup entirely.  Keying on whatever each route happens to have would make one
+ * field of one type print as two different pseudonyms depending on which route
+ * printed it, which is the disagreement FR-40 rules out.
+ *
+ * Two consequences, both readability and neither disclosure, carried over from
+ * the CTE decision: two names that hash alike share a pseudonym, and two
+ * genuinely different composite types with a same-named field share one too.
+ * Both are concealed either way.
+ *
+ * NO EXEMPTION TEST, deliberately.  Every name in this file that can be exempt
+ * is keyed on the OID of a catalog object, so "is this in pg_catalog" is a
+ * question that can be asked of it; a hashed string is not, and the four routes
+ * cannot all produce the OID that would be needed.  A field of a pg_catalog
+ * composite therefore comes out as fldN where a pg_catalog column comes out
+ * under its real name.  That is the safe direction, and FR-93 grants no
+ * exemption to begin with.
+ */
+static const char *
+redact_field_name(const char *fieldname, struct RedactCtx *redact)
+{
+	int			key;
+
+	Assert(redact != NULL);
+	Assert(fieldname != NULL);
+
+	key = (int) hash_bytes((const unsigned char *) fieldname,
+						   strlen(fieldname));
+
+	return explain_redact_local(redact, REDACT_FIELD, key, 0);
+}
+
 /* ----------
  * get_const_expr
  *
@@ -14075,6 +14211,30 @@ processIndirection(Node *node, deparse_context *context)
 			Assert(list_length(fstore->fieldnums) == 1);
 			fieldname = get_attname(typrelid,
 									linitial_int(fstore->fieldnums), false);
+
+			/*
+			 * The assignment half of FR-93, sharing the read half's pseudonym
+			 * space so that the same field reads as the same fldN whichever
+			 * side of an assignment printed it.  Note this route does have an
+			 * exact (typrelid, fieldnum) identity available and still hashes
+			 * the name: see redact_field_name(), where the reason is that the
+			 * other three routes cannot produce one.
+			 *
+			 * Not reachable from EXPLAIN, per this function's own header
+			 * comment -- it prints stored rules, and an executable target
+			 * list takes the other path.  That is why FR-93's
+			 * composite-assignment case is pinned as a negative control
+			 * rather than as a fixture: T01 found no shape, with or without
+			 * RETURNING, in which an UPDATE of a subfield prints the target
+			 * field name.  Guarded on the same reasoning as the NamedArgExpr
+			 * label above: get_query_def() does thread a map down to here, so
+			 * the path exists.
+			 */
+			if (context->redact != NULL)
+				fieldname = unconstify(char *,
+									   redact_field_name(fieldname,
+														 context->redact));
+
 			appendStringInfo(buf, ".%s", quote_identifier(fieldname));
 
 			/*

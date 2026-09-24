@@ -309,10 +309,17 @@ INSERT INTO zsec_fixtures (fr, note, opts, zsec_expect, qry) VALUES
 -- FR-93/94: composite field names and named-argument labels.
 ('FR-93', 'composite field select',   'COSTS OFF', 'zsec_fld_ssn',
  'SELECT zsec_id FROM zsec_customers WHERE (zsec_comp).zsec_fld_ssn = ''x'''),
--- Reaches the whole-row branch of get_name_for_var_field(), which resolves the
--- field name through get_rte_attribute_name() -- a different return path from
--- the composite-select case above.  The expected identifier is the same
--- ("zsec_ssn"), so this one leans on plan shape rather than on the name.
+-- CORRECTED BY T12, WHICH MEASURED THE CLAIM THIS COMMENT USED TO MAKE.  It said
+-- this fixture reaches the whole-row branch of get_name_for_var_field() and so
+-- resolves its field name through get_rte_attribute_name().  It does not, and it
+-- never did: ParseComplexProjection() short-circuits (whole-row-Var).field
+-- straight to a plain Var for that column, so "(zsec_c).zsec_ssn" never becomes a
+-- FieldSelect and deparses as an ordinary column reference.  The row is kept
+-- because a column name in a plan is worth pinning, but it is an FR-12 fixture
+-- wearing an FR-93 label.  Reaching get_rte_attribute_name() needs a whole-row
+-- Var of type RECORD behind an enclosing Var; that shape is exercised in
+-- src/test/modules/test_explain_redact, which is the only place a layer-B guard
+-- executes at all until T21b.
 ('FR-93', 'whole-row field reference', 'COSTS OFF, VERBOSE', 'zsec_ssn',
  'SELECT (zsec_c).zsec_ssn FROM zsec_customers zsec_c'),
 -- NB: the "composite field assignment" fixture is NOT here.  T01 could find no
