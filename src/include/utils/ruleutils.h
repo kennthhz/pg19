@@ -57,6 +57,15 @@ extern List *deparse_context_for_plan_tree_redacted(PlannedStmt *pstmt,
 													List *rtable_names,
 													struct RedactCtx *redact);
 
+/*
+ * Whether any namespace in a deparse context carries a pseudonym map.
+ *
+ * For the two guards that have to tell a redacting deparse context from an
+ * ordinary one without being able to see deparse_namespace, which is private
+ * to ruleutils.c.
+ */
+extern bool deparse_context_is_redacting(List *dpcontext);
+
 extern char *deparse_expression(Node *expr, List *dpcontext,
 								bool forceprefix, bool showimplicit);
 extern List *deparse_context_for(const char *aliasname, Oid relid);

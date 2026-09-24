@@ -649,6 +649,72 @@ test_redact_deparse(PG_FUNCTION_ARGS)
 }
 
 /*
+ * test_redact_deparse_plain(query text) returns text
+ *
+ * The negative half of test_redact_deparse(): build the same redacting deparse
+ * context, then deparse through the plain deparse_expression() entry point,
+ * which passes no RedactCtx.
+ *
+ * That combination is exactly what an EXPLAIN site left on the plain entry point
+ * would produce once expression output returns, and it is the failure that is
+ * hardest to see from the outside: the column names would still be pseudonyms,
+ * because the namespace has the map, while every constant, function name and
+ * operator in the same string would be real.  No error, no missing property, and
+ * a record that reads as a working redaction.
+ *
+ * So deparse_expression_pretty() refuses it, and this function has no successful
+ * return: it either raises that error or the guard has stopped working.  The
+ * matching positive case is every other call in this file -- the guard is
+ * conditioned on the namespace rather than on the parameter, so the ordinary
+ * unredacted callers of deparse_expression(), pg_get_viewdef() and friends
+ * included, never reach it.
+ */
+PG_FUNCTION_INFO_V1(test_redact_deparse_plain);
+Datum
+test_redact_deparse_plain(PG_FUNCTION_ARGS)
+{
+	char	   *query = text_to_cstring(PG_GETARG_TEXT_PP(0));
+	SPIPlanPtr	spiplan;
+	List	   *sources;
+	CachedPlanSource *source;
+	CachedPlan *cplan;
+	PlannedStmt *pstmt;
+	RedactCtx  *ctx;
+	List	   *rtable_names;
+	List	   *dpcontext;
+	TargetEntry *tle;
+
+	if (SPI_connect() != SPI_OK_CONNECT)
+		elog(ERROR, "SPI_connect failed");
+
+	spiplan = SPI_prepare(query, 0, NULL);
+	if (spiplan == NULL)
+		elog(ERROR, "SPI_prepare failed: %s",
+			 SPI_result_code_string(SPI_result));
+
+	sources = SPI_plan_get_plan_sources(spiplan);
+	source = (CachedPlanSource *) linitial(sources);
+	cplan = GetCachedPlan(source, NULL, NULL, NULL);
+	pstmt = linitial_node(PlannedStmt, cplan->stmt_list);
+
+	ctx = explain_redact_create(NIL);
+
+	rtable_names = select_rtable_names_for_explain_redacted(pstmt->rtable,
+															NULL, ctx);
+	dpcontext = deparse_context_for_plan_tree_redacted(pstmt, rtable_names,
+													   ctx);
+	dpcontext = set_deparse_context_plan(dpcontext, pstmt->planTree, NIL);
+
+	tle = (TargetEntry *) linitial(pstmt->planTree->targetlist);
+
+	/* Expected to error.  Nothing below it runs. */
+	(void) deparse_expression((Node *) tle->expr, dpcontext, true, false);
+
+	elog(ERROR, "deparse_expression() returned for a redacting namespace");
+	PG_RETURN_NULL();
+}
+
+/*
  * test_redact_tripwire_enabled() returns bool
  *
  * Whether the tripwire is compiled in, so the regression test can state plainly

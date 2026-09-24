@@ -49,3 +49,8 @@ CREATE FUNCTION test_redact_deparse(query text, redact boolean)
 RETURNS text
 AS 'MODULE_PATHNAME', 'test_redact_deparse'
 LANGUAGE C STRICT;
+
+CREATE FUNCTION test_redact_deparse_plain(query text)
+RETURNS text
+AS 'MODULE_PATHNAME', 'test_redact_deparse_plain'
+LANGUAGE C STRICT;

@@ -1076,6 +1076,40 @@ SELECT zsec_t02_blob('SELECT id, val FROM test_extensible_tbl',
                      'COSTS OFF, FORMAT json') LIKE '%TestCustomScan%'       AS provider_leaks_unredacted,
        zsec_t02_blob('SELECT id, val FROM test_extensible_tbl',
                      'COSTS OFF, FORMAT json') LIKE '%Custom Plan Provider%' AS property_present_unredacted;
+--
+-- T21a: the deparse entry point refuses a redacting namespace with no map.
+--
+-- Two separate fields carry redaction in ruleutils.c and setting one does not
+-- set the other.  deparse_context_for_plan_tree_redacted() puts a map on the
+-- namespace, which is where column names are decided; deparse_expression_pretty()
+-- gets its own from a parameter, once per expression.  A caller that has the
+-- first and not the second prints pseudonymized column names next to real
+-- constants and real function names -- populated, plausible and unredacted, with
+-- nothing erroring and no property missing.
+--
+-- test_redact_deparse_plain() is that caller.  It builds the context exactly as
+-- the redacting test above does, then deparses through plain
+-- deparse_expression().  The guard must refuse it.
+--
+SELECT test_redact_deparse_plain('SELECT c_first, c_second FROM zsec_c');
+
+-- The condition is on the namespace and not on the parameter, which is what
+-- keeps pg_get_expr(), pg_get_viewdef() and every extension caller of
+-- deparse_expression() silent (FR-62).  Those all pass a namespace with no map,
+-- so nothing about them changes.  Both halves demonstrated here: an ordinary
+-- deparse through the same public function the guard sits behind, and the
+-- module's own redact => false path, which passes NULL to the context builder
+-- as well as to the deparse call.
+CREATE VIEW zsec_t02.zsec_v AS SELECT c_first + 1 AS s FROM zsec_t02.zsec_c;
+CREATE TABLE zsec_t02.zsec_def (a int DEFAULT 40 + 2);
+SELECT pg_get_viewdef('zsec_t02.zsec_v'::regclass) AS viewdef;
+SELECT pg_get_expr(adbin, adrelid) AS defexpr
+  FROM pg_attrdef
+ WHERE adrelid = 'zsec_t02.zsec_def'::regclass;
+SELECT test_redact_deparse('SELECT c_first, c_second FROM zsec_c', false) AS plain;
+DROP TABLE zsec_t02.zsec_def;
+DROP VIEW zsec_t02.zsec_v;
+
 DROP TABLE zsec_t02.test_extensible_tbl;
 DROP TABLE zsec_t02.zsec_ts;
 DROP FUNCTION zsec_t02_blob(text, text);

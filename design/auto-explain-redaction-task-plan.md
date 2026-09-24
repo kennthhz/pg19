@@ -210,6 +210,30 @@ only for the fixtures, so it catches paths the catalog missed.
 > T21b is where its reach would have paid: output returns across nine guards at
 > once, and this is the only one of the four mechanisms that names a line rather
 > than a symptom.)***
+>
+> ***(rev. T21a: **wired.** The decision went to wiring it rather than dropping
+> it, so this section counts four mechanisms again. Three call sites, all in
+> `explain_format.c`: `ExplainProperty()` — the common path behind
+> `ExplainPropertyText()`, `…Integer()`, `…UInteger()`, `…Float()` and
+> `…Bool()`, so one call covers five public writers — `ExplainPropertyList()`
+> and `ExplainPropertyListNested()`. Every property value in all four formats
+> goes through one of those three. Observed firing, which it never had been
+> before: a temporary probe property under `es->redact` produced
+> `redaction leak at Zsec Probe: emitted marked string "zsec_probe_value"`, and
+> a probe list item produced the same at `Zsec Probe List` for a `zsecdata-`
+> marker. The reported site is the property's label rather than a function name,
+> since the label is what identifies the surface.
+>
+> Two limits, both in the code comment rather than only here. The text format
+> writes node labels, relation names and index names straight to `es->str` from
+> `explain.c` instead of through a property writer, so in that format those are
+> not checked — the same values do pass through `ExplainPropertyText()` in JSON,
+> XML and YAML and the suite runs all four, so what is lost is which site wrote
+> the string, not the detection. And the pseudonym map is created on first use,
+> so a property written under redaction before it exists is skipped; none is
+> today, because the map is created in `ExplainPrintPlan()` and the two
+> properties written earlier — `Query Text` and `Query Parameters` — are omitted
+> entirely under redaction.)***
 
 **Periodic re-audit of the source enumeration (judgement, not a gate).** The
 residual weakness is not detection, it is enumeration: did we find every place in

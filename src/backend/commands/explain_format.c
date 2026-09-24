@@ -15,6 +15,7 @@
 
 #include "commands/explain.h"
 #include "commands/explain_format.h"
+#include "commands/explain_redact.h"
 #include "commands/explain_state.h"
 #include "utils/json.h"
 #include "utils/xml.h"
@@ -25,10 +26,79 @@
 #define X_CLOSE_IMMEDIATE 2
 #define X_NOWHITESPACE 4
 
+static void ExplainRedactTripwire(const char *value, const char *site,
+								  ExplainState *es);
+static void ExplainRedactTripwireList(List *data, const char *site,
+									  ExplainState *es);
 static void ExplainJSONLineEnding(ExplainState *es);
 static void ExplainXMLTag(const char *tagname, int flags, ExplainState *es);
 static void ExplainYAMLLineStarting(ExplainState *es);
 static void escape_yaml(StringInfo buf, const char *str);
+
+/*
+ * Check a string that is about to be written into a redacted record against
+ * the assert-build tripwire.
+ *
+ * Every property value, in all four formats, is written by ExplainProperty(),
+ * ExplainPropertyList() or ExplainPropertyListNested(), so three calls to these
+ * two helpers cover the whole property surface.  That is the reason the check
+ * lives here rather than at the sites that produce the strings: those number in
+ * the hundreds and grow with every release, and a check that has to be added
+ * per site is a check that will be forgotten at one.
+ *
+ * Numeric and boolean properties are checked too, through ExplainProperty().
+ * They cannot carry a marker, so this is a few wasted comparisons over a
+ * twenty-character buffer in assert builds, in exchange for not having to keep
+ * a list of which wrappers are safe.
+ *
+ * The site reported is the property's label rather than the name of this
+ * function, because the label is what tells a reader which surface leaked; the
+ * elog already reports the file and line, and that is always one of the three
+ * call sites below.
+ *
+ * With redaction off both helpers return on their first test, so FR-62 costs
+ * nothing.  In a non-assert build with redaction on, the list version still
+ * walks its list to call a macro that expands to nothing, which is a few
+ * instructions per property and is not worth an #ifdef here.
+ *
+ * Two things it does not see, both worth knowing before treating it as
+ * complete:
+ *
+ * The text format writes node labels, relation names and index names straight
+ * to es->str from explain.c instead of through a property writer, so in that
+ * format those strings are not checked here.  The same values do go through
+ * ExplainPropertyText() in the JSON, XML and YAML formats, and the leak-check
+ * suite runs all four, so what is lost is the precision about which site wrote
+ * the string, not the detection.
+ *
+ * And the pseudonym map is created on first use, so a property written under
+ * redaction before the map exists is skipped.  No such property exists today:
+ * the map is created in ExplainPrintPlan(), which runs before every property of
+ * a plan, and the two that are written earlier -- Query Text and Query
+ * Parameters -- are both omitted entirely under redaction.
+ */
+static void
+ExplainRedactTripwire(const char *value, const char *site, ExplainState *es)
+{
+	if (es->redact)
+		explain_redact_tripwire(es->redact_ctx, value, site);
+}
+
+/*
+ * As above, for the list-valued properties, whose items are the user-derived
+ * part rather than the property as a whole.
+ */
+static void
+ExplainRedactTripwireList(List *data, const char *site, ExplainState *es)
+{
+	ListCell   *lc;
+
+	if (!es->redact)
+		return;
+
+	foreach(lc, data)
+		explain_redact_tripwire(es->redact_ctx, (const char *) lfirst(lc), site);
+}
 
 /*
  * Explain a property, such as sort keys or targets, that takes the form of
@@ -39,6 +109,8 @@ ExplainPropertyList(const char *qlabel, List *data, ExplainState *es)
 {
 	ListCell   *lc;
 	bool		first = true;
+
+	ExplainRedactTripwireList(data, qlabel, es);
 
 	switch (es->format)
 	{
@@ -110,6 +182,13 @@ ExplainPropertyListNested(const char *qlabel, List *data, ExplainState *es)
 	ListCell   *lc;
 	bool		first = true;
 
+	/*
+	 * The text and XML cases below hand off to ExplainPropertyList(), which
+	 * checks again.  Checking twice in two of four formats is cheaper than a
+	 * per-format call inside the switch.
+	 */
+	ExplainRedactTripwireList(data, qlabel, es);
+
 	switch (es->format)
 	{
 		case EXPLAIN_FORMAT_TEXT:
@@ -161,6 +240,8 @@ static void
 ExplainProperty(const char *qlabel, const char *unit, const char *value,
 				bool numeric, ExplainState *es)
 {
+	ExplainRedactTripwire(value, qlabel, es);
+
 	switch (es->format)
 	{
 		case EXPLAIN_FORMAT_TEXT:

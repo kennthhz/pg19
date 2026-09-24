@@ -901,22 +901,59 @@ ExplainPrintPlan(ExplainState *es, QueryDesc *queryDesc)
 	 *
 	 * This one call decides two separate things, and the second is easy to
 	 * overlook.  The list is what ExplainTargetRel() and the Replaces
-	 * property print as an alias, and it is also what
-	 * deparse_context_for_plan_tree() just below builds the deparse context
-	 * from.  So every expression eventually printed through that context
-	 * refers to relations by whatever this list holds.  Expression output is
-	 * still suppressed today, which is the only reason a real alias here
-	 * would have been harmless; leaving it real would turn into a live leak
-	 * the moment T21 re-enables expressions.
+	 * property print as an alias, and it is also what the deparse-context
+	 * call just below builds its context from.  So every expression
+	 * eventually printed through that context refers to relations by whatever
+	 * this list holds.  Expression output is still suppressed today, which is
+	 * the only reason a real alias here would have been harmless; leaving it
+	 * real would turn into a live leak the moment T21b re-enables
+	 * expressions.
 	 */
 	if (es->redact)
+	{
+		RedactCtx  *ctx = explain_redact_context(es);
+
 		es->rtable_names =
-			select_rtable_names_for_explain_redacted(es->rtable, rels_used,
-													 explain_redact_context(es));
+			select_rtable_names_for_explain_redacted(es->rtable, rels_used, ctx);
+
+		/*
+		 * The deparse context has to carry the map as well, because the
+		 * column names for the whole plan tree are assigned while it is built
+		 * -- see the header comment on
+		 * deparse_context_for_plan_tree_redacted(). Putting the map on the
+		 * individual expression deparse instead would be too late for every
+		 * column name in the plan.
+		 */
+		es->deparse_cxt =
+			deparse_context_for_plan_tree_redacted(queryDesc->plannedstmt,
+												   es->rtable_names, ctx);
+
+		/*
+		 * Refuse to carry on with a context that is not redacting.  This
+		 * cannot happen as the code just above stands; it is here because the
+		 * mistake it catches is the one that produces populated, plausible,
+		 * unredacted output -- real column names inside expression
+		 * properties, with no error raised and no missing field for a reader
+		 * to notice.
+		 *
+		 * The matching check on the other side is in
+		 * deparse_expression_pretty(), and the two see different failures.
+		 * This one sees a context that was never built redacting, which the
+		 * callee cannot notice, because a namespace with no map looks exactly
+		 * like every ordinary pg_get_viewdef() namespace.  The callee sees a
+		 * call site that deparses a redacting context through the plain entry
+		 * point, which this one cannot notice, because the context is fine
+		 * and only the call is wrong.
+		 */
+		if (!deparse_context_is_redacting(es->deparse_cxt))
+			elog(ERROR, "redacted EXPLAIN built a deparse context with no pseudonym map");
+	}
 	else
+	{
 		es->rtable_names = select_rtable_names_for_explain(es->rtable, rels_used);
-	es->deparse_cxt = deparse_context_for_plan_tree(queryDesc->plannedstmt,
-													es->rtable_names);
+		es->deparse_cxt = deparse_context_for_plan_tree(queryDesc->plannedstmt,
+														es->rtable_names);
+	}
 	es->printed_subplans = NULL;
 	es->rtable_size = list_length(es->rtable);
 	foreach(lc, es->rtable)

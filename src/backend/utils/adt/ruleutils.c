@@ -3735,6 +3735,35 @@ deparse_expression_redacted(Node *expr, List *dpcontext,
 									 showimplicit, 0, 0, redact);
 }
 
+/*
+ * deparse_context_is_redacting
+ *		Does any namespace in this deparse context carry a pseudonym map?
+ *
+ * Exists so that callers outside this file can ask the question without
+ * seeing deparse_namespace, which is private here.  There are two, and both
+ * are guards rather than ordinary logic: the one in
+ * deparse_expression_pretty() below, and the one in ExplainPrintPlan() that
+ * checks a redacted EXPLAIN actually built a redacting context.
+ *
+ * NIL, which deparse_expression() accepts and means "no Vars expected", gives
+ * false without a special case, since the loop then runs zero times.
+ */
+bool
+deparse_context_is_redacting(List *dpcontext)
+{
+	ListCell   *lc;
+
+	foreach(lc, dpcontext)
+	{
+		deparse_namespace *dpns = (deparse_namespace *) lfirst(lc);
+
+		if (dpns->redact != NULL)
+			return true;
+	}
+
+	return false;
+}
+
 /* ----------
  * deparse_expression_pretty	- General utility for deparsing expressions
  *
@@ -3762,6 +3791,41 @@ deparse_expression_pretty(Node *expr, List *dpcontext,
 {
 	StringInfoData buf;
 	deparse_context context;
+
+	/*
+	 * Refuse to deparse a redacting namespace without a pseudonym map.
+	 *
+	 * Redaction is carried in two places, installed at two different times,
+	 * and setting one does not set the other: the namespace gets its handle
+	 * when the deparse context is built, because that is when column names
+	 * are assigned, and this function gets one from its own parameter, once
+	 * per expression.  A caller that deparses a redacted plan's context
+	 * through plain deparse_expression() has the first and not the second, so
+	 * it would print pseudonymized column names next to real constants, real
+	 * function names and real operators.  Nothing would error and no property
+	 * would be missing, so the record would read as a working redaction.
+	 * That is the worst failure available here, which is why this errors
+	 * rather than asserting: the builds where it matters most are the ones
+	 * without asserts.
+	 *
+	 * The question is asked of the namespace and never of the parameter.
+	 * deparse_expression() is public API -- pg_get_expr(), pg_get_viewdef(),
+	 * pg_get_ruledef(), FDW deparse and any extension call it with no map,
+	 * which is correct and must stay silent.  Only
+	 * deparse_context_for_plan_tree_redacted() and
+	 * select_rtable_names_for_explain_redacted() ever put a handle on a
+	 * namespace, so conditioning on the namespace leaves all of those callers
+	 * untouched by construction, rather than by a list of exceptions that
+	 * someone has to keep current.
+	 *
+	 * What this does not cover: set_deparse_for_query() memsets the namespace
+	 * it is given, which clears the handle, so a namespace that has been
+	 * through there no longer looks redacting to this test.  That is the
+	 * latent hazard described in the note above that memset, and this check
+	 * does not close it.
+	 */
+	if (redact == NULL && deparse_context_is_redacting(dpcontext))
+		elog(ERROR, "cannot deparse a redacting namespace without a redaction context");
 
 	initStringInfo(&buf);
 	context.buf = &buf;
