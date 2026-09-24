@@ -176,6 +176,38 @@ SELECT test_redact_exempt('trigger', 1::oid) AS trigger_always_redacted;
 SELECT test_redact_exempt('constraint', 1::oid) AS constraint_always_redacted;
 
 --
+-- The index kind, added by T16, and the only two assertions that back FR-16's
+-- half of FR-60.
+--
+-- Both have to live here rather than in the regression file, and for opposite
+-- reasons.  The dropped-index case needs an OID that no catalog row backs, which
+-- is not something a plan can be built around: a regression run is one backend,
+-- and the plancache invalidates the plan the moment the index goes away, so
+-- explain_get_index_name() is never called with a dead OID from SQL.  The
+-- catalog-index case is reachable from SQL and is asserted there too, on the
+-- redacted plan itself -- it is repeated here because the regression assertion
+-- tests the two together, and this one separates them.
+--
+-- The dropped index.  FR-60 says the record survives with a pseudonym rather
+-- than dying in the elog(ERROR, "cache lookup failed for index %u").
+-- explain_get_index_name() satisfies that by returning before the lookup, which
+-- is only sound if the substitute it returns instead cannot fail either -- so
+-- that is what is asserted: a nonexistent index OID yields i1, not an error and
+-- not NULL, and a repeat of the same dead OID is still i1.
+SELECT test_redact_exempt('index', 999999999::oid) AS missing_index_redacted;
+SELECT test_redact_oid_seq(ARRAY['index','index','index'],
+                           ARRAY[999999999::oid, 999999998::oid, 999999999::oid])
+    AS missing_index_pseudonyms;
+-- A pg_catalog index keeps its real name, by the same namespace rule as its
+-- table.  T16 leans on this instead of calling explain_redact_exempt() itself:
+-- there is no schema on an index name, so unlike T15's relation case there is
+-- only one string to choose and explain_redact_name() already chooses it.
+SELECT test_redact_exempt('index', 'pg_class_oid_index'::regclass)
+    AS catalog_index_exempt;
+SELECT test_redact_oid_seq(ARRAY['index'], ARRAY['pg_class_oid_index'::regclass::oid])
+    AS catalog_index_real_name;
+
+--
 -- The tripwire.
 --
 -- It is compiled out without assertions, so a naive test would emit 'ok' in both

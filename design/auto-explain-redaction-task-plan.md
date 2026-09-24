@@ -40,6 +40,17 @@ task therefore owes a by-name assertion that the surfaces belonging to the tasks
 after it are still absent. T15 wrote the first one; the pattern, including its
 anti-vacuity clause, is in that task's section.)*
 
+*(rev. T16: T16 owes nothing new under that rule and pays it anyway in a second
+currency. No later task owns an adjacent index-name surface — there is no
+half-surface here to re-enable early — and T15's by-name block for T17's three
+names still passes unchanged, which is the check that T16 did not wander. What
+T16 adds is the form the rule takes when the error mode is not "printed a name
+too early" but "printed the **wrong** pseudonym": the arbiter index and an index
+scan on that index are asserted to print the same `iN`. A mismatch there carries
+no marker, leaks nothing, and passes every absence assertion in the suite, so it
+is the same class of invisible mistake and needs the same kind of explicit
+assertion.)*
+
 ### 1.2 The plan is a stack; unwind from the top
 
 Each task depends only on tasks before it. Reverting the most recent task is
@@ -876,7 +887,12 @@ happen rather than absorbed silently:
   FR-96 rows are the exception and will stay vacuous here permanently, because
   the construct is collapsed by design — their real coverage is the test module.
   What is left of the original idea is the per-row annotation, which T15 wrote
-  out in full at the vacuity note in that file.)*
+  out in full at the vacuity note in that file.)* *(rev. T16: two more, and the
+  count is now 13 of 33 — both of FR-16's rows, the arbiter row in the sweep and
+  the `index name (scan)` row in the GUC section. The arbiter one is the clearer
+  of the two: T04 skipped the gather loop, so `Conflict Arbiter Indexes` was
+  absent from the record entirely and its `clean` verdict meant only that an
+  absent property carries no marker. Enumerated at the same vacuity note.)*
 
 #### T14 — Layer B: remaining leaf sites
 
@@ -1102,13 +1118,128 @@ defensive assertion is what converts that from silent to loud.
 
 #### T16 — Index names
 
-`explain_get_index_name()` → `iN` (hook still ignored);
-`ExplainIndexScanDetails` (`:4550`, `:4569`); `Conflict Arbiter Indexes`
-(`:4852`, `:4895`).
+*(rev. T16: rewritten to match what was built. The three lines it replaced named
+the sites and the tests; they said nothing about the **direction** the guard
+went, which is the one thing about this task a later reader will get wrong,
+because it is the opposite of T14's. Line numbers are as landed.)*
 
-**Tests.** Index scan, bitmap index scan, index-only scan, and
-`ON CONFLICT` arbiter indexes. FR-60: a concurrently-dropped index substitutes
-a pseudonym instead of erroring the record.
+**Delivered.** One signature change, two call sites and one retyped loop, all in
+`src/backend/commands/explain.c` — 80 insertions, 25 deletions, most of them T04
+comment and guard text rather than logic.
+
+1. **`explain_get_index_name()`** (decl `:149`, def `:4546`) — gains an
+   `ExplainState *` and the redaction guard, which returns
+   `explain_redact_name(…, REDACT_INDEX, indexId)` as its first statement.
+2. **`ExplainIndexScanDetails()`** (`:4877`) — T04's `es->redact ? NULL :` and its
+   nine-line comment removed; feeds both `Index Scan` and `Index Only Scan`.
+3. **Bitmap Index Scan** (`:1893`) — same removal, back to the upstream shape.
+4. **Arbiter gather** (`:5237`) — T04 skipped the whole loop and left `idxNames`
+   NIL. The loop runs in both modes now: `get_rel_name()` off-mode,
+   `explain_redact_name()` redacted. The `if (idxNames)` print guard at `:5292`
+   goes back to its upstream meaning (a bare `DO NOTHING` has no arbiters)
+   instead of doubling as the suppression.
+
+**THE GUARD WENT INWARD. T14'S WENT OUTWARD. Do not reconcile them.**
+
+This is the part worth reading twice, because the two tasks look like the same
+problem and are not. `get_opclass_name()` (T14) has a caller that must **never**
+redact — `pg_get_indexdef`, which is a user-facing function, not EXPLAIN — so
+its guard had to sit at its call sites: a guard inside it would redact
+`pg_get_indexdef` output. `explain_get_index_name()` has no such caller. It is
+`static`, it is EXPLAIN-only, and every caller wants the same answer, so the
+guard belongs inside, where it covers the call sites that exist and the ones
+someone adds later.
+
+Two things follow that a call-site guard cannot give:
+
+- **FR-25, the hook.** `explain_get_index_name_hook` is `PGDLLIMPORT` and an
+  extension answering it returns any string it likes. Returning before the hook
+  is consulted is only possible inside the function; a call-site check can
+  decline to call it, but it cannot make the function safe for the next caller.
+- **FR-60, the lookup failure.** The
+  `elog(ERROR, "cache lookup failed for index %u")` sits after the hook, on the
+  unredacted path only. The redacted path returns before it, so a concurrently
+  dropped index cannot destroy the record — unreachable rather than handled,
+  which is the stronger property.
+
+Both functions now carry a comment saying which way their guard went and why, so
+the asymmetry reads as deliberate.
+
+**The arbiter site deliberately does not route through the function.** It gathers
+with `get_rel_name()` in off mode, which is the upstream shape: the hook has
+never applied there. Routing it through `explain_get_index_name()` would newly
+expose unredacted arbiter names to an extension hook — a change to
+**non-redacted** output, which is not this feature's to make. Under redaction it
+calls the same `explain_redact_name(…, REDACT_INDEX, oid)` the function calls, so
+an arbiter index and an index scan on that index print the same `iN`. That is the
+property the site exists for and the one a careless change breaks, so it is
+asserted rather than argued.
+
+**Deviation from the brief, and the assertion that pays for it.** The brief
+called for an explicit `explain_redact_exempt()` test, as T15 has in
+`ExplainTargetRel()`. There is none. For an exempt index `explain_redact_name()`
+already returns the real name — it tests exemption itself and caches the real
+name the way it caches a pseudonym. T15 needed the explicit test because its
+exempt path prints a **second** thing, the schema, which FR-11 keeps off a
+pseudonym, so it was choosing between code paths rather than between strings.
+There is no schema on an index name, and an explicit test here would add a
+`get_rel_name()` call that can return NULL on the one path whose purpose is to
+survive that. Same observable behaviour, strictly better FR-60 property. The
+regression file asserts `Index Scan using pg_class_oid_index on pg_class` in all
+four formats, which is what makes the reliance sound rather than assumed.
+
+**Tests.** All four surfaces separately — `Index Scan`, `Index Only Scan`,
+`Bitmap Index Scan`, `Conflict Arbiter Indexes` — because three different code
+paths feed them and one fixture would leave two untested. Each carries its own
+GUCs (the settings that force one plan shape rule out another, so they cannot
+share a table-driven query) and its own anti-vacuity clause requiring the
+unredacted plan to name a real index. `enable_indexonlyscan` has to be off as
+well as the two GUCs the older FR-16 fixture set, or the plain `Index Scan`
+surface is never reached — the same mistake T01 recorded for that fixture, one
+level further in. Then FR-40 both halves, all four formats, the exempt negative
+control, and the two negative controls on the same nodes: `Scan Direction`, which
+comes out of the same two format branches as the index name, and `Index
+Searches`, which sits on both node types.
+
+Two things are **not** asserted, and the file says so rather than dressing them
+up as passing fixtures:
+
+- **FR-60 end-to-end.** Not constructible from a regression test: one backend,
+  and the plancache invalidates the plan the moment the index is dropped, so
+  nothing reaches the lookup with a dead OID. Held up instead by the structural
+  argument above plus a module assertion that `explain_redact_name()` answers a
+  nonexistent index OID with `i1` rather than erroring or returning NULL — the
+  half that would falsify the structural argument if it were wrong.
+- **`Rows Removed by Index Recheck`.** Emitted on the Bitmap **Heap** Scan node,
+  neither T16 site, and needs a lossy `TIDBitmap`: 60000 rows at 200 bytes goes
+  lossy, 20000 does not, and at the lossy size the index condition matched
+  everything so nothing was rechecked away. An unstable expected file costs more
+  than a counter no T16 path can suppress.
+
+**Nothing was inverted, and that is a finding.** §1.1 says each Stage 4 task
+inverts its by-name assertions rather than deleting them, and this task had none
+to invert. The three existing FR-16 assertions all turn on a **real** index name
+— found without `REDACT`, absent with it — and T16 changes neither, because the
+pseudonym carries no marker. Inverting them would have been a regression. What
+changed is that they stopped being vacuous, which converts the two §10.2 sweep
+rows FR-16 owns. The one artefact that did state the opposite of the new
+behaviour was a comment — "Scan direction survives an index scan even though the
+index name does not" — corrected in place. One expected line changed in the whole
+suite: `Index Only Scan Backward on t1` became
+`Index Only Scan Backward using i1 on t1`.
+
+**Revert.** Reverting returns the index name to blanked on all four surfaces:
+less informative, still safe. The partial revert to be careful about is the
+arbiter loop alone — restoring T04's `if (!es->redact)` around it while leaving
+the rest is safe, but restoring the loop **without** its `explain_redact_name()`
+branch prints real index names in redacted records, because the `if (idxNames)`
+guard is no longer doing double duty.
+
+**Not T16's, and left alone.** `get_opclass_name()`'s FR-60 defect, recorded in
+T14's section, is untouched: the inference-element path still `elog(ERROR)`s on a
+concurrently dropped operator class, at base as well as after T14, and is
+FR-60-clean only because it is unreachable. T16 closing the index-name `elog`
+does not generalise to it.
 
 #### T17 — CTE, ENR, function-scan, sampling and custom-scan names
 

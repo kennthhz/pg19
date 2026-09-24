@@ -240,7 +240,7 @@ In every redacted record, the following must not appear in **any** field, in
 | FR-13 | User-visible relation aliases / refnames, including (a) the value used when no alias was assigned because the RTE is absent from the EXPLAIN `rels_used` set, and (b) `RETURNING WITH (OLD AS …, NEW AS …)` aliases *(rev. code audit: both bypass the alias list produced for EXPLAIN)* *(rev. T15: (a) landed and covered. (b) is **not** covered yet and its §10.2 assertion is still vacuous — the `OLD`/`NEW` alias reaches output only as a `Var` prefix inside the `Output` list, which stays suppressed until T21, so there is nothing for the fixture to grep either way. "Derived from the relation pseudonym" is exact and load-bearing: an unaliased relation's reference name is keyed by **OID**, so it equals the object name and EXPLAIN prints one identifier, not two; keying it by range-table index would turn every unaliased scan line into `Seq Scan on t1 a1` and change the shape of the output rather than its content. One exception, measured: two unaliased RTEs of the *same* relation both derive `t1`, collide, and the second takes a `_1` suffix — `Seq Scan on t1 t1_1`. Identical in shape to the unredacted `zsec_customers zsec_customers_1`, so nothing extra is disclosed, but it contradicts FR-47's claim that pseudonyms make the uniquifier a no-op.)* | derived from the relation pseudonym, or `a1`, `a2`, … when a distinct alias must be shown |
 | FR-14 | CTE names, in **every** property that can carry one — the scan target, the sub-plan label, and any deparsed sub-plan reference *(rev. code audit: see FR-90)* | `cte1`, `cte2`, … |
 | FR-15 | Ephemeral named tuplestore (ENR) names | `enr1`, … *(rev. T15: **not reachable from EXPLAIN.** `ExplainNode()` omits `T_NamedTuplestoreScan` from the node list that calls `ExplainScanTarget()`, so a named tuplestore scan prints no `Tuplestore Name` and no `Alias` in any format, redacted or not — measured from inside a trigger with a `REFERENCING NEW TABLE` transition table, which is the only way to get an ENR into a plan. The `T_NamedTuplestoreScan` case in `ExplainTargetRel()` has no caller. FR-15 therefore joins FR-94 and FR-98c as a **guard** for a printer path EXPLAIN cannot reach, and T17 has nothing to pseudonymize here unless upstream adds the missing case. A negative control is pinned in the regression file so that if it ever does, the change is reported rather than shipped silently.)* |
-| FR-16 | Index names in **any** property: index scans (`Index Name`), and non-scan sites such as `Conflict Arbiter Indexes` *(rev. security review)* | `i1`, `i2`, … |
+| FR-16 | Index names in **any** property: index scans (`Index Name`), and non-scan sites such as `Conflict Arbiter Indexes` *(rev. security review)* *(rev. T16: landed, and this is the first entry in the table with coverage on every surface it claims. All four are asserted, separately, because three different code paths feed them: `Index Scan` and `Index Only Scan` share `ExplainIndexScanDetails()`, `Bitmap Index Scan` has its own inline emission in `ExplainNode()`, and `Conflict Arbiter Indexes` is assembled in `show_modifytable_info()` and never went through the shared function. Until T16 the two rows §10.2 holds for this requirement were vacuous — T04 suppressed the name and skipped the arbiter gather entirely, so “clean” meant an absent property rather than a pseudonymized one. Also verified: the arbiter list and an index scan on the same index print the **same** `iN` (see FR-40), and a `pg_catalog` index keeps its real name.)* | `i1`, `i2`, … |
 | FR-17 | Trigger names and constraint names (trigger section, `Trigger Name` property) | `trg1`, … / `con1`, … |
 | FR-18 | User-defined function, procedure, aggregate, window-function names — in every emission path: deparsed expressions, `Function Name` / `Function Call` properties, Function-Scan targets, **and TABLESAMPLE method names** (`Sampling:`, `Sampling Method`), which core resolves via a direct function-name lookup rather than the expression deparser *(rev. security review)* | `f1(…)`, …; argument expressions redacted recursively |
 | FR-19 | User-defined operator names in expressions | `op1`; **exempt** operators (`=`, `<`, `+`, …) kept for readability |
@@ -249,7 +249,7 @@ In every redacted record, the following must not appear in **any** field, in
 | FR-22 | Parameter values: the `Query Parameters` property must be **omitted entirely** from redacted records *(rev. code audit; changed by D10 — v1.1's "names only" rendering disclosed `params->numParams`, i.e. the parameter count including parameters the plan never used, in cases where `log_parameter_max_length = 0` suppresses the property today. Redaction must not be net-additive.)* | omitted |
 | FR-23 | Query text: the `Query Text` property must be omitted in redacted records | omitted |
 | FR-24 | Column definitions **and path/plan strings** of table functions (`json_table` / `xmltable`): column names, and JSON path literals such as `'$.ssn'` which embed user key names and may not flow through the constant path *(rev. security review; fail-closed: if a path string cannot be redacted structurally, the property is omitted)* | column names per FR-12; path strings `?` or property omitted |
-| FR-25 | Text emitted by third-party code paths: FDW `Remote SQL` and custom-scan callback output, extension explain options (`log_extension_options` / `apply_extension_options`), **and the generic per-plan and per-node EXPLAIN plugin hooks** *(rev. code audit: these two hooks are not covered by the FDW/custom-scan wording and are the mechanism by which extensions inject arbitrary output; they also receive the `ExplainState` and the `PlanState`, so a plugin can re-enter expression deparsing with its own context and bypass every deparse-side control)* | suppressed: none of these callbacks or hooks are invoked in redacted records |
+| FR-25 | Text emitted by third-party code paths: FDW `Remote SQL` and custom-scan callback output, extension explain options (`log_extension_options` / `apply_extension_options`), **and the generic per-plan and per-node EXPLAIN plugin hooks** *(rev. code audit: these two hooks are not covered by the FDW/custom-scan wording and are the mechanism by which extensions inject arbitrary output; they also receive the `ExplainState` and the `PlanState`, so a plugin can re-enter expression deparsing with its own context and bypass every deparse-side control)* | suppressed: none of these callbacks or hooks are invoked in redacted records *(rev. T16: for `explain_get_index_name_hook` this is now enforced **inside** `explain_get_index_name()` rather than at its call sites. T04 checked `es->redact` at each of the two callers, which skipped the call and therefore the hook, but only for the callers that existed then. The guard was moved into the function so that the hook is unreachable under redaction for every present and future caller — a call-site check cannot make the function safe for the next caller someone adds. Note the direction: this is the opposite of what T14 had to do with `get_opclass_name()`, whose guard went **outward** to its call sites because one caller, `pg_get_indexdef`, must never redact. `explain_get_index_name()` is static and EXPLAIN-only and has no such caller, so inward is correct for it and the two are deliberately inconsistent.)* |
 | FR-28 | The extension-defined custom-scan provider name, printed **by core itself** as `Custom Scan (<name>)` and the `Custom Plan Provider` property — this does not come from the suppressed callbacks *(rev. security review)* | blanked/omitted |
 | FR-29 | An extension-registered `EXPLAIN` option that has already been parsed into the `ExplainState` before redaction takes effect *(rev. code audit: `EXPLAIN (REDACT, RANGE_TABLE)` with the in-tree `pg_overexplain` loaded emits the complete range table — per-RTE `Alias`, `Eref` alias **and every column name**, schema-qualified `Relation`, `Relation Kind`, `CTE Name`, `ENR Name`, and the sub-plan name — none of which the plan-body contract touches. Suppressing option *application* (FR-25) closes the `log_extension_options` route but not the `EXPLAIN (…)` route, because the option is set by the option parser, not by the extension callback.)* | `REDACT` combined with any extension-registered `EXPLAIN` option is rejected with an `ERROR` (see FR-72); in auto_explain, extension options are ignored (FR-73) |
 | FR-26 | The `Settings` section (GUC names/values; `search_path` etc. reveal schemas) | excluded from redacted records |
@@ -317,7 +317,7 @@ has a test in §10.
 
 | ID | Requirement |
 |---|---|
-| FR-60 | If a name or value cannot be classified as exempt during redacted output, it must be redacted (fail closed). A catalog lookup failure (e.g. a concurrently dropped object) must result in the **pseudonym being substituted**, not in the whole record being lost to an ERROR *(rev. security review)*. *(rev. code audit: several reachable sites currently `elog(ERROR)` on a failed lookup — the index-name fetch, the sort-key collation and operator lookups, the operator-class lookup, and the column-name and range-table-index sanity checks in the deparser. In redacted mode each of these must substitute a pseudonym instead. Sites that indicate a genuine internal inconsistency rather than a concurrent catalog change may still error; the design must state which is which.)* |
+| FR-60 | If a name or value cannot be classified as exempt during redacted output, it must be redacted (fail closed). A catalog lookup failure (e.g. a concurrently dropped object) must result in the **pseudonym being substituted**, not in the whole record being lost to an ERROR *(rev. security review)*. *(rev. code audit: several reachable sites currently `elog(ERROR)` on a failed lookup — the index-name fetch, the sort-key collation and operator lookups, the operator-class lookup, and the column-name and range-table-index sanity checks in the deparser. In redacted mode each of these must substitute a pseudonym instead. Sites that indicate a genuine internal inconsistency rather than a concurrent catalog change may still error; the design must state which is which.)* *(rev. T16: the first of those enumerated sites is discharged, and **structurally** rather than by handling the failure. `explain_get_index_name()`’s `elog(ERROR, "cache lookup failed for index %u")` sits after the redaction check, so a redacted record returns before reaching it — the failure is unreachable, not caught. The arbiter site never had an `elog`; `get_rel_name()` returns NULL there, and the redacted branch does not call it. This is only sound because the substitute cannot fail either, which is the half that is **measured**: `src/test/modules/test_explain_redact` asserts a nonexistent index OID yields `i1` rather than an error or a NULL. It is **not** asserted from the regression file, and cannot be — a regression run is one backend, and the plancache invalidates the plan the moment the index is dropped, so no SQL shape reaches the lookup with a dead OID. Recorded as argued-plus-unit-tested rather than end-to-end verified. The remaining sites — sort-key collation and operator, operator class, and the deparser’s sanity checks — belong to T20 and T21.)* |
 | FR-61 | Redaction must not alter output structure: records remain parseable as `text`/`json`/`xml`/`yaml` respectively, and JSON output remains a valid single JSON object (the auto_explain JSON fix-up must continue to work). Substituting a pseudonym or `?` must not break a construct the pseudonym is embedded in (FR-99). |
 | FR-62 | With `auto_explain.log_redact = off`, no code path may behave differently from today (no perf or output change). |
 | FR-63 | Redaction must be applied **to the value at its source**, never to the serialized property *(rev. code audit)*. A filter placed on the property-emitting functions would be format-dependent and therefore incomplete: in `text` format a large number of identifiers — trigger, constraint and relation names in the trigger section, index names, the scan-target relation/schema/alias clause, the sampling method, and the sub-plan label — are appended directly to the output buffer and never pass through those functions. An implementation that redacts centrally at serialization will produce clean `json`/`xml`/`yaml` and leaky `text`, and the default format is `text`. |
@@ -940,6 +940,89 @@ extension explain options were skipped.
 > `RTI 1 (relation, in-from-clause):` — so assert on `RTI n (` and on the
 > `Eref:` / `Relation:` lines, not on a header string.
 
+**FR-16 — index names, all four surfaces.** [V — added by T16]
+Until T16 this requirement had no §10.2 entry of its own: the two rows the
+catalog carries for it — `arbiter index (ON CONFLICT)` in the table-driven sweep
+and `index name (scan)` in the GUC section — were the whole of it, and both were
+vacuous, because T04 suppressed the name on the scan sites and skipped the
+arbiter gather entirely. An entry exists now because the coverage does.
+
+Four properties carry an index name and **three** different code paths feed
+them, which is why one representative fixture is not enough:
+
+| Surface | Emission | Redacted output |
+|---|---|---|
+| `Index Scan` | `ExplainIndexScanDetails()` | `Index Scan using i1 on t1` |
+| `Index Only Scan` | same function, different node | `Index Only Scan using i1 on t1` |
+| `Bitmap Index Scan` | inline in `ExplainNode()` | `Bitmap Index Scan on i1` |
+| `Conflict Arbiter Indexes` | `show_modifytable_info()` | `Conflict Arbiter Indexes: i1` |
+
+Each needs its own GUCs and therefore its own assertion — the settings that
+force one plan shape rule out another, so they cannot share a table-driven query
+the way the sweep does. `enable_indexonlyscan` must be off as well as
+`enable_seqscan` and `enable_bitmapscan` to reach the plain `Index Scan` case:
+with only the two the planner picks an Index Only Scan, the Index Only Scan
+surface gets measured twice and the Index Scan surface goes untested. This is
+the same class of mistake T01 recorded for the original fixture (§10.3), one
+level further in.
+
+Each assertion carries the anti-vacuity clause: the **unredacted** plan must
+name a real index, or “no real index name in the redacted plan” is satisfied by
+a plan that never reached the emission site.
+
+Two further assertions, neither of which the surface list implies:
+
+- **FR-40 relatability.** An `ON CONFLICT` statement whose arbiter index is also
+  scanned prints the same `i1` on both lines, from two different functions.
+  Verified:
+
+  ```
+  Insert on t1
+    Conflict Resolution: NOTHING
+    Conflict Arbiter Indexes: i1
+    ->  Index Only Scan using i1 on t1 t1_1
+  ```
+
+  A mistake here produces a record that says the statement conflicts on an index
+  it is not scanning — no real name, no marker, and every leak assertion still
+  passes, so it is measured rather than reasoned about. The other half of FR-40
+  is checked too: two different indexes on the **same** relation print `i1` and
+  `i2` while the relation stays `t1`, so the index counter runs independently of
+  the relation counter.
+- **Exempt index, negative control.** `Index Scan using pg_class_oid_index on
+  pg_class`, in all four formats. This assertion is load-bearing beyond the
+  usual “don’t redact the catalogs” reason: T16 does **not** call
+  `explain_redact_exempt()` itself and relies on `explain_redact_name()`
+  deciding exemption and returning the real name, so this is the only thing that
+  proves the reliance sound. Were it misplaced, a `pg_catalog` index would print
+  as `iN`, every leak assertion in the file would still pass, and catalog plans
+  would have become unreadable for no gain.
+
+**Negative controls on the same nodes**, because every assertion above is
+satisfied by printing the index name and nothing else: `Scan Direction` still
+prints — checked in all four formats, since text emits the bare word `Backward`
+while the others emit a property — and `Index Searches` still prints on both the
+`Index Scan` node and the `Bitmap Index Scan` child.
+
+`Rows Removed by Index Recheck` is deliberately **not** pinned. It is emitted by
+`show_instrumentation_count()` on the Bitmap **Heap** Scan node, neither of the
+two sites T16 touches, and reaching it needs a lossy `TIDBitmap`. Measured while
+writing the tests: 60000 rows at 200 bytes goes lossy, 20000 does not, and at
+the lossy size the index condition matched every row so nothing was rechecked
+away. A `Heap Blocks: lossy=` count in an expected file moves with `work_mem`
+and page layout, which costs more than a counter no T16 code path can suppress.
+
+*What T16 did **not** need to change, recorded because it was expected to.* The
+three existing FR-16 assertions — the sweep’s arbiter row, the unredacted
+positive control and the redacted GUC row — were **not** inverted, and inverting
+them would have been a regression. All three turn on the presence or absence of
+a **real** index name, and T16 changes neither: the pseudonym carries no marker,
+so “the real name is found without `REDACT`” and “the real name is absent with
+it” both still hold and are still the assertions worth making. What changed is
+that they stopped being vacuous. The one thing in the file that did assert the
+opposite of the new behaviour was a comment — “Scan direction survives an index
+scan even though the index name does not” — and it is corrected in place.
+
 **FR-17 — trigger section, reachable only under ANALYZE.** [V]
 Site: `report_triggers()`, explain.c:1134/1138/1140 (text) and 1151/1153/1154
 (structured). `ExplainPrintTriggers` is called only when
@@ -978,7 +1061,7 @@ Every fixture in §10.2 is run in all four formats and the same absence
 assertion is applied. Additionally, these paths write directly to `es->str`
 in text mode and never pass through the property functions, so they need
 explicit text-mode assertions: trigger/constraint/relation names
-(explain.c:1134/1138/1140), index names (1715-1716, 4550), the scan-target
+(explain.c:1134/1138/1140), index names (1715-1716, 4550) *(rev. T16: the index-name half is done, and in all four formats rather than text alone — the text tail and the `Index Name` property are written by different branches of both emission sites, so a text-only check covers neither property path. `Scan Direction` is checked in all four for the same reason.)*, the scan-target
 `on schema.name alias` clause (4710-4718), `Sampling:` (3075), and the bare
 sub-plan label line in `ExplainNode`.
 
@@ -1031,7 +1114,7 @@ parallel run and one generic-plan run.
 >
 > | Requirement | Why it missed | Fix |
 > |---|---|---|
-> | FR-16 index name | 20-row table, so the planner chose a Seq Scan and the index-name site was never executed | `enable_seqscan`/`enable_bitmapscan` off, in its own GUC section |
+> | FR-16 index name | 20-row table, so the planner chose a Seq Scan and the index-name site was never executed | `enable_seqscan`/`enable_bitmapscan` off, in its own GUC section *(rev. T16: those two are enough for an **Index Only** Scan and not for a plain `Index Scan` — with only them the planner picks index-only, so the one surface gets measured twice and the other not at all. `enable_indexonlyscan` off as well for that case, and `enable_indexscan` off too for the bitmap case. Same failure, one level further in.)* |
 > | FR-20 user collation | `COLLATE` on the Var is absorbed into the operator's `inputcollid` by constant folding; no `CollateExpr` survives to deparse | put `COLLATE` on the **constant** |
 > | FR-46 subquery alias | subquery flattened into the outer scan; neither alias nor output name exists | `OFFSET 0` |
 > | FR-93 composite assignment | no shape prints the target field name; it reaches output only through a **read** | withdrawn to a negative control |
@@ -1102,7 +1185,15 @@ protects goals 2 and 3:
   tables show different pseudonyms (FR-40). *(rev. T15: verified. The self-join
   is the case that separates the two halves of the rule — one relation
   pseudonym, two alias pseudonyms — and it is the case a "number the scans as
-  you meet them" scheme gets wrong.)*
+  you meet them" scheme gets wrong.)* *(rev. T16: the same rule verified
+  for indexes. An `ON CONFLICT` arbiter index and an index scan on that index
+  print the same `iN` from two different functions, and two different indexes on
+  one relation print `i1`/`i2` while the relation stays `t1`.)*
+- `Scan Direction` and `Index Searches` still print on redacted index-scan and
+  bitmap-index-scan nodes *(rev. T16)*. Both live on the nodes T16 edits —
+  `Scan Direction` in the same two format branches of the same function as the
+  index name — so a guard widened from the name to the function or the node
+  would take them with it.
 - With `log_redact = off`, output is byte-identical to the unpatched build
   across the whole existing `auto_explain` and `EXPLAIN` regression suites
   (FR-62), and the existing `ruleutils` suites are byte-identical too.

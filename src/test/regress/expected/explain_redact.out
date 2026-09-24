@@ -878,10 +878,33 @@ SELECT f.fr,
 -- The two FR-46 rows are genuine only for the alias half of what they name; the
 -- column-name half still waits on T21, as does every row whose identifier lives
 -- in a Filter or Output.  The rest wait on the task that owns their surface:
--- T16 for FR-16, T17 for FR-14 and FR-18, T18 for FR-17, T19 for FR-90 and
+-- T17 for FR-14 and FR-18, T18 for FR-17, T19 for FR-90 and
 -- FR-91, T20 for FR-98a, T21 for FR-12, FR-20, FR-21, FR-46, FR-93, FR-97,
 -- FR-98d, FR-99 and FR-13b.  The two FR-96 rows are collapsed by design and
 -- will stay vacuous here for good; their real coverage is the test module.
+--
+-- T16 converted two more *(rev. T16)*, which are the two this file holds for
+-- FR-16:
+--
+--   FR-16 arbiter index (ON CONFLICT)  -> Conflict Arbiter Indexes
+--   FR-16 index name (scan), below     -> Index Name / " using iN"
+--
+-- Both now print a pseudonym where T04 printed nothing.  The arbiter row is the
+-- clearer change of the two: T04 skipped the gather loop, so "Conflict Arbiter
+-- Indexes" was absent from the record entirely and the row's "clean" verdict
+-- meant only that an absent property contains no marker.  The property is back
+-- and a real index name appearing in it would now be found.
+--
+-- Note what did NOT need changing, because the brief for T16 expected it to.
+-- Neither of these two rows, nor the unredacted positive control at the FR-16
+-- GUC block above, had its assertion inverted -- all three assert the presence
+-- or absence of a REAL index name, and T16 changes neither: the pseudonym
+-- carries no zsec_ marker, so "no marker without REDACT is a failure" and "no
+-- marker with REDACT is a pass" both still hold, and they are still the
+-- assertions worth making.  What changed is that they stopped being vacuous.
+-- The one thing in this file that did assert the opposite of the new behaviour
+-- was a comment, not a fixture; it is corrected at the scan-direction dump
+-- below.
 SELECT (SELECT count(*) FROM zsec_plan(q, 'COSTS OFF, VERBOSE') AS l
          WHERE l LIKE '%Table Function Call%')         AS tfc_plain,
        (SELECT count(*) FROM zsec_plan(q, 'COSTS OFF, VERBOSE, REDACT') AS l
@@ -908,6 +931,10 @@ SELECT (SELECT count(*) FROM zsec_plan(q, 'COSTS OFF, VERBOSE') AS l
 -- they cannot share a run without changing every other fixture's plan.
 SET enable_seqscan = off;
 SET enable_bitmapscan = off;
+-- *(rev. T16: unchanged, and now genuine.  The redacted plan prints
+-- "Index Only Scan using i1 on t1", so "clean" means the real index name is
+-- absent from a record that does name an index, instead of meaning the property
+-- was not printed.  The shape itself is asserted in the T16 section below.)*
 SELECT 'FR-16' AS fr, 'index name (scan)' AS note,
        coalesce(string_agg(l, ' '), 'clean') AS verdict
   FROM zsec_leaks('SELECT zsec_ssn FROM zsec_customers WHERE zsec_ssn = ''x''',
@@ -988,14 +1015,25 @@ SELECT * FROM zsec_plan('SELECT * FROM zsec_excluded WHERE zsec_k < 0',
 (2 rows)
 
 RESET constraint_exclusion;
--- Scan direction survives an index scan even though the index name does not.
+-- Scan direction survives an index scan, and so does the index name -- as "iN".
+--
+-- *(rev. T16: this note used to end "even though the index name does not",
+-- which was true under T04 and is now wrong.  The dump below is the only line
+-- in this file whose expected output T16 changed: it read "Index Only Scan
+-- Backward on t1" and now reads "Index Only Scan Backward using i1 on t1".  The
+-- pairing the note was making is still the right one and is why it is kept --
+-- both the direction and the name come out of the two format branches of
+-- ExplainIndexScanDetails(), so a guard placed around that function rather than
+-- inside explain_get_index_name() would take the direction with it.  Asserted in
+-- all four formats in the T16 section below rather than left to this one text
+-- dump, because Scan Direction is a property in the other three.)*
 SET enable_seqscan = off;
 SET enable_bitmapscan = off;
 SELECT * FROM zsec_plan('SELECT zsec_ssn FROM zsec_customers ORDER BY zsec_ssn DESC',
                         'COSTS OFF, REDACT');
-           zsec_plan            
---------------------------------
- Index Only Scan Backward on t1
+                zsec_plan                
+-----------------------------------------
+ Index Only Scan Backward using i1 on t1
 (1 row)
 
 RESET enable_bitmapscan;
@@ -1527,6 +1565,394 @@ SELECT l AS replaces_line_no_name
 (1 row)
 
 --
+-- ===========================================================================
+-- T16: index names.
+--
+-- Four properties carry an index name and they are fed by three different code
+-- paths, so each is checked separately rather than through one representative
+-- fixture: Index Scan and Index Only Scan share ExplainIndexScanDetails(),
+-- Bitmap Index Scan has its own inline emission in ExplainNode(), and
+-- Conflict Arbiter Indexes is assembled in show_modifytable_info() and has never
+-- gone through the shared function at all.  One fixture would leave two of the
+-- three paths untested.
+--
+-- The guard for the first three went INWARD, into explain_get_index_name()
+-- itself, which is the opposite direction from the one T14 took with
+-- get_opclass_name().  That function has a caller -- pg_get_indexdef -- that must
+-- never redact, so its guard had to be pushed OUT to its call sites; this one is
+-- static and EXPLAIN-only, so a guard inside it covers every present and future
+-- caller, and inside is also the only position from which the extension hook the
+-- function consults can be skipped (FR-25).  The two are deliberately
+-- inconsistent and someone will try to reconcile them.
+--
+-- The arbiter list still uses get_rel_name() in off mode -- it has never
+-- consulted the hook, and routing it through the function would newly expose
+-- unredacted arbiter names to an extension, which is a change to non-redacted
+-- output and not this feature's to make -- and calls explain_redact_name()
+-- directly under redaction.  That is what keeps it relatable to an Index Scan on
+-- the same index (FR-40, below).
+-- ===========================================================================
+--
+-- One verdict helper, because the same three clauses apply to all four surfaces:
+-- the unredacted plan must name a real index (or the assertion is vacuous, which
+-- is the failure T01 found in the original FR-16 fixture -- it got a Seq Scan and
+-- passed), the redacted plan must carry no marker, and the redacted plan must
+-- carry a pseudonym in the shape that surface prints.
+CREATE FUNCTION zsec_index_verdict(query_text text, want_pattern text)
+RETURNS text
+LANGUAGE sql AS
+$$
+    SELECT CASE
+             WHEN NOT EXISTS (SELECT 1 FROM zsec_plan(query_text, 'COSTS OFF') l
+                               WHERE l LIKE '%zsec_idx_%')
+               THEN 'FAIL: unredacted plan names no index -- assertion is vacuous'
+             WHEN EXISTS (SELECT 1 FROM zsec_plan(query_text, 'COSTS OFF, REDACT') l
+                           WHERE l LIKE '%zsec_%')
+               THEN 'FAIL: marker present in redacted output'
+             WHEN NOT EXISTS (SELECT 1 FROM zsec_plan(query_text, 'COSTS OFF, REDACT') l
+                               WHERE l ~ want_pattern)
+               THEN 'FAIL: no index pseudonym matching ' || want_pattern
+             ELSE 'ok: ' || want_pattern
+           END
+$$;
+--
+-- Surface 1 of 4: Index Scan.  " using iN" is appended to the text line; in the
+-- other three formats it is an "Index Name" property.
+--
+-- enable_indexonlyscan is off as well as the two GUCs the older FR-16 fixtures
+-- set, or the planner picks an Index Only Scan for this query, surface 2 gets
+-- measured twice and surface 1 goes untested.  Each surface below therefore
+-- carries its own GUCs with its own verdict inside them, rather than sharing one
+-- table-driven query the way the sweep above does: the settings that force one
+-- plan shape rule out another.
+SET enable_seqscan = off;
+SET enable_bitmapscan = off;
+SET enable_indexonlyscan = off;
+SELECT * FROM zsec_plan('SELECT zsec_bal FROM zsec_customers WHERE zsec_ssn = ''x''',
+                        'COSTS OFF, REDACT');
+         zsec_plan         
+---------------------------
+ Index Scan using i1 on t1
+(1 row)
+
+SELECT 'index scan' AS surface,
+       zsec_index_verdict(q, 'Index Scan using i[0-9]+ on t[0-9]+') AS verdict
+  FROM (VALUES ('SELECT zsec_bal FROM zsec_customers WHERE zsec_ssn = ''x''')) v(q);
+  surface   |                 verdict                 
+------------+-----------------------------------------
+ index scan | ok: Index Scan using i[0-9]+ on t[0-9]+
+(1 row)
+
+RESET enable_indexonlyscan;
+-- Surface 2 of 4: Index Only Scan.  Same emission site, different node type.
+SELECT * FROM zsec_plan('SELECT zsec_ssn FROM zsec_customers WHERE zsec_ssn = ''x''',
+                        'COSTS OFF, REDACT');
+           zsec_plan            
+--------------------------------
+ Index Only Scan using i1 on t1
+(1 row)
+
+SELECT 'index only scan' AS surface,
+       zsec_index_verdict(q, 'Index Only Scan using i[0-9]+ on t[0-9]+') AS verdict
+  FROM (VALUES ('SELECT zsec_ssn FROM zsec_customers WHERE zsec_ssn = ''x''')) v(q);
+     surface     |                   verdict                    
+-----------------+----------------------------------------------
+ index only scan | ok: Index Only Scan using i[0-9]+ on t[0-9]+
+(1 row)
+
+RESET enable_bitmapscan;
+RESET enable_seqscan;
+-- Surface 3 of 4: Bitmap Index Scan -- " on iN", a separate emission site with
+-- its own format branch.  The index name sits on the Bitmap INDEX Scan child;
+-- the relation name is on the Bitmap Heap Scan parent, so a fixture that read
+-- only the parent line would see a relation pseudonym and conclude the index
+-- name had been dealt with.
+SET enable_seqscan = off;
+SET enable_indexscan = off;
+SET enable_indexonlyscan = off;
+SELECT * FROM zsec_plan('SELECT zsec_bal FROM zsec_customers WHERE zsec_ssn = ''x''',
+                        'COSTS OFF, REDACT');
+           zsec_plan           
+-------------------------------
+ Bitmap Heap Scan on t1
+   ->  Bitmap Index Scan on i1
+(2 rows)
+
+SELECT 'bitmap index scan' AS surface,
+       zsec_index_verdict(q, 'Bitmap Index Scan on i[0-9]+') AS verdict
+  FROM (VALUES ('SELECT zsec_bal FROM zsec_customers WHERE zsec_ssn = ''x''')) v(q);
+      surface      |             verdict              
+-------------------+----------------------------------
+ bitmap index scan | ok: Bitmap Index Scan on i[0-9]+
+(1 row)
+
+RESET enable_indexonlyscan;
+RESET enable_indexscan;
+RESET enable_seqscan;
+-- Surface 4 of 4: Conflict Arbiter Indexes.  No GUC needed -- the arbiter list
+-- comes from the ON CONFLICT inference clause, not from a plan choice.  T04
+-- skipped the gather loop and left the list NIL, so the upstream "don't display
+-- arbiter indexes for a bare DO NOTHING" guard was doing the suppression as a
+-- side effect; the loop runs in both modes now and that guard is back to meaning
+-- what it says.
+SELECT * FROM zsec_plan('INSERT INTO zsec_customers (zsec_ssn) VALUES (''x'') ON CONFLICT (zsec_ssn) DO NOTHING',
+                        'COSTS OFF, REDACT');
+           zsec_plan            
+--------------------------------
+ Insert on t1
+   Conflict Resolution: NOTHING
+   Conflict Arbiter Indexes: i1
+   ->  Result
+(4 rows)
+
+SELECT 'conflict arbiter indexes' AS surface,
+       zsec_index_verdict(q, 'Conflict Arbiter Indexes: i[0-9]+') AS verdict
+  FROM (VALUES ('INSERT INTO zsec_customers (zsec_ssn) VALUES (''x'') ON CONFLICT (zsec_ssn) DO NOTHING')) v(q);
+         surface          |                verdict                
+--------------------------+---------------------------------------
+ conflict arbiter indexes | ok: Conflict Arbiter Indexes: i[0-9]+
+(1 row)
+
+-- And the guard itself: a bare DO NOTHING with no inference clause has no
+-- arbiter indexes and must still print no list, in either mode.  This is what
+-- would break if someone read the change above as "the redacted path should
+-- always emit something".
+SELECT count(*) AS arbiter_lines_for_bare_do_nothing
+  FROM zsec_plan('INSERT INTO zsec_customers (zsec_ssn) VALUES (''x'') ON CONFLICT DO NOTHING',
+                 'COSTS OFF, REDACT') l
+ WHERE l LIKE '%Conflict Arbiter%';
+ arbiter_lines_for_bare_do_nothing 
+-----------------------------------
+                                 0
+(1 row)
+
+--
+-- FR-40, and the property the arbiter site exists for: an ON CONFLICT statement
+-- whose arbiter index is ALSO scanned must print the same iN in both places.
+--
+-- This is the assertion here that a careless change would break, because the two
+-- lines are produced by two different functions.  Route the arbiter list through
+-- get_rel_name() under redaction, or key its pseudonym on anything but the index
+-- OID, and the record reads "Conflict Arbiter Indexes: i2" above an "Index Only
+-- Scan using i1" -- telling a reader the statement conflicts on an index it is
+-- not scanning.  No real name, no marker, and the sweep above stays clean, so it
+-- is measured here.
+--
+SET enable_seqscan = off;
+SET enable_bitmapscan = off;
+SELECT * FROM zsec_plan('INSERT INTO zsec_customers (zsec_ssn) SELECT zsec_ssn FROM zsec_customers WHERE zsec_ssn = ''x'' ON CONFLICT (zsec_ssn) DO NOTHING',
+                        'COSTS OFF, REDACT');
+                 zsec_plan                 
+-------------------------------------------
+ Insert on t1
+   Conflict Resolution: NOTHING
+   Conflict Arbiter Indexes: i1
+   ->  Index Only Scan using i1 on t1 t1_1
+(4 rows)
+
+SELECT CASE
+         WHEN arbiter IS NULL THEN 'FAIL: no arbiter pseudonym -- assertion is vacuous'
+         WHEN scanned IS NULL THEN 'FAIL: no scan pseudonym -- assertion is vacuous'
+         WHEN arbiter = scanned THEN 'ok: same index, same pseudonym (' || arbiter || ')'
+         ELSE 'FAIL: arbiter ' || arbiter || ' but scan ' || scanned
+       END AS arbiter_scan_relatable
+  FROM (SELECT (SELECT m[1] FROM zsec_plan(q, 'COSTS OFF, REDACT') l,
+                     LATERAL regexp_matches(l, 'Conflict Arbiter Indexes: (i[0-9]+)') m) AS arbiter,
+               (SELECT m[1] FROM zsec_plan(q, 'COSTS OFF, REDACT') l,
+                     LATERAL regexp_matches(l, 'Scan using (i[0-9]+)') m) AS scanned
+          FROM (VALUES ('INSERT INTO zsec_customers (zsec_ssn) SELECT zsec_ssn FROM zsec_customers WHERE zsec_ssn = ''x'' ON CONFLICT (zsec_ssn) DO NOTHING')) v(q)) s;
+       arbiter_scan_relatable        
+-------------------------------------
+ ok: same index, same pseudonym (i1)
+(1 row)
+
+-- The other half of FR-40: two different indexes get two different pseudonyms.
+-- Both branches scan the same relation, so this also shows the index counter runs
+-- independently of the relation counter -- the relation stays t1 on both lines
+-- while the indexes are i1 and i2.
+SELECT * FROM zsec_plan('SELECT zsec_a.zsec_bal FROM zsec_customers zsec_a WHERE zsec_a.zsec_ssn = ''x'' UNION ALL SELECT zsec_b.zsec_bal FROM zsec_customers zsec_b WHERE zsec_b.zsec_bal = 1',
+                        'COSTS OFF, REDACT');
+                zsec_plan                
+-----------------------------------------
+ Append
+   ->  Index Scan using i1 on t1 a2
+   ->  Index Only Scan using i2 on t1 a3
+(3 rows)
+
+RESET enable_bitmapscan;
+RESET enable_seqscan;
+--
+-- All four formats.  "Index Name" is a property in json/xml/yaml and a bare text
+-- tail in the text format, written by different branches of both emission sites,
+-- so a text-only check covers neither property path.
+--
+SET enable_seqscan = off;
+SET enable_bitmapscan = off;
+SELECT fmt.name AS format,
+       CASE
+         WHEN s.b LIKE '%zsec_idx%' THEN 'FAIL: real index name present'
+         WHEN s.b LIKE '%zsec_%'    THEN 'FAIL: marker present'
+         WHEN s.b !~ '\mi1\M'       THEN 'FAIL: no index pseudonym -- assertion is vacuous'
+         ELSE 'ok: index named i1'
+       END AS verdict
+  FROM (VALUES ('json'), ('text'), ('xml'), ('yaml')) AS fmt(name),
+       LATERAL (SELECT zsec_explain_blob('SELECT zsec_ssn FROM zsec_customers WHERE zsec_ssn = ''x''',
+                                         'COSTS OFF, REDACT, FORMAT ' || fmt.name)) AS s(b)
+ ORDER BY fmt.name COLLATE "C";
+ format |      verdict       
+--------+--------------------
+ json   | ok: index named i1
+ text   | ok: index named i1
+ xml    | ok: index named i1
+ yaml   | ok: index named i1
+(4 rows)
+
+RESET enable_bitmapscan;
+RESET enable_seqscan;
+--
+-- Exemption: the negative control for the whole rule, and the assertion that
+-- makes T16's one deviation from its brief sound.
+--
+-- The brief called for an explicit explain_redact_exempt() test inside
+-- explain_get_index_name(), as T15 has in ExplainTargetRel().  T16 has none and
+-- relies on explain_redact_name() deciding exemption itself and returning the
+-- real name.  T15 needed the explicit test because its exempt path prints a
+-- second thing -- the schema, which FR-11 keeps off a pseudonym -- so it was
+-- choosing between code paths rather than between strings.  An index name has no
+-- schema, and an explicit test here would mean a second get_rel_name() call on
+-- the one path whose purpose is to survive that returning NULL (FR-60).
+--
+-- So this is where that reliance is proved.  Were it misplaced, a pg_catalog
+-- index would print as iN, every leak assertion in this file would still pass,
+-- and catalog plans would have become unreadable for no gain.
+--
+SELECT * FROM zsec_plan('SELECT relname FROM pg_class WHERE oid = 1259', 'COSTS OFF, REDACT');
+                    zsec_plan                    
+-------------------------------------------------
+ Index Scan using pg_class_oid_index on pg_class
+(1 row)
+
+SELECT fmt.name AS format,
+       CASE
+         WHEN s.b NOT LIKE '%pg_class_oid_index%' THEN 'FAIL: exempt index was pseudonymized'
+         WHEN s.b NOT LIKE '%pg_class%'           THEN 'FAIL: exempt relation was pseudonymized'
+         ELSE 'ok: real index name kept'
+       END AS verdict
+  FROM (VALUES ('json'), ('text'), ('xml'), ('yaml')) AS fmt(name),
+       LATERAL (SELECT zsec_explain_blob('SELECT relname FROM pg_class WHERE oid = 1259',
+                                         'COSTS OFF, REDACT, FORMAT ' || fmt.name)) AS s(b)
+ ORDER BY fmt.name COLLATE "C";
+ format |         verdict          
+--------+--------------------------
+ json   | ok: real index name kept
+ text   | ok: real index name kept
+ xml    | ok: real index name kept
+ yaml   | ok: real index name kept
+(4 rows)
+
+--
+-- FR-60 IS NOT ASSERTED HERE, and the reason is that it cannot be from this
+-- file.  The requirement is about a concurrently dropped index; a regression run
+-- is one backend against a plan the plancache invalidates the moment the index
+-- goes away, so no shape reaches explain_get_index_name()'s catalog lookup with
+-- a dead OID.  Writing a fixture that looked as though it did would be worse
+-- than saying so.
+--
+-- Two things hold it up instead, one structural and one measured elsewhere:
+--
+--   * Structural.  The redacted path RETURNS BEFORE the lookup.  The
+--     elog(ERROR, "cache lookup failed for index %u") that FR-60 names sits
+--     after the es->redact check in explain_get_index_name(), so a redacted
+--     record cannot reach it at all -- a stronger property than handling the
+--     failure.  The arbiter site never had an elog: get_rel_name() returns NULL
+--     there, and the redacted branch does not call it.
+--   * Measured, in src/test/modules/test_explain_redact: explain_redact_name()
+--     answers a nonexistent index OID with i1 rather than erroring or returning
+--     NULL.  That is the half which would make the structural argument false if
+--     it were wrong, and it needs an OID no catalog row backs, which is why it
+--     lives there and not here.
+--
+-- Recorded as a comment rather than dressed up as a passing fixture, so the
+-- coverage claim in the requirements stays honest.
+--
+--
+-- Redaction must not become deletion, on T16's own surfaces.
+--
+-- Every assertion above is satisfied by an implementation that prints the index
+-- name and nothing else on those nodes, so what shares the node is pinned too.
+--
+-- Scan Direction is the one the T04-era comment in ExplainIndexScanDetails()
+-- paired the index name with, and it comes out of the same two format branches of
+-- the same function -- so a guard that crept back around the function would take
+-- it along.  Checked in all four formats, because in text it is the bare word
+-- "Backward" (and nothing at all for a forward scan) while in the other three it
+-- is a property with a value.
+--
+SET enable_seqscan = off;
+SET enable_bitmapscan = off;
+SELECT * FROM zsec_plan('SELECT zsec_ssn FROM zsec_customers ORDER BY zsec_ssn DESC',
+                        'COSTS OFF, REDACT');
+                zsec_plan                
+-----------------------------------------
+ Index Only Scan Backward using i1 on t1
+(1 row)
+
+SELECT fmt.name AS format,
+       CASE
+         WHEN s.b !~ 'Backward' THEN 'FAIL: Scan Direction suppressed'
+         WHEN s.b !~ '\mi1\M'   THEN 'FAIL: no index pseudonym -- assertion is vacuous'
+         ELSE 'ok: direction and pseudonym both printed'
+       END AS verdict
+  FROM (VALUES ('json'), ('text'), ('xml'), ('yaml')) AS fmt(name),
+       LATERAL (SELECT zsec_explain_blob('SELECT zsec_ssn FROM zsec_customers ORDER BY zsec_ssn DESC',
+                                         'COSTS OFF, REDACT, FORMAT ' || fmt.name)) AS s(b)
+ ORDER BY fmt.name COLLATE "C";
+ format |                 verdict                  
+--------+------------------------------------------
+ json   | ok: direction and pseudonym both printed
+ text   | ok: direction and pseudonym both printed
+ xml    | ok: direction and pseudonym both printed
+ yaml   | ok: direction and pseudonym both printed
+(4 rows)
+
+-- Index Searches is the counter that sits on the very nodes T16 edits -- on the
+-- Index Scan node itself and on the Bitmap Index Scan child, not on the heap
+-- parent -- so it is the counter a widened guard would take out.  ANALYZE is
+-- needed to reach it; the lines zsec_plan strips are what make this readable.
+SELECT * FROM zsec_plan('SELECT zsec_bal FROM zsec_customers WHERE zsec_ssn = ''x''',
+                        'ANALYZE, COSTS OFF, TIMING OFF, BUFFERS OFF, REDACT');
+                      zsec_plan                      
+-----------------------------------------------------
+ Index Scan using i1 on t1 (actual rows=N.N loops=N)
+   Index Searches: N
+(2 rows)
+
+RESET enable_bitmapscan;
+RESET enable_seqscan;
+SET enable_seqscan = off;
+SET enable_indexscan = off;
+SET enable_indexonlyscan = off;
+SELECT * FROM zsec_plan('SELECT zsec_bal FROM zsec_customers WHERE zsec_ssn = ''x''',
+                        'ANALYZE, COSTS OFF, TIMING OFF, BUFFERS OFF, REDACT');
+                        zsec_plan                        
+---------------------------------------------------------
+ Bitmap Heap Scan on t1 (actual rows=N.N loops=N)
+   ->  Bitmap Index Scan on i1 (actual rows=N.N loops=N)
+         Index Searches: N
+(3 rows)
+
+RESET enable_indexonlyscan;
+RESET enable_indexscan;
+RESET enable_seqscan;
+-- "Rows Removed by Index Recheck" is NOT pinned, deliberately.  It is emitted by
+-- show_instrumentation_count() on the Bitmap HEAP Scan node -- neither of the two
+-- sites T16 touches -- and reaching it needs a lossy TIDBitmap, which needs a
+-- table big enough that the "Heap Blocks: lossy=" counts move with work_mem and
+-- page layout.  Measured while writing this: 60000 rows at 200 bytes goes lossy
+-- and 20000 does not, and at the lossy size the index condition matched every row
+-- so nothing was rechecked away.  An expected file that shifts between hosts
+-- costs more than a counter no T16 code path can suppress.
+--
 -- Parallel plans.  A worker's section is produced by the same ExplainNode code,
 -- but with es->str temporarily pointed at a per-worker buffer, so it is worth
 -- confirming redaction survives the swap rather than assuming it.
@@ -1591,7 +2017,7 @@ SELECT count(*) > 0 AS serialize_alone_still_works
 --
 RESET search_path;
 DROP SCHEMA zsec_ns CASCADE;
-NOTICE:  drop cascades to 18 other objects
+NOTICE:  drop cascades to 19 other objects
 DETAIL:  drop cascades to collation zsec_ns.zsec_coll
 drop cascades to type zsec_ns.zsec_composite
 drop cascades to type zsec_ns.zsec_enum
@@ -1610,3 +2036,4 @@ drop cascades to function zsec_ns.zsec_explain_blob(text,text)
 drop cascades to table zsec_ns.zsec_enr_src
 drop cascades to table zsec_ns.zsec_enr_log
 drop cascades to function zsec_ns.zsec_enr_trig()
+drop cascades to function zsec_ns.zsec_index_verdict(text,text)

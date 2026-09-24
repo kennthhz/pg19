@@ -146,7 +146,7 @@ static void show_scan_io_usage(ScanState *planstate,
 static void show_instrumentation_count(const char *qlabel, int which,
 									   PlanState *planstate, ExplainState *es);
 static void show_foreignscan_info(ForeignScanState *fsstate, ExplainState *es);
-static const char *explain_get_index_name(Oid indexId);
+static const char *explain_get_index_name(Oid indexId, ExplainState *es);
 static RedactCtx *explain_redact_context(ExplainState *es);
 static const char *explain_redact_refname(ExplainState *es,
 										  RangeTblEntry *rte, Index rti);
@@ -1890,10 +1890,16 @@ ExplainNode(PlanState *planstate, List *ancestors,
 		case T_BitmapIndexScan:
 			{
 				BitmapIndexScan *bitmapindexscan = (BitmapIndexScan *) plan;
-				const char *indexname = es->redact ? NULL :
-					explain_get_index_name(bitmapindexscan->indexid);
+				const char *indexname =
+					explain_get_index_name(bitmapindexscan->indexid, es);
 
-				/* The other of the two index-name lookups; see above */
+				/*
+				 * The second of this file's two index-name lookups; the other
+				 * is in ExplainIndexScanDetails().  T04's es->redact check
+				 * stood here too, and redaction is now the function's
+				 * business, so this site is back to the upstream shape -- a
+				 * redacted bitmap scan reads " on i1".
+				 */
 				if (indexname != NULL)
 				{
 					if (es->format == EXPLAIN_FORMAT_TEXT)
@@ -4505,11 +4511,51 @@ show_foreignscan_info(ForeignScanState *fsstate, ExplainState *es)
  * Note: names returned by this function should be "raw"; the caller will
  * apply quoting if needed.  Formerly the convention was to do quoting here,
  * but we don't want that in non-text output formats.
+ *
+ * Under redaction the index name becomes "iN".  The ExplainState argument is
+ * here only to make that decision, and it was added so that the decision could
+ * be made HERE rather than at the call sites: T04 checked es->redact at each of
+ * the two callers, and the guard was moved inward because two things can only
+ * be got right on the inside.
+ *
+ * The first is the hook.  An extension answering explain_get_index_name_hook
+ * returns whatever string it likes, and extension-supplied output does not
+ * belong in a redacted record at all (FR-25).  Redaction therefore returns
+ * before the hook is consulted.  A caller-side check can decline to call this
+ * function, but it cannot stop the next caller someone adds from reaching the
+ * hook.
+ *
+ * The second is the lookup failure below.  A concurrently dropped index makes
+ * get_rel_name() return NULL and turns the whole record into an ERROR, which
+ * FR-60 forbids for redacted output: a pseudonym must be substituted instead.
+ * explain_redact_name() neither errors nor returns NULL -- a failed catalog
+ * lookup is exactly what it answers with a pseudonym -- so the redacted path
+ * satisfies FR-60 by returning before the elog rather than by handling it.
+ *
+ * Note that this is the opposite move from get_opclass_name() in ruleutils.c,
+ * whose guard T14 pushed the other way, out to its call sites.  That function
+ * has a caller that must never redact (pg_get_indexdef); this one is static,
+ * EXPLAIN-only, and every caller wants the same answer, so the default belongs
+ * in the function.
+ *
+ * An index in pg_catalog keeps its real name, on the same footing as the exempt
+ * relations T15 prints in full.  That needs no separate test here:
+ * explain_redact_name() decides exemption itself and returns the real name when
+ * it applies.  T15 had to call explain_redact_exempt() explicitly because its
+ * exempt path prints a second thing as well -- the schema, which FR-11 keeps off
+ * a pseudonym -- so it was choosing between code paths rather than between
+ * strings.  There is no schema on an index name, and testing exemption here
+ * separately would mean calling get_rel_name() again on a path that has to cope
+ * with it returning NULL.
  */
 static const char *
-explain_get_index_name(Oid indexId)
+explain_get_index_name(Oid indexId, ExplainState *es)
 {
 	const char *result;
+
+	if (es->redact)
+		return explain_redact_name(explain_redact_context(es),
+								   REDACT_INDEX, indexId);
 
 	if (explain_get_index_name_hook)
 		result = (*explain_get_index_name_hook) (indexId);
@@ -4819,16 +4865,17 @@ ExplainIndexScanDetails(Oid indexid, ScanDirection indexorderdir,
 						ExplainState *es)
 {
 	/*
-	 * Scan direction describes the plan and stays; the index name is the
-	 * user's and goes.  explain_get_index_name() has no ExplainState
-	 * argument, so the check has to be made by its callers -- this one and
-	 * one other, both in this file.
+	 * Both the scan direction and the index name are printed under redaction:
+	 * the direction describes the plan, and the name arrives as "iN" because
+	 * explain_get_index_name() now redacts on its own.  T04's check of
+	 * es->redact stood here and is gone -- see that function for why the
+	 * guard belongs inside it.
 	 *
-	 * Not calling it has a second benefit.  It consults
-	 * explain_get_index_name_hook first, and an extension answering that hook
-	 * returns whatever name it likes, under no obligation to pick a safe one.
+	 * indexname can still be NULL: EXPLAIN of a hypothetical index from an
+	 * extension hook has always been able to produce that, and the two
+	 * branches below already cope with it.
 	 */
-	const char *indexname = es->redact ? NULL : explain_get_index_name(indexid);
+	const char *indexname = explain_get_index_name(indexid, es);
 
 	if (es->format == EXPLAIN_FORMAT_TEXT)
 	{
@@ -5187,20 +5234,29 @@ show_modifytable_info(ModifyTableState *mtstate, List *ancestors,
 	}
 
 	/*
-	 * Gather names of ON CONFLICT arbiter indexes.  Under redaction the names
-	 * are not looked up at all, rather than looked up and then dropped where
-	 * they would be printed.  The other name sites in this file avoid their
-	 * lookups the same way, and doing one of them differently would leave a
-	 * reader wondering why.
+	 * Gather names of ON CONFLICT arbiter indexes.  Under redaction each one
+	 * becomes "iN" -- the same pseudonym an Index Scan on that index prints,
+	 * because it comes from the same call, so the two lines in a record stay
+	 * relatable (FR-92).  T04 skipped this loop entirely and left the list
+	 * empty; it runs in both modes now.
+	 *
+	 * Deliberately not explain_get_index_name(): this site has never
+	 * consulted explain_get_index_name_hook, and routing it through there
+	 * would newly expose unredacted arbiter names to an extension hook, which
+	 * is a change to non-redacted output and not this feature's to make.
 	 */
-	if (!es->redact)
+	foreach(lst, node->arbiterIndexes)
 	{
-		foreach(lst, node->arbiterIndexes)
-		{
-			char	   *indexname = get_rel_name(lfirst_oid(lst));
+		Oid			indexoid = lfirst_oid(lst);
+		const char *indexname;
 
-			idxNames = lappend(idxNames, indexname);
-		}
+		if (es->redact)
+			indexname = explain_redact_name(explain_redact_context(es),
+											REDACT_INDEX, indexoid);
+		else
+			indexname = get_rel_name(indexoid);
+
+		idxNames = lappend(idxNames, unconstify(char *, indexname));
 	}
 
 	if (node->onConflictAction != ONCONFLICT_NONE)
@@ -5240,7 +5296,6 @@ show_modifytable_info(ModifyTableState *mtstate, List *ancestors,
 		 * Don't display arbiter indexes at all when DO NOTHING variant
 		 * implicitly ignores all conflicts
 		 */
-		/* Empty under redaction, since the names were never looked up */
 		if (idxNames)
 			ExplainPropertyList("Conflict Arbiter Indexes", idxNames, es);
 
