@@ -469,7 +469,9 @@ a commit series, but the option must not become visible until the last commit.
   text line); `show_window_def` (`:2912`); `Replaces` (`:5042`/`:5064`/`:5069`);
   `Custom Plan Provider` and the `Custom Scan (…)` name; `show_tablesample`
   method (`:3052`); `show_sortorder_options` `COLLATE`/`USING`
-  (`:2866`/`:2881`).
+  (`:3267`/`:3289` *(rev. T20: was `:2866`/`:2881`. Only this one entry was
+  re-verified — the rest of this inventory has not been audited against the
+  current tree and several others are likely to have drifted too)*).
 - Omit `Query Text` (FR-23), the `Query Parameters` property entirely
   (FR-22/D10), `Query Identifier` (`:825`, FR-37/D5), and the `Settings`
   section (FR-26).
@@ -1657,15 +1659,108 @@ own-surface accounting; the two agree from here on.
 
 #### T20 — Sort-key `COLLATE` / `USING` decorations
 
-`show_sortorder_options()` (`:2866`, `:2881`). These are appended in
-explain.c *after* deparse returns, so no Stage 3 change reaches them. **This
-must land before T21**, or T21 would enable `Sort Key` output carrying a real
-collation name. Both sites currently `elog(ERROR)` on lookup failure and must
-become pseudonym substitution (FR-60).
+`show_sortorder_options()` — `get_collation_name()` at explain.c`:3267`,
+`get_opname()` at `:3289`, redaction branches at `:3262` and `:3284`, decorations
+printed at `:3271` and `:3293`. *(rev. T20: this section previously cited `:2866`
+and `:2881`, which were stale before T20 changed anything.)* Both names are
+assembled in explain.c **after** `deparse_expression()` has returned the key
+string, so no Stage 3 change reaches them — which is the whole reason FR-98 lists
+this site apart from the deparser ones. **This must land before T21**, or T21
+enables `Sort Key` output carrying a real collation name.
 
-**Tests.** `ORDER BY … COLLATE <user collation>`; a user-defined ordering
-operator for the `USING` half; built-in `>` still prints `DESC` (negative
-control).
+**Delivered.** The `ExplainState` is threaded into the function (forward
+declaration `:117-119`, sole call site `:3173-3178`) and both lookups become
+`explain_redact_name(explain_redact_context(es), REDACT_COLLATION|REDACT_OPERATOR,
+oid)` under `if (es->redact)`. 90 insertions, 15 deletions, explain.c only.
+
+**Guard direction: inward, and this is now the third such decision in the
+feature.** Someone will eventually try to make the three uniform, so the reasons
+are recorded together rather than one per task:
+
+| task | site | direction | why |
+|---|---|---|---|
+| T14 | `get_opclass_name()` (ruleutils) | **outward**, to the call site | non-EXPLAIN callers: `pg_get_indexdef_worker()` and the partition-bound printer emit DDL that must name real objects. A guard inside would corrupt `pg_get_indexdef()`. It also takes a bare `StringInfo` and no deparse context, so it *cannot* decide for itself. |
+| T16 | `explain_get_index_name()` | **inward** | `static`, EXPLAIN-only, no caller that should stay unredacted. |
+| T20 | `show_sortorder_options()` | **inward** | same three properties as T16: `static` in explain.c, EXPLAIN-only, exactly one caller (verified by grep tree-wide — the declaration, the definition, one call, one mention in a comment) and no caller that should stay unredacted, so a caller added later is covered by default. |
+
+The rule the three share is not "inward" or "outward": it is **whether every
+caller wants the same answer**. T14's did not; T16's and T20's do.
+
+**Dormant as landed, and that is the surface, not an oversight.** The only
+caller, `show_sort_group_keys()`, still returns early under redaction, so the
+function is not entered and T20 changes no byte of output. It cannot be otherwise:
+a decoration is appended to the deparsed key string, and there is no printing
+`" COLLATE coll1"` without the expression it decorates — that expression is T21's
+surface. Contrast T17 (tablesample method name, separable from its parameters) and
+T19 (window name, separable from its body): those had a printable name with no
+expression attached. This one does not. The blanket return **stays**, and the
+caller's comment was rewritten to say so along with the real reason: the callee
+*can* check now, what keeps the return is that the expression is still suppressed.
+Do not lift it to demonstrate the guard — what comes out with it is real column
+names.
+
+**FR-60 fixed at both sites, structurally.** Each `elog(ERROR, "cache lookup
+failed for …")` now sits on the `else` branch only; the redacted branch assigns
+from `explain_redact_name()` — which neither errors nor returns NULL — and falls
+through to the `appendStringInfo`. The failure is **unreachable** under redaction
+rather than handled, the same move T16 made for the index lookup. Recorded against
+FR-60 in the requirements as well, since that requirement has been accumulating a
+list of paths that do and do not honour it and these two arrive with a status of
+their own: clean by construction **and unexecuted**, unlike T16's (executes, unit
+tested) and unlike FR-98c's (clean only because unreachable, and breaks the day it
+is not).
+
+**Preserved deliberately.** `DESC`, `NULLS FIRST`/`NULLS LAST` and the `reverse`
+flag are plan structure and print identically in both modes. In particular
+`get_equality_op_for_ordering_op()` (`:3300`) is called for its `reverse` **output
+parameter**, not for a name, and so sits *outside* the redaction split, with a
+comment saying why: skipping it under redaction would silently change the `NULLS`
+decision, which is a correctness bug in the structure rather than a disclosure.
+
+**Tests — T20 has none, and none were invented.** The guard has no verification
+reach before T21, which is worth stating rather than papering over:
+
+* Not through EXPLAIN — the caller returns before the call.
+* Not through `src/test/modules/test_explain_redact` either — the function is
+  `static` in explain.c, so unlike the ruleutils guards the module reaches
+  directly, it cannot be called from outside.
+* The only way to see it fire is the out-of-tree perturbation T19 used
+  (temporarily drop the caller's return, run a user collation and a user ordering
+  operator under redaction, observe `COLLATE coll1` / `USING op1`, restore). Not
+  run in this slice and **not to be committed as a fixture.**
+
+So FR-98(a) is verified by **T21's tests plus the existing off-mode coverage**, and
+by nothing of its own.
+
+**What the checks in this slice confirm** is the **non-redacted** path, which the
+restructure did touch when both lookups moved into `else` branches. That coverage
+was counted, not assumed: 46 sort-key decorations across five `expected/*.out`
+files, of which **11 execute** in this build — `collate.out` (`COLLATE "C"` ×3,
+`COLLATE "POSIX"`, one of them alongside `DESC` and `NULLS FIRST`),
+`equivclass.out` (`USING <` ×3) and `incremental_sort.out` (`COLLATE "C"` ×4). Both
+restructured branches are therefore exercised. `make -C src/test/regress check`:
+**241/241, no expected file changed.** A changed sort-key expected file would be a
+defect in the `else` branches, not something to regenerate.
+
+The 35 remaining occurrences are real but unreachable here, and this is the gap to
+know about: 31 are in `collate.icu.utf8.out`, which self-skips because this tree
+has `with_icu = no`, and 4 are in `contrib/postgres_fdw/expected/postgres_fdw.out`,
+which holds the **only** user-defined ordering operator in any expected output
+(`USING <^`). Off-mode coverage is indifferent to whether a name is exempt — the
+`else` branch calls `get_collation_name()` / `get_opname()` either way — so the
+11 cover the restructure fully; but if a future task needs a *user* collation or
+operator name in off-mode expected output, those two files are where it lives and
+neither runs in a default `make check`.
+
+**Exemption.** Not asserted separately: `explain_redact_name()` decides it and
+returns the real name where it applies, so `COLLATE "C"` (T11) and `USING <` (T10)
+stay readable. That matters more here than elsewhere — a pg_catalog collation and
+a built-in operator are most of what makes a sort key diagnosable, and both
+disclose nothing.
+
+**Revert.** Nothing observable changes, since the guard is dormant: the decorations
+are suppressed by T04's return either way. The FR-60 property at both sites is lost,
+and T21 must not be applied on top of a reverted T20.
 
 #### T21 — Re-enable expression output
 
@@ -1677,9 +1772,9 @@ emitted through `deparse_expression_redacted()`.
 This is the highest-risk task in the plan and it is deliberately last. Its risk
 was moved into T06–T20, all of which are already landed and unit-tested.
 
-**Delivers — two required steps, not one.**
+**Delivers — three required steps, not one.** *(rev. T20: step 3 added. Step 1 was added by T19. The pattern is worth naming: every task that lands a guard it cannot execute pushes a confirmation obligation onto T21, and T21 is the only place any of them can be discharged.)*
 
-1. **`explain.c:917` must call `deparse_context_for_plan_tree_redacted()`.**
+1. **`explain.c:918` must call `deparse_context_for_plan_tree_redacted()`.** *(rev. T20: `:917` was off by one; the call is at `:918`, re-verified against the current tree.)*
    *(rev. T19: this step was missing from this section and it is not a detail.)*
    `ExplainPrintPlan()` calls the **non-redacted**
    `deparse_context_for_plan_tree()` today, unconditionally, in both modes. T06
@@ -1700,6 +1795,32 @@ was moved into T06–T20, all of which are already landed and unit-tested.
 2. **Replace the T04 suppression of the `show_*` calls** with calls that pass the
    `RedactCtx`.
 
+3. **Confirm T20's sort-key guard starts producing output.** *(rev. T20.)*
+   `show_sortorder_options()` (explain.c`:3240`) pseudonymizes the `COLLATE`
+   collation and the `USING` operator itself, and as landed it is **never entered
+   under redaction**: `show_sort_group_keys()` returns early, because a decoration
+   is appended to the deparsed key string and the string cannot be printed without
+   the expression. Lifting that return is step 2's job, and the instant it is
+   lifted T20's guard goes from unexecuted to load-bearing on the same line of
+   output as the key expression. Until then **T20 has no verification reach at
+   all** — not through EXPLAIN, and not through
+   `src/test/modules/test_explain_redact` either, because the function is `static`
+   in explain.c and out of the module's reach.
+
+   So T21's tests **must** include, in a sort key: a **user-defined collation**
+   and a **user-defined ordering operator**. Assert `coll`*N* and `op`*N* in
+   `Sort Key`, with `COLLATE "C"` and `USING <` as the exempt negative controls
+   (T11 and T10). Without both, T20 ships permanently unverified — and unlike the
+   FR-94 / FR-98c / FR-15 guards, T20 is **not** an unreachable-path guard that
+   can be left argued; it is a reachable path that this task makes reachable.
+   Note that neither name exists in the tree's off-mode expected output in a form
+   this build runs: the only user-defined ordering operator is `USING <^` in
+   `contrib/postgres_fdw`, and the user collations are in `collate.icu.utf8.out`,
+   which self-skips under `with_icu = no`. T21 creates its own.
+
+   Same shape as step 1, and the same failure mode: nothing errors, nothing looks
+   wrong, the property is simply populated with a real name.
+
 Plus a **defensive assertion**: if `es->redact` is set and the deparse context
 carries no `RedactCtx`, error rather than emit. That converts an out-of-order
 revert of T06–T20 (§1.2) from a silent leak into a loud failure — **and, as of
@@ -1709,7 +1830,8 @@ so that it fires on exactly that state: `es->redact` true and the context's
 the assertion fires rather than output appearing.
 
 **Tests.** The whole §10.2 catalog re-run with expressions enabled — this is
-the first point at which most of it is meaningful. Plus §10.3's full mode
+the first point at which most of it is meaningful. Including step 3's user
+collation and user ordering operator in a sort key, which is not optional. Plus §10.3's full mode
 matrix. Plus the §10.4 negative controls, which now matter far more: exempt
 function and operator names, core type labels, and plan structure must all be
 present *inside* expressions.

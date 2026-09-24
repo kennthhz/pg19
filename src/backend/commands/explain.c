@@ -115,7 +115,8 @@ static void show_sort_group_keys(PlanState *planstate, const char *qlabel,
 								 Oid *sortOperators, Oid *collations, bool *nullsFirst,
 								 List *ancestors, ExplainState *es);
 static void show_sortorder_options(StringInfo buf, Node *sortexpr,
-								   Oid sortOperator, Oid collation, bool nullsFirst);
+								   Oid sortOperator, Oid collation, bool nullsFirst,
+								   ExplainState *es);
 static void show_window_def(WindowAggState *planstate,
 							List *ancestors, ExplainState *es);
 static void show_window_keys(StringInfo buf, PlanState *planstate,
@@ -3124,11 +3125,20 @@ show_sort_group_keys(PlanState *planstate, const char *qlabel,
 	int			keyno;
 
 	/*
-	 * This also takes care of show_sortorder_options(), which tacks COLLATE
-	 * and USING names onto a key after it has been printed.  That function is
-	 * given only a string buffer, not the ExplainState, so it cannot make the
-	 * check for itself.  Relying on this one is safe because this is the only
-	 * place that calls it.
+	 * The keys themselves are deparsed expressions, so they stay suppressed
+	 * until T21 enables expression output.  This return is what suppresses
+	 * them.
+	 *
+	 * It also, today, suppresses the COLLATE and USING decorations that
+	 * show_sortorder_options() tacks onto a key.  That function now takes the
+	 * ExplainState and redacts those two names itself, so it no longer
+	 * depends on this check -- but it cannot be demonstrated while this
+	 * return stands, because a decoration is appended to the deparsed key
+	 * string and there is no way to print " COLLATE <name>" without the
+	 * expression it decorates. Do not lift this return in order to show the
+	 * decorations working: what would come out with it is the user's real
+	 * column names.  Lifting it is T21's job, and T21 is where that guard
+	 * starts producing output.
 	 */
 	if (es->redact)
 		return;
@@ -3165,7 +3175,8 @@ show_sort_group_keys(PlanState *planstate, const char *qlabel,
 								   (Node *) target->expr,
 								   sortOperators[keyno],
 								   collations[keyno],
-								   nullsFirst[keyno]);
+								   nullsFirst[keyno],
+								   es);
 		/* Emit one property-list item per sort key */
 		result = lappend(result, pstrdup(sortkeybuf.data));
 		if (keyno < nPresortedKeys)
@@ -3180,10 +3191,56 @@ show_sort_group_keys(PlanState *planstate, const char *qlabel,
 /*
  * Append nondefault characteristics of the sort ordering of a column to buf
  * (collation, direction, NULLS FIRST/LAST)
+ *
+ * Two of the things printed here are names the user chose: the collation of a
+ * COLLATE decoration and the operator of a USING decoration (FR-98a).  Both are
+ * assembled here, in explain.c, after deparse_expression() has already returned
+ * the key string, so no change on the deparse side reaches them -- which is the
+ * whole reason FR-98 lists this site separately.  Under redaction they become
+ * "collN" and "opN".
+ *
+ * The ExplainState argument was added for that decision, and it was added so the
+ * decision could be made HERE rather than at the call site, which is the move
+ * T16 made for explain_get_index_name() and for the same reason: this function is
+ * static, EXPLAIN-only, and there is no caller that should stay unredacted, so
+ * any caller added later is covered by default.  Contrast get_opclass_name() in
+ * ruleutils.c, whose guard T14 deliberately pushed the other way, out to its call
+ * sites, because one of its callers is pg_get_indexdef() and DDL must never
+ * redact.
+ *
+ * THE GUARD IS DORMANT AS LANDED, and that is a property of the surface rather
+ * than an oversight.  The only caller, show_sort_group_keys(), returns early
+ * under redaction because a decoration is appended to the deparsed key string,
+ * and there is no printing " COLLATE coll1" without the expression it decorates.
+ * The expression is T21's surface.  So this function is not reached under
+ * redaction today and T20 changes no output; T21 is the task that makes it
+ * observable.  It has to land first all the same, because the moment T21 lifts
+ * that return an unguarded version here would print a real collation name.
+ *
+ * Exemption is not tested separately because explain_redact_name() decides it and
+ * answers with the real name when it applies.  That is what keeps the useful
+ * cases readable: COLLATE "C" and USING < disclose nothing -- a pg_catalog
+ * collation (T11) and a built-in operator (T10) are both exempt -- and they are
+ * most of what makes a sort key diagnosable.
+ *
+ * FR-60: both catalog lookups below end in elog(ERROR) when the object has been
+ * dropped concurrently, which would destroy the whole record.  FR-60 forbids that
+ * for redacted output and requires a pseudonym instead, so the redacted branch of
+ * each site returns a name without going near the lookup.  explain_redact_name()
+ * neither errors nor returns NULL -- a failed lookup is exactly the case it
+ * answers with a pseudonym -- so the elogs are unreachable under redaction rather
+ * than handled.  Same structural fix T16 made for the index lookup.
+ *
+ * Everything else here is plan structure, not names: DESC, NULLS FIRST/LAST and
+ * the reverse flag are printed identically in both modes.  Note in particular
+ * that get_equality_op_for_ordering_op() is called for its "reverse" output, not
+ * for a name, and so sits outside the redaction split below -- skipping it would
+ * change the NULLS decision.
  */
 static void
 show_sortorder_options(StringInfo buf, Node *sortexpr,
-					   Oid sortOperator, Oid collation, bool nullsFirst)
+					   Oid sortOperator, Oid collation, bool nullsFirst,
+					   ExplainState *es)
 {
 	Oid			sortcoltype = exprType(sortexpr);
 	bool		reverse = false;
@@ -3201,10 +3258,17 @@ show_sortorder_options(StringInfo buf, Node *sortexpr,
 	 */
 	if (OidIsValid(collation) && collation != get_typcollation(sortcoltype))
 	{
-		char	   *collname = get_collation_name(collation);
+		const char *collname;
 
-		if (collname == NULL)
-			elog(ERROR, "cache lookup failed for collation %u", collation);
+		if (es->redact)
+			collname = explain_redact_name(explain_redact_context(es),
+										   REDACT_COLLATION, collation);
+		else
+		{
+			collname = get_collation_name(collation);
+			if (collname == NULL)
+				elog(ERROR, "cache lookup failed for collation %u", collation);
+		}
 		appendStringInfo(buf, " COLLATE %s", quote_identifier(collname));
 	}
 
@@ -3216,12 +3280,24 @@ show_sortorder_options(StringInfo buf, Node *sortexpr,
 	}
 	else if (sortOperator != typentry->lt_opr)
 	{
-		char	   *opname = get_opname(sortOperator);
+		const char *opname;
 
-		if (opname == NULL)
-			elog(ERROR, "cache lookup failed for operator %u", sortOperator);
+		if (es->redact)
+			opname = explain_redact_name(explain_redact_context(es),
+										 REDACT_OPERATOR, sortOperator);
+		else
+		{
+			opname = get_opname(sortOperator);
+			if (opname == NULL)
+				elog(ERROR, "cache lookup failed for operator %u", sortOperator);
+		}
 		appendStringInfo(buf, " USING %s", opname);
-		/* Determine whether operator would be considered ASC or DESC */
+
+		/*
+		 * Determine whether operator would be considered ASC or DESC.  This
+		 * is structure, not a name, and it decides the NULLS clause below, so
+		 * it runs in both modes.
+		 */
 		(void) get_equality_op_for_ordering_op(sortOperator, &reverse);
 	}
 

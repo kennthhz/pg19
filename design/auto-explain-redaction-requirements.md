@@ -317,7 +317,7 @@ has a test in §10.
 
 | ID | Requirement |
 |---|---|
-| FR-60 | If a name or value cannot be classified as exempt during redacted output, it must be redacted (fail closed). A catalog lookup failure (e.g. a concurrently dropped object) must result in the **pseudonym being substituted**, not in the whole record being lost to an ERROR *(rev. security review)*. *(rev. code audit: several reachable sites currently `elog(ERROR)` on a failed lookup — the index-name fetch, the sort-key collation and operator lookups, the operator-class lookup, and the column-name and range-table-index sanity checks in the deparser. In redacted mode each of these must substitute a pseudonym instead. Sites that indicate a genuine internal inconsistency rather than a concurrent catalog change may still error; the design must state which is which.)* *(rev. T16: the first of those enumerated sites is discharged, and **structurally** rather than by handling the failure. `explain_get_index_name()`’s `elog(ERROR, "cache lookup failed for index %u")` sits after the redaction check, so a redacted record returns before reaching it — the failure is unreachable, not caught. The arbiter site never had an `elog`; `get_rel_name()` returns NULL there, and the redacted branch does not call it. This is only sound because the substitute cannot fail either, which is the half that is **measured**: `src/test/modules/test_explain_redact` asserts a nonexistent index OID yields `i1` rather than an error or a NULL. It is **not** asserted from the regression file, and cannot be — a regression run is one backend, and the plancache invalidates the plan the moment the index is dropped, so no SQL shape reaches the lookup with a dead OID. Recorded as argued-plus-unit-tested rather than end-to-end verified. The remaining sites — sort-key collation and operator, operator class, and the deparser’s sanity checks — belong to T20 and T21.)* |
+| FR-60 | If a name or value cannot be classified as exempt during redacted output, it must be redacted (fail closed). A catalog lookup failure (e.g. a concurrently dropped object) must result in the **pseudonym being substituted**, not in the whole record being lost to an ERROR *(rev. security review)*. *(rev. code audit: several reachable sites currently `elog(ERROR)` on a failed lookup — the index-name fetch, the sort-key collation and operator lookups, the operator-class lookup, and the column-name and range-table-index sanity checks in the deparser. In redacted mode each of these must substitute a pseudonym instead. Sites that indicate a genuine internal inconsistency rather than a concurrent catalog change may still error; the design must state which is which.)* *(rev. T16: the first of those enumerated sites is discharged, and **structurally** rather than by handling the failure. `explain_get_index_name()`’s `elog(ERROR, "cache lookup failed for index %u")` sits after the redaction check, so a redacted record returns before reaching it — the failure is unreachable, not caught. The arbiter site never had an `elog`; `get_rel_name()` returns NULL there, and the redacted branch does not call it. This is only sound because the substitute cannot fail either, which is the half that is **measured**: `src/test/modules/test_explain_redact` asserts a nonexistent index OID yields `i1` rather than an error or a NULL. It is **not** asserted from the regression file, and cannot be — a regression run is one backend, and the plancache invalidates the plan the moment the index is dropped, so no SQL shape reaches the lookup with a dead OID. Recorded as argued-plus-unit-tested rather than end-to-end verified. The remaining sites — sort-key collation and operator, operator class, and the deparser’s sanity checks — belong to T20 and T21.)* *(rev. T20: two more discharged, and by the **same structural move** T16 used rather than by handling the failure — which is now three sites settled the same way, so read them as one pattern. `show_sortorder_options()`’s `elog(ERROR, "cache lookup failed for collation %u")` and `elog(ERROR, "cache lookup failed for operator %u")` both now sit on the **`else`** branch of an `if (es->redact)`, so a redacted record assigns from `explain_redact_name()` and falls through to the `appendStringInfo` without going near either lookup: unreachable under redaction, not caught. Sound for the same reason T16 was — the substitute cannot fail either, `explain_redact_name()` neither errors nor returns NULL, and a failed lookup is precisely the case it answers with a pseudonym — and that half is already measured by `src/test/modules/test_explain_redact` for the index OID. **Weaker than T16 in one respect that should be recorded, not glossed:** T16’s guard executes, T20’s does not yet, because `show_sort_group_keys()` returns early under redaction until T21. So these two sites are FR-60-clean **by construction and unexecuted**, which is a third status alongside T16’s argued-plus-unit-tested and FR-98c’s clean-only-because-unreachable. The difference from FR-98c matters: the operator-class path is clean by accident and breaks when someone makes it reachable, whereas these two are written to be clean and start executing when T21 lifts the return. The remaining sites — operator class (FR-98c, still carried, still nobody’s) and the deparser’s column-name and range-table-index sanity checks — belong to T21.)* |
 | FR-61 | Redaction must not alter output structure: records remain parseable as `text`/`json`/`xml`/`yaml` respectively, and JSON output remains a valid single JSON object (the auto_explain JSON fix-up must continue to work). Substituting a pseudonym or `?` must not break a construct the pseudonym is embedded in (FR-99). |
 | FR-62 | With `auto_explain.log_redact = off`, no code path may behave differently from today (no perf or output change). |
 | FR-63 | Redaction must be applied **to the value at its source**, never to the serialized property *(rev. code audit)*. A filter placed on the property-emitting functions would be format-dependent and therefore incomplete: in `text` format a large number of identifiers — trigger, constraint and relation names in the trigger section, index names, the scan-target relation/schema/alias clause, the sampling method, and the sub-plan label — are appended directly to the output buffer and never pass through those functions. An implementation that redacts centrally at serialization will produce clean `json`/`xml`/`yaml` and leaky `text`, and the default format is `text`. |
@@ -622,7 +622,7 @@ identical `winref` to the identical
 they are one map entry and agree by construction — that is why `winref` was
 chosen over a hash. But `Output` is a deparsed expression and is still
 suppressed, and would print the real name even if it were not, because
-`ExplainPrintPlan()` (explain.c:917) builds its deparse context with
+`ExplainPrintPlan()` (explain.c:918 *(rev. T20: was `:917`)*) builds its deparse context with
 `deparse_context_for_plan_tree()` rather than the `_redacted()` variant, leaving
 `context->redact` NULL on every EXPLAIN path. `OVER wN` is covered where it can
 be: the test module deparses directly and prints `rank() OVER w1`.*
@@ -787,7 +787,12 @@ RETURNING column with one, while plain `EXPLAIN (VERBOSE)` shows
 Carried into T21 on the same footing as T13's `get_tablefunc()` guard.)*
 
 **FR-98(a) — sort-key `COLLATE` / `USING`, assembled after deparse.** [V]
-Site: explain.c:2866 (`get_collation_name`), 2881 (`get_opname`). These are
+Site: explain.c:3267 (`get_collation_name`), 3289 (`get_opname`), with the
+redaction branch of each at 3262 and 3284 respectively and the decorations
+printed at 3271 and 3293 *(rev. T20: the previous citation, `:2866` / `:2881`,
+was stale before T20 touched anything -- the sites had already drifted to ~3266
+/ ~3296 under earlier tasks. Numbers are given per construct rather than as a
+pair so the next drift is easier to re-anchor)*. These are
 appended to the sort-key string in explain.c, *after* `deparse_expression()`
 returns — a ruleutils-only fix does not reach them.
 
@@ -797,6 +802,46 @@ SELECT zcol_ssn FROM zcustomers ORDER BY zcol_ssn COLLATE zcoll_secret;
 Assert: `Sort Key` contains no `zcoll_secret`. For the `USING` half a
 user-defined ordering operator is needed; built-in `>` is exempt and must
 still print (see §10.4).
+
+*(rev. T20: **landed, and deliberately dormant.** `show_sortorder_options()` now
+takes the `ExplainState` and pseudonymizes both names itself. The guard changes no
+byte of output as shipped, and that is a property of the surface, not an
+oversight: its only caller, `show_sort_group_keys()`, still returns early under
+redaction, because a decoration is **appended to the deparsed key string** and
+there is no printing " COLLATE coll1" without the expression it decorates. That
+expression is T21's surface. The blanket return stays; it is not to be lifted to
+demonstrate this requirement, since what would come out with it is real column
+names. It has to land ahead of T21 all the same -- the moment T21 lifts the
+return, an unguarded version here prints a real collation name.
+
+*Verification reach before T21: none, stated plainly. Not through EXPLAIN, because
+the caller is never entered under redaction. Not through
+`src/test/modules/test_explain_redact` either, because the function is `static` in
+explain.c and so out of the module's reach, unlike the ruleutils guards it tests
+directly. FR-98(a) is therefore verified by T21's tests plus existing off-mode
+coverage, and by nothing of its own -- the SQL above is T21's assertion, not
+T20's. T21's checklist now carries this guard as a second thing whose correctness
+only becomes observable there.*
+
+*What the T20 commit **is** covered for is the **non-redacted** path, which the
+restructure touched: both lookups moved into `else` branches. Measured rather than
+asserted -- 46 sort-key decorations exist across five `expected/*.out` files, of
+which 11 execute in a non-ICU build (7 `COLLATE`, 3 `USING`, 1 `POSIX`,
+`collate.out` / `equivclass.out` / `incremental_sort.out`), including a key
+carrying `COLLATE` together with `DESC` and `NULLS FIRST`. All 241 regression
+tests pass and no sort-key expected file changed. The other 35 are real but not
+reachable here: 31 are in `collate.icu.utf8.out`, which self-skips when
+`with_icu = no`, and 4 are in `contrib/postgres_fdw`, which holds the only
+user-defined ordering operator (`USING <^`) in the tree's expected output.*
+
+*Exemption is not separately asserted because `explain_redact_name()` decides it
+and answers with the real name where it applies, which is what keeps the useful
+cases diagnosable: `COLLATE "C"` stays readable under T11's collation exemption
+and `USING <` under T10's operator exemption, and between them those are most of
+what a sort key discloses harmlessly. Note that off-mode coverage is indifferent
+to exemption -- the `else` branch calls `get_collation_name()` / `get_opname()`
+regardless -- so the built-in names above cover the restructure just as well as
+user names would.)*
 
 **FR-98(b) — collation via an explicit `COLLATE` expression.** [V]
 Site: ruleutils.c:9841. Distinct from `get_const_collation()`, which is the
