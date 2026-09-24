@@ -24,6 +24,7 @@
 #include "commands/explain_redact.h"
 #include "commands/explain_state.h"
 #include "commands/prepare.h"
+#include "common/hashfn.h"
 #include "foreign/fdwapi.h"
 #include "jit/jit.h"
 #include "libpq/pqformat.h"
@@ -150,6 +151,8 @@ static const char *explain_get_index_name(Oid indexId, ExplainState *es);
 static RedactCtx *explain_redact_context(ExplainState *es);
 static const char *explain_redact_refname(ExplainState *es,
 										  RangeTblEntry *rte, Index rti);
+static const char *explain_redact_by_name(ExplainState *es, RedactKind kind,
+										  const char *name);
 static bool peek_buffer_usage(ExplainState *es, const BufferUsage *usage);
 static void show_buffer_usage(ExplainState *es, const BufferUsage *usage);
 static void show_wal_usage(ExplainState *es, const WalUsage *usage);
@@ -821,6 +824,47 @@ explain_redact_refname(ExplainState *es, RangeTblEntry *rte, Index rti)
 		return explain_redact_name(ctx, REDACT_RELATION, rte->relid);
 
 	return explain_redact_local(ctx, REDACT_ALIAS, rti, 0);
+}
+
+/*
+ * Pseudonym for a name that has no catalog object and no numeric identity --
+ * only the string the user wrote.  A CTE name is the case that matters
+ * (REDACT_CTE); REDACT_ENR would be the other, if EXPLAIN could reach it.
+ *
+ * Keyed on a hash of the name because explain_redact_local() keys on two
+ * integers.  The hash is only ever a hash-table key: it is never printed and
+ * nothing is derived from it.  Same shape as the cursor name T14 pseudonymizes
+ * in ruleutils.c, for the same reason.
+ *
+ * THE KEY IS THE STRING, NOT THE RANGE-TABLE INDEX, AND THAT IS WHAT MAKES
+ * FR-90 POSSIBLE.  The same CTE is printed by three different places: the
+ * CTE Scan target, the WorkTable Scan target of a recursive CTE, and -- once
+ * T19 lands -- the "Subplan Name: CTE ..." label above them.  The first two
+ * have a range-table entry, the third has only SubPlan->plan_name, which
+ * choose_plan_name() seeds verbatim from the CTE name and which knows nothing
+ * about the range table.  Keying on the RTE index would therefore leave T19
+ * unable to arrive at the same pseudonym, and a record reading "CTE Name: cte1"
+ * under "Subplan Name: CTE cte2" is exactly what FR-90 exists to prevent.  The
+ * self-reference RTE of a recursive CTE carries the same ctename string as the
+ * outer one, so the two targets agree for free.
+ *
+ * Two consequences of hashing a string, both costing readability and neither
+ * disclosing anything.  Two different names that happen to hash alike share a
+ * pseudonym.  And two CTEs in one statement that genuinely share a name share
+ * a pseudonym here, while choose_plan_name() will have uniquified the second
+ * one's plan name to "name_1" -- so T19's label for it hashes differently and
+ * gets a pseudonym of its own.
+ */
+static const char *
+explain_redact_by_name(ExplainState *es, RedactKind kind, const char *name)
+{
+	int			key;
+
+	Assert(name != NULL);
+
+	key = (int) hash_bytes((const unsigned char *) name, strlen(name));
+
+	return explain_redact_local(explain_redact_context(es), kind, key, 0);
 }
 
 /*
@@ -1699,6 +1743,24 @@ ExplainNode(PlanState *planstate, List *ancestors,
 			 * customer.  Leaving custom_name NULL drops it from the node
 			 * label and also skips the Custom Plan Provider property further
 			 * down, which leaves the node reading as a plain "Custom Scan".
+			 *
+			 * Revisited at T17 and deliberately left blank rather than given
+			 * a pseudonym.  FR-28's disposition for this name is
+			 * "blanked/omitted" and FR-28 is the requirement of record; the
+			 * task plan's T17 section lists it among that task's names, which
+			 * reads as promising an "fN" here, and the task plan is what
+			 * needs correcting.
+			 *
+			 * The substance rather than the paperwork: this string is not a
+			 * name the user chose, so a pseudonym would not be hiding an
+			 * identifier -- it would be standing in for the identity of a
+			 * loaded extension, which FR-25 keeps out of a redacted record
+			 * altogether.  Every other channel through which this extension
+			 * could speak is already silent (its ExplainCustomScan callback
+			 * and the per-node hook), so printing a name for it would leave
+			 * the one trace of an extension in a record that otherwise has
+			 * none.  There is also nothing a reader could do with "f1" here
+			 * that "Custom Scan" does not already tell them.
 			 */
 			if (!es->redact)
 				custom_name = ((CustomScan *) plan)->methods->CustomName;
@@ -3295,46 +3357,60 @@ show_tablesample(TableSampleClause *tsc, PlanState *planstate,
 {
 	List	   *context;
 	bool		useprefix;
-	char	   *method_name;
+	const char *method_name;
 	List	   *params = NIL;
-	char	   *repeatable;
+	char	   *repeatable = NULL;
 	ListCell   *lc;
 
 	/*
-	 * Everything this function prints comes from the user: the sampling
-	 * method is a function name, and the arguments and the REPEATABLE seed
-	 * are expressions.
+	 * This function prints three things the user chose, and redaction treats
+	 * them differently, so the split is worth stating.
 	 *
-	 * The seed deserves a second look, because it seems like a harmless
-	 * number.  It is what makes a sample repeatable, so printing it beside
-	 * the row count tells a reader which rows were examined.
+	 * The method is a function name and is pseudonymized here, the same way
+	 * T10 treats a function name inside an expression: "system" and
+	 * "bernoulli" live in pg_catalog and keep their real names by exemption,
+	 * while a method installed by an extension becomes "fN".
+	 *
+	 * The arguments and the REPEATABLE seed are a deparsed expression list
+	 * and a deparsed constant, which makes them T21's surface rather than
+	 * this task's, and they stay suppressed until then.  Do not "finish the
+	 * job" by re-enabling them alongside the method name: there is nothing to
+	 * print in their place today but the user's real literal values.
+	 *
+	 * The seed deserves a second look on its own account, because it looks
+	 * like a harmless number.  It is what makes a sample repeatable, so
+	 * printing it beside the row count tells a reader which rows were
+	 * examined.
 	 */
-	if (es->redact)
-		return;
-
-	/* Set up deparsing context */
-	context = set_deparse_context_plan(es->deparse_cxt,
-									   planstate->plan,
-									   ancestors);
-	useprefix = es->rtable_size > 1;
 
 	/* Get the tablesample method name */
-	method_name = get_func_name(tsc->tsmhandler);
-
-	/* Deparse parameter expressions */
-	foreach(lc, tsc->args)
-	{
-		Node	   *arg = (Node *) lfirst(lc);
-
-		params = lappend(params,
-						 deparse_expression(arg, context,
-											useprefix, false));
-	}
-	if (tsc->repeatable)
-		repeatable = deparse_expression((Node *) tsc->repeatable, context,
-										useprefix, false);
+	if (es->redact)
+		method_name = explain_redact_name(explain_redact_context(es),
+										  REDACT_FUNCTION, tsc->tsmhandler);
 	else
-		repeatable = NULL;
+		method_name = get_func_name(tsc->tsmhandler);
+
+	if (!es->redact)
+	{
+		/* Set up deparsing context */
+		context = set_deparse_context_plan(es->deparse_cxt,
+										   planstate->plan,
+										   ancestors);
+		useprefix = es->rtable_size > 1;
+
+		/* Deparse parameter expressions */
+		foreach(lc, tsc->args)
+		{
+			Node	   *arg = (Node *) lfirst(lc);
+
+			params = lappend(params,
+							 deparse_expression(arg, context,
+												useprefix, false));
+		}
+		if (tsc->repeatable)
+			repeatable = deparse_expression((Node *) tsc->repeatable, context,
+											useprefix, false);
+	}
 
 	/* Print results */
 	if (es->format == EXPLAIN_FORMAT_TEXT)
@@ -3342,25 +3418,48 @@ show_tablesample(TableSampleClause *tsc, PlanState *planstate,
 		bool		first = true;
 
 		ExplainIndentText(es);
-		appendStringInfo(es->str, "Sampling: %s (", method_name);
-		foreach(lc, params)
+		appendStringInfo(es->str, "Sampling: %s", method_name);
+
+		/*
+		 * The parentheses go with the arguments they hold, so a redacted line
+		 * reads "Sampling: f1" rather than "Sampling: f1 ()".  An empty
+		 * argument list would read as a method that takes no arguments, which
+		 * no sampling method does, and would be a worse description of the
+		 * plan than saying nothing.
+		 */
+		if (!es->redact)
 		{
-			if (!first)
-				appendStringInfoString(es->str, ", ");
-			appendStringInfoString(es->str, (const char *) lfirst(lc));
-			first = false;
+			appendStringInfoString(es->str, " (");
+			foreach(lc, params)
+			{
+				if (!first)
+					appendStringInfoString(es->str, ", ");
+				appendStringInfoString(es->str, (const char *) lfirst(lc));
+				first = false;
+			}
+			appendStringInfoChar(es->str, ')');
+			if (repeatable)
+				appendStringInfo(es->str, " REPEATABLE (%s)", repeatable);
 		}
-		appendStringInfoChar(es->str, ')');
-		if (repeatable)
-			appendStringInfo(es->str, " REPEATABLE (%s)", repeatable);
 		appendStringInfoChar(es->str, '\n');
 	}
 	else
 	{
 		ExplainPropertyText("Sampling Method", method_name, es);
-		ExplainPropertyList("Sampling Parameters", params, es);
-		if (repeatable)
-			ExplainPropertyText("Repeatable Seed", repeatable, es);
+
+		/*
+		 * Both properties omitted rather than emitted empty, which is how
+		 * every other suppressed expression property in this file behaves.
+		 * params is already NIL and repeatable already NULL under redaction,
+		 * so this guard is saying who owns the decision (T21) rather than
+		 * doing work.
+		 */
+		if (!es->redact)
+		{
+			ExplainPropertyList("Sampling Parameters", params, es);
+			if (repeatable)
+				ExplainPropertyText("Repeatable Seed", repeatable, es);
+		}
 	}
 }
 
@@ -4946,10 +5045,10 @@ ExplainTargetRel(Plan *plan, Index rti, ExplainState *es)
 	 * set-returning function.  Under redaction each one is either replaced by
 	 * a pseudonym or left out, decided per kind in the switch below.
 	 *
-	 * Two of those decisions belong to later tasks, so read the switch before
-	 * changing anything here: the function, CTE and tuplestore names stay
-	 * absent until T17 gives them pseudonyms, and the schema name stays
-	 * absent for good (FR-11).
+	 * Read the switch before changing anything here.  The function, relation
+	 * and CTE names are pseudonyms; the schema name stays absent for good
+	 * (FR-11, and see the relation case); and the tuplestore name stays
+	 * absent because nothing calls that branch at all.
 	 */
 	rte = rt_fetch(rti, es->rtable);
 	refname = (const char *) list_nth(es->rtable_names, rti - 1);
@@ -5006,13 +5105,18 @@ ExplainTargetRel(Plan *plan, Index rti, ExplainState *es)
 				 * Otherwise, punt.  (Even if it was a single function call
 				 * originally, the optimizer could have simplified it away.)
 				 *
-				 * Redaction punts as well, leaving no Function Name at all,
-				 * because the function name is T17's surface (it becomes
-				 * "fN", alongside the CTE and tuplestore names below).  Do
-				 * not "finish the job" by printing it here: without T17 there
-				 * is nothing to print but the user's real function name.
+				 * Under redaction the name becomes "fN", on exactly the terms
+				 * T10 set for a function name inside an expression: a
+				 * built-in or otherwise exempt function keeps its real name,
+				 * and its schema with it when VERBOSE, while a user-defined
+				 * one gets the pseudonym and no schema at all (FR-11 -- a
+				 * pseudonym qualified by a real schema hands back part of
+				 * what the pseudonym hides).  Same two-branch shape as the
+				 * relation case above, and for the same reason: the exempt
+				 * path prints a second thing, so this is a choice between
+				 * code paths rather than between strings.
 				 */
-				if (!es->redact && list_length(fscan->functions) == 1)
+				if (list_length(fscan->functions) == 1)
 				{
 					RangeTblFunction *rtfunc = (RangeTblFunction *) linitial(fscan->functions);
 
@@ -5021,9 +5125,17 @@ ExplainTargetRel(Plan *plan, Index rti, ExplainState *es)
 						FuncExpr   *funcexpr = (FuncExpr *) rtfunc->funcexpr;
 						Oid			funcid = funcexpr->funcid;
 
-						objectname = get_func_name(funcid);
-						if (es->verbose)
-							namespace = get_namespace_name_or_temp(get_func_namespace(funcid));
+						if (!es->redact ||
+							explain_redact_exempt(explain_redact_context(es),
+												  REDACT_FUNCTION, funcid))
+						{
+							objectname = get_func_name(funcid);
+							if (es->verbose)
+								namespace = get_namespace_name_or_temp(get_func_namespace(funcid));
+						}
+						else
+							objectname = explain_redact_name(explain_redact_context(es),
+															 REDACT_FUNCTION, funcid);
 					}
 				}
 				objecttag = "Function Name";
@@ -5062,14 +5174,36 @@ ExplainTargetRel(Plan *plan, Index rti, ExplainState *es)
 			/* Assert it's on a non-self-reference CTE */
 			Assert(rte->rtekind == RTE_CTE);
 			Assert(!rte->self_reference);
-			/* CTE name: T17's surface, left absent until then */
-			if (!es->redact)
-				objectname = rte->ctename;
+
+			/*
+			 * A CTE name has no catalog object, so it can never be exempt and
+			 * there is only one path here.  Keyed on the name string rather
+			 * than on rti, which is what lets T19 print the same pseudonym in
+			 * the "Subplan Name: CTE ..." label above this line (FR-90) --
+			 * see explain_redact_by_name().
+			 */
+			objectname = es->redact ?
+				explain_redact_by_name(es, REDACT_CTE, rte->ctename) :
+				rte->ctename;
 			objecttag = "CTE Name";
 			break;
 		case T_NamedTuplestoreScan:
 			Assert(rte->rtekind == RTE_NAMEDTUPLESTORE);
-			/* Tuplestore name: likewise T17's */
+
+			/*
+			 * Examined at T17 and deliberately left suppressed: this branch
+			 * has no caller.  ExplainNode() omits T_NamedTuplestoreScan from
+			 * the node list that calls ExplainScanTarget(), so no Tuplestore
+			 * Name is printed in any format, redacted or not -- the only way
+			 * to get an ephemeral named tuplestore into a plan is a trigger
+			 * with a REFERENCING NEW TABLE transition table, and that was
+			 * measured at T15 (FR-15 as revised).
+			 *
+			 * So REDACT_ENR stays unused rather than being spent on a dead
+			 * path, and the guard stays as the thing that would hold the line
+			 * if upstream ever adds the missing case.  A negative control in
+			 * the regression file reports it if that happens.
+			 */
 			if (!es->redact)
 				objectname = rte->enrname;
 			objecttag = "Tuplestore Name";
@@ -5078,9 +5212,17 @@ ExplainTargetRel(Plan *plan, Index rti, ExplainState *es)
 			/* Assert it's on a self-reference CTE */
 			Assert(rte->rtekind == RTE_CTE);
 			Assert(rte->self_reference);
-			/* Same CTE name a T_CteScan would print, so same treatment */
-			if (!es->redact)
-				objectname = rte->ctename;
+
+			/*
+			 * The self-reference RTE of a recursive CTE carries the same
+			 * ctename string as the outer one, so keying on that string makes
+			 * the WorkTable Scan and the CTE Scan of one recursive CTE print
+			 * the same pseudonym without either of them knowing about the
+			 * other (FR-92).
+			 */
+			objectname = es->redact ?
+				explain_redact_by_name(es, REDACT_CTE, rte->ctename) :
+				rte->ctename;
 			objecttag = "CTE Name";
 			break;
 		default:

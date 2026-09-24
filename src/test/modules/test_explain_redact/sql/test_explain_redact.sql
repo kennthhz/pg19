@@ -781,6 +781,147 @@ SELECT test_redact_deparse(
          'SELECT c_second, EXTRACT(''zsecdata-secret'' FROM c_when) FROM zsec_c',
          true) NOT LIKE '%zsecdata-secret%' AS extract_field_absent_redacted;
 
+--
+-- T17: the two surfaces that need an extension loaded.
+--
+-- Everything else in this file tests the engine directly, because at T02 nothing
+-- consumed it.  These two are different: they are EXPLAIN output, they belong
+-- with the rest of T17's fixtures in src/test/regress/sql/explain_redact.sql, and
+-- they are here only because that file cannot reach them.  A core regression test
+-- runs against a plain install; giving src/test/regress an EXTRA_INSTALL pointed
+-- at contrib would invert the dependency between core and contrib, in two build
+-- systems.  This Makefile already has an EXTRA_INSTALL and the precedent for it
+-- (contrib/auto_explain does the same for pg_overexplain), so the two fixtures
+-- come here rather than being faked there or dropped.
+--
+--   a user-installed TABLESAMPLE method  -> "Sampling: f1"   (tsm_system_rows)
+--   a custom-scan provider name          -> nothing at all   (test_extensible)
+--
+-- Both are the halves that show a DIFFERENCE from the exempt/blank case measured
+-- in the regress file.  Without them, "the method name is pseudonymized" and "the
+-- provider name is blanked" rest on reading the code.
+--
+CREATE EXTENSION tsm_system_rows WITH SCHEMA public;
+CREATE EXTENSION test_extensible WITH SCHEMA public;
+-- CREATE EXTENSION records the extension but does not load the library; the
+-- CustomScan provider is registered by _PG_init, which runs on the first call
+-- into it.  Without this the set_rel_pathlist hook is not installed and the
+-- fixture below gets a Seq Scan -- passing, and testing nothing.
+SELECT test_get_custom_scan_methods('TestCustomScan', false) AS provider_registered;
+-- Same helper the regress file uses, rebuilt here: EXPLAIN as one string, so a
+-- property can be looked for in every format rather than only in text.
+CREATE FUNCTION zsec_t02_blob(query_text text, explain_opts text)
+RETURNS text
+LANGUAGE plpgsql AS
+$$
+DECLARE
+    ln  text;
+    buf text := '';
+BEGIN
+    FOR ln IN EXECUTE format('EXPLAIN (%s) %s', explain_opts, query_text) LOOP
+        buf := buf || ln || E'\n';
+    END LOOP;
+    RETURN buf;
+END
+$$;
+CREATE TABLE zsec_t02.zsec_ts (zsec_k int, zsec_v text);
+--
+-- FR-18's TABLESAMPLE clause, the half src/test/regress cannot show: a
+-- user-installed sampling method becomes fN.  (FR-18, not FR-27 -- FR-27 is the
+-- xmltable/json_table keyword rule, and a sampling method is a function name like
+-- any other, reached by a direct lookup rather than by the deparser.)
+--
+-- system_rows lives in public, not pg_catalog, so it is not exempt, which is the
+-- whole difference from the built-in "bernoulli"/"system" that the regress file
+-- measures keeping their real names.
+--
+-- The text line VERBATIM is the assertion, not a LIKE.  "Sampling: f1" with
+-- nothing after it: the arguments are T21's surface and stay suppressed, and the
+-- parentheses go with the arguments they held -- a line reading "Sampling: f1 ()"
+-- would describe a sampling method that takes no arguments, and none does.
+--
+-- No REPEATABLE clause here, and not by choice: system_rows sets
+-- repeatable_across_queries = false, so the parser rejects REPEATABLE on it
+-- outright ("tablesample method system_rows does not support REPEATABLE").  The
+-- seed half of the suppression is therefore measured on the built-in BERNOULLI
+-- fixture in src/test/regress/sql/explain_redact.sql, where a REPEATABLE clause
+-- is legal; what is measured here is the argument list, using a row count no
+-- other part of a plan could produce by accident.
+--
+SELECT zsec_t02_blob('SELECT zsec_k FROM zsec_ts TABLESAMPLE system_rows (987654321)',
+                     'COSTS OFF, REDACT') AS redacted_text;
+SELECT zsec_t02_blob('SELECT zsec_k FROM zsec_ts TABLESAMPLE system_rows (987654321)',
+                     'COSTS OFF') AS plain_text;
+SELECT fmt.name AS format,
+       CASE
+         WHEN s.b LIKE '%system_rows%'         THEN 'FAIL: real method name present'
+         WHEN s.b LIKE '%Sampling Parameters%' THEN 'FAIL: Sampling Parameters emitted'
+         WHEN s.b LIKE '%Repeatable Seed%'     THEN 'FAIL: Repeatable Seed emitted'
+         WHEN s.b LIKE '%987654321%'           THEN 'FAIL: the argument value itself is present'
+         WHEN s.b !~ '\mf1\M'                  THEN 'FAIL: no method pseudonym -- assertion is vacuous'
+         ELSE 'ok: method is f1, arguments absent'
+       END AS verdict
+  FROM (VALUES ('json'), ('text'), ('xml'), ('yaml')) AS fmt(name),
+       LATERAL (SELECT zsec_t02_blob('SELECT zsec_k FROM zsec_ts TABLESAMPLE system_rows (987654321)',
+                                     'COSTS OFF, REDACT, FORMAT ' || fmt.name)) AS s(b)
+ ORDER BY fmt.name COLLATE "C";
+-- And the negative control for the pseudonym itself: the real method name and the
+-- real argument are both in the unredacted record, so each absence clause above
+-- is asserting the absence of something that was there to leak.
+SELECT zsec_t02_blob('SELECT zsec_k FROM zsec_ts TABLESAMPLE system_rows (987654321)',
+                     'COSTS OFF, FORMAT json') LIKE '%system_rows%' AS method_leaks_unredacted,
+       zsec_t02_blob('SELECT zsec_k FROM zsec_ts TABLESAMPLE system_rows (987654321)',
+                     'COSTS OFF, FORMAT json') LIKE '%987654321%'   AS argument_leaks_unredacted;
+--
+-- FR-28: the custom-scan provider name is BLANKED, not pseudonymized.
+--
+-- This is the decision T17 confirmed rather than made, and it is the one place
+-- in the feature where a name is dropped instead of replaced.  The reasoning, so
+-- that a later reader does not "fix" it into an fN: the string is
+-- CustomScan->methods->CustomName, chosen by the extension author and not by the
+-- user, so a pseudonym would not be concealing a user identifier -- it would be
+-- standing in for the identity of a loaded extension, which FR-25 keeps out of a
+-- redacted record altogether.  Every other channel that extension has
+-- (ExplainCustomScan, the per-node hook) is already silent, so an "f1" here would
+-- be the one trace of an extension in a record that otherwise has none.
+--
+-- test_extensible injects a CustomPath for any relation NAMED test_extensible_tbl
+-- regardless of schema, which is why the table below can live in the fixture
+-- schema.  It skips relations with a TABLESAMPLE clause, so it cannot collide
+-- with the fixture above.
+--
+CREATE TABLE zsec_t02.test_extensible_tbl (id int, val text);
+SELECT zsec_t02_blob('SELECT id, val FROM test_extensible_tbl', 'COSTS OFF') AS plain_text;
+SELECT zsec_t02_blob('SELECT id, val FROM test_extensible_tbl', 'COSTS OFF, REDACT') AS redacted_text;
+-- Four clauses.  The first is the requirement; the second is the structured-format
+-- half of it, because the provider name has its own "Custom Plan Provider"
+-- property that the text format folds into the node label -- suppressing one and
+-- not the other is an easy mistake and invisible in text output.  The last two are
+-- the anti-vacuity guards: FR-28 is satisfied by printing nothing at all, and a
+-- plan with no Custom Scan in it satisfies everything above for free.
+SELECT fmt.name AS format,
+       CASE
+         WHEN s.b LIKE '%TestCustomScan%'        THEN 'FAIL: provider name present'
+         WHEN s.b LIKE '%Custom Plan Provider%'  THEN 'FAIL: Custom Plan Provider property emitted'
+         WHEN s.b NOT LIKE '%Custom Scan%'       THEN 'FAIL: no Custom Scan node -- assertion is vacuous'
+         WHEN s.b !~ '\mt1\M'                    THEN 'FAIL: relation not named -- redaction became deletion'
+         ELSE 'ok: Custom Scan named, provider blank, relation is t1'
+       END AS verdict
+  FROM (VALUES ('json'), ('text'), ('xml'), ('yaml')) AS fmt(name),
+       LATERAL (SELECT zsec_t02_blob('SELECT id, val FROM test_extensible_tbl',
+                                     'COSTS OFF, REDACT, FORMAT ' || fmt.name)) AS s(b)
+ ORDER BY fmt.name COLLATE "C";
+-- The negative control: both the name and the property are in the unredacted
+-- record, so the two absence clauses above each have something to be absent.
+SELECT zsec_t02_blob('SELECT id, val FROM test_extensible_tbl',
+                     'COSTS OFF, FORMAT json') LIKE '%TestCustomScan%'       AS provider_leaks_unredacted,
+       zsec_t02_blob('SELECT id, val FROM test_extensible_tbl',
+                     'COSTS OFF, FORMAT json') LIKE '%Custom Plan Provider%' AS property_present_unredacted;
+DROP TABLE zsec_t02.test_extensible_tbl;
+DROP TABLE zsec_t02.zsec_ts;
+DROP FUNCTION zsec_t02_blob(text, text);
 RESET search_path;
 DROP SCHEMA zsec_t02 CASCADE;
 DROP EXTENSION test_explain_redact;
+DROP EXTENSION test_extensible;
+DROP EXTENSION tsm_system_rows;

@@ -893,6 +893,14 @@ happen rather than absorbed silently:
   of the two: T04 skipped the gather loop, so `Conflict Arbiter Indexes` was
   absent from the record entirely and its `clean` verdict meant only that an
   absent property carries no marker. Enumerated at the same vacuity note.)*
+  *(rev. T17: **15 of 34**, and the denominator moved for the first time. FR-14's
+  row was promoted — its CTE name now prints as `cteN` on the scan target. FR-18's
+  existing row could **not** be: that fixture reaches the function name through a
+  `Filter`, which is an expression property and therefore T21's surface, so a
+  **new** row was added on the Function-Scan surface instead of the old one being
+  relabelled. Adding rather than promoting is the honest move and is why the
+  sweep is 29 rows now rather than 28. Not promoted and never will be: FR-15,
+  which has no emission site at all.)*
 
 #### T14 — Layer B: remaining leaf sites
 
@@ -1072,7 +1080,11 @@ because doing it here would land an untestable change.
   `T_NamedTuplestoreScan` case in `ExplainTargetRel()` has no caller and a named
   tuplestore scan prints no name in any format, redacted or not. **T17's ENR
   deliverable is a guard, not a substitution**; its section still lists an ENR
-  test and that test can only be a negative control.
+  test and that test can only be a negative control. *(rev. T17: acted on. T17
+  re-verified the finding, left the guard, kept `REDACT_ENR` unassigned, and its
+  section now says so rather than listing an ENR substitution. The negative
+  control was widened to pin the `Tuplestore Name` property tag in all four
+  formats and both modes.)*
 
 **Tests.** The negative test first, because Stage 4 inverts the failure
 direction: from here a mistake makes output *less* redacted, and the leak sweep
@@ -1241,33 +1253,143 @@ concurrently dropped operator class, at base as well as after T14, and is
 FR-60-clean only because it is unreachable. T16 closing the index-name `elog`
 does not generalise to it.
 
-#### T17 — CTE, ENR, function-scan, sampling and custom-scan names
+#### T17 — CTE, function-scan, sampling and custom-scan names
 
-`rte->ctename` → `cteN` (`:4688`, `:4700`); ~~`rte->enrname` → `enrN`
-(`:4693`)~~; function-scan `Function Name` → `fN` (`:4653`);
-`show_tablesample` method → `fN` (`:3052`); custom-scan provider name.
+*(rev. T17: rewritten to match what was built. Two corrections the old text
+needed. It listed the **custom-scan provider name** among the names this task
+assigns, which reads as promising an `fN`; FR-28's disposition is
+blanked/omitted, FR-28 is the requirement of record, and the name stays blank —
+the deliverable is the confirmation, not a pseudonym. And its line references
+(`:4688`, `:4700`, `:4693`, `:4653`, `:3052`) were pre-T15 and stale, T15 and
+T16 having rewritten the surrounding code; line numbers below are as landed.)*
 
-*(rev. T15: **the ENR half is a guard, not a substitution.** `ExplainNode()`
-omits `T_NamedTuplestoreScan` from the node list that calls
-`ExplainScanTarget()`, so `ExplainTargetRel()`'s `T_NamedTuplestoreScan` case has
-no caller and no `Tuplestore Name` is ever printed — measured in every format,
-with and without `REDACT`, from inside a trigger with a `REFERENCING NEW TABLE`
-transition table, which is the only way to get an ENR into a plan. T15 left the
-case suppressed and pinned a negative control for it; T17 should keep it
-suppressed and not spend a pseudonym namespace on a path with no caller. See
-FR-15's revised entry in the requirements.)*
+**Delivered.** One new helper and five guarded sites, all in
+`src/backend/commands/explain.c` — 202 insertions, 60 deletions, a large share
+of it comment text recording which of the five names is printed and which is
+not.
 
-**Tests.** CTE, recursive CTE (`WorkTable Scan`), function-in-`FROM`, a
-user-installed `TABLESAMPLE` method, and an extension custom scan. The ENR case
-is a negative control only, already written at T15 — it asserts the name is
-absent **and** reports if a future version starts printing it, which is the only
-thing that would give T17 work here.
+1. **`explain_redact_by_name()`** (decl `:154`, def `:843`) — pseudonym for a
+   name with no catalog object and no numeric identity, keyed on
+   `hash_bytes(name)`. Needs `#include "common/hashfn.h"` (`:27`).
+2. **CTE name** — `T_CteScan` (`:5177`) and `T_WorkTableScan` (`:5215`), both
+   `explain_redact_by_name(REDACT_CTE, rte->ctename)`.
+3. **Function-scan `Function Name`** (`:5123`) — two branches, not two strings:
+   the exempt path also prints the schema under `VERBOSE`, the pseudonym path
+   must not (FR-11). Same shape T15 used for the relation case.
+4. **`show_tablesample()` method** (`:3387`) — `REDACT_FUNCTION` on
+   `tsc->tsmhandler`, so built-in `system`/`bernoulli` keep their real names by
+   exemption. Arguments and `REPEATABLE` seed stay suppressed (`:3393`, `:3428`,
+   `:3451`).
+5. **Named tuplestore** (`:5191`) and **custom-scan provider name** (`:1766`) —
+   comment only. Both guards unchanged; see below.
 
-Note the three by-name assertions T15 left behind — function, CTE and worktable
-names absent from redacted output, each with an anti-vacuity clause — are
-expected to **fail** when this task lands, and must be inverted rather than
-deleted: the real names must still be absent, and the pseudonyms must now be
-present.
+**THE CTE KEY IS THE NAME STRING, NOT THE RANGE-TABLE INDEX.**
+
+This is the one decision here with a consequence past this task, and T19
+inherits it. FR-90 requires the `Subplan Name: CTE …` label to carry the same
+pseudonym as the `CTE Name` beside it, and a `SubPlan` has only `plan_name` —
+a string `choose_plan_name()` (planner.c) seeds verbatim from `cte->ctename` —
+with no range-table index anywhere in reach. A string key is therefore the only
+key all three printers can compute: `ExplainTargetRel()`/`T_CteScan`,
+`ExplainTargetRel()`/`T_WorkTableScan`, and T19's `ExplainSubPlans()`. Keying on
+`CteScan->ctePlanId` was considered and rejected: it is exact and would match
+`SubPlan->plan_id`, but `WorkTableScan` has no plan id (only `wtParam`), so a
+recursive CTE could not agree with itself. Same shape T14 used for the cursor
+name.
+
+Measured, and the closest rehearsal of FR-90 available before T19 exists: the
+`CTE Scan` and the `WorkTable Scan` of one recursive CTE both print `cte1`,
+because the self-reference RTE carries the same `ctename` string. One CTE
+scanned twice keeps one pseudonym; two different CTEs get two.
+
+**Two names T17 owned and did not print.**
+
+- **ENR (FR-15) — unreachable, guard kept.** `ExplainNode()` omits
+  `T_NamedTuplestoreScan` from the node list that calls `ExplainScanTarget()`,
+  so `ExplainTargetRel()`'s `T_NamedTuplestoreScan` case has no caller and no
+  `Tuplestore Name` is printed in any format, in either mode. T15 measured this
+  from inside a trigger with a `REFERENCING NEW TABLE` transition table — the
+  only way to get an ENR into a plan — and T17 re-verified it against the tree.
+  `REDACT_ENR` stays declared and unassigned rather than spending a pseudonym
+  namespace on a dead path, and the `es->redact` check ships as a guard on the
+  same footing as FR-94 and FR-98c. The negative control was strengthened rather
+  than added: the regression file now pins the property **tag**
+  `Tuplestore Name` as absent in all four formats and both modes, which is the
+  string that would appear if the missing case ever arrived.
+- **Custom-scan provider name (FR-28) — blanked, confirmed.** `custom_name`
+  stays NULL, which drops it from the node label and skips the
+  `Custom Plan Provider` property, leaving the node reading `Custom Scan on t1`.
+  The reasoning, so it is not reopened: the string is
+  `CustomScan->methods->CustomName`, chosen by the extension author and not by
+  the user, so a pseudonym would not be concealing a user identifier — it would
+  be standing in for the identity of a loaded extension, which FR-25 keeps out
+  of a redacted record altogether. Every other channel that extension has
+  (`ExplainCustomScan`, the per-node hook) is already silent, so an `fN` here
+  would be the one trace of an extension in a record that otherwise has none.
+
+**Redaction must not become deletion, on this task's surfaces.** The sampling
+method came back but its arguments and its `REPEATABLE` seed did not, and that
+split is deliberate: both are deparsed expressions, both are T21's, and there is
+nothing to print in their place today but the user's literal values. The seed in
+particular looks harmless and is not — it is what makes a sample reproducible,
+so printing it beside a row count tells a reader which rows were examined. Text
+mode drops the parenthesised argument list along with them, so a redacted line
+reads `Sampling: f1` rather than `Sampling: f1 ()`, which would describe a
+sampling method that takes no arguments. None does.
+
+**Tests.** CTE name in four formats; the recursive-CTE agreement above; FR-40 on
+CTEs (one CTE scanned twice → one pseudonym, two CTEs → two); a user-defined SRF
+in `FROM` → `f1`, with `generate_series` beside it as the exemption control and
+the no-schema-on-a-pseudonym assertion in all four formats; built-in `SYSTEM`
+and `BERNOULLI` keeping their real names; and the shape divergence below, pinned
+rather than fixed.
+
+Two fixtures cannot live in `src/test/regress` because they need an extension
+loaded, and a core regression test runs against a plain install — giving it an
+`EXTRA_INSTALL` pointed at contrib would invert the core/contrib dependency, in
+two build systems. They are in `src/test/modules/test_explain_redact`, whose
+Makefile gained
+`EXTRA_INSTALL = contrib/tsm_system_rows src/test/modules/test_extensible`
+(precedent: `contrib/auto_explain/Makefile` does this for `pg_overexplain`; the
+meson build needs no counterpart, since it installs every module into the shared
+`tmp_install`):
+
+- a **user-installed sampling method**, `TABLESAMPLE system_rows (…)` →
+  `Sampling: f1` asserted verbatim, with `Sampling Parameters`, `Repeatable
+  Seed` and the argument value all absent, against an unredacted control that
+  contains the method name and the argument. `system_rows` sets
+  `repeatable_across_queries = false`, so the parser rejects `REPEATABLE` on it
+  — the seed half of the suppression is measured on the built-in `BERNOULLI`
+  fixture in the regress file instead, where the clause is legal.
+- an **extension custom scan**, `test_extensible` → `Custom Scan on t1` in all
+  four formats, with the provider name and the `Custom Plan Provider` property
+  both absent and both present unredacted.
+
+**Shape divergence, recorded rather than fixed.** An unaliased CTE or function
+scan prints **two** tokens under redaction where plain mode prints one:
+`CTE Scan on cte1 a1` against `CTE Scan on my_cte`. `ExplainTargetRel()` prints
+the reference name only when it differs from the object name, and
+`set_rtable_names()` keys every non-relation RTE as `REDACT_ALIAS` (T07), so a
+CTE's reference name is `aN` while its object name is `cteN` and the two never
+match. An unaliased **relation** does not diverge, because T15 arranged for both
+of its names to come from the same `(kind, oid)` lookup. Making the CTE case
+agree would mean changing the refname keying in ruleutils.c, which is T07's
+surface and also feeds the deparse context T21 turns on — out of scope here.
+Both tokens are pseudonyms and nothing is disclosed, so this is pinned in the
+regression file as a decision rather than left to be reported as a bug later.
+
+**Note on T15's by-name block, because the old text got this wrong.** It said
+the three assertions T15 left behind — function, CTE and worktable names absent
+from redacted output — were "expected to **fail** when this task lands, and must
+be inverted". **None of them failed and none was inverted.** Each says a *real*
+name is absent under `REDACT` and present without it, and both halves stay true:
+a pseudonym carries no `zsec_` marker. This is the second brief in a row to
+predict inversions here and the second to need none — T16's expected four and
+needed none of them. The block keeps its title and its purpose: it is still the
+only thing standing between a later task and printing a name *early* as a
+pseudonym, which no marker-based sweep can see. What T17 actually changed there
+was two verdict strings that named T17 as a future owner, and the three plan
+dumps below them, which now carry the pseudonyms.
 
 #### T18 — Trigger section
 
@@ -1286,9 +1408,38 @@ relatable (FR-90); `get_parameter()`'s `(hashed SubPlan …).colN` (`:8798`);
 `OVER <winname>` (`:11194`) — dormant until T21 but landed and unit-tested
 here.
 
+*(rev. T17: **the shared map is keyed on `hash_bytes(name)`, and that is what
+T19 has to use.** "Sharing the map with T17's `cteN`" above is right but not
+specific enough to act on, so: the entry point is
+`explain_redact_by_name(es, REDACT_CTE, name)` (explain.c `:843`), which hashes
+the name string and calls `explain_redact_local()`. It is keyed on the string
+rather than on the range-table index precisely so that T19 can reach it — a
+`SubPlan` carries `plan_name` and no range-table index. T19 must pass the CTE
+name it finds in `plan_name` **after** stripping the `CTE `/`InitPlan `/`SubPlan `
+prefix the label adds, and must not build a second map.
+
+**One case where the two cannot agree, and T19 needs it before writing the FR-90
+fixture.** `choose_plan_name()` (planner.c) **uniquifies a duplicate CTE name**:
+where two CTEs in one statement share a name, the second sub-plan is named
+`name_1`. That string hashes differently from the `ctename` on the scan target,
+so the sub-plan label and the `CTE Name` get different `cteN` for what is one
+CTE — and, symmetrically, the two same-named CTEs collapse onto one `cteN` on
+the scan-target side. Readability cost inside a single record, no disclosure;
+the same tradeoff T14 accepted for cursor names. Do not write the FR-90 fixture
+with duplicate CTE names and do not treat this as a regression; if it needs
+closing, the fix is on the planner-name side and is its own task.
+
+The keying is already exercised across two independent printers, which is the
+part T19 does not have to re-establish: T17 measured the `CTE Scan` and the
+`WorkTable Scan` of one recursive CTE both printing `cte1`, since the
+self-reference RTE carries the same `ctename`. What is **not** established is
+agreement with `plan_name`, because the label is still bare — that is T19's
+fixture to write and the reason T17's regress section calls its recursive case
+an FR-90 *rehearsal* rather than a proof.)*
+
 **Tests.** The FR-90 CTE fixture asserting the `CTE Name` and `Subplan Name`
-pseudonyms resolve to the same object; the FR-91 window fixture; a hashed
-subplan.
+pseudonyms resolve to the same object — with a **unique** CTE name, per the
+uniquifier note above; the FR-91 window fixture; a hashed subplan.
 
 #### T20 — Sort-key `COLLATE` / `USING` decorations
 

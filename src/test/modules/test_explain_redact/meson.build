@@ -31,3 +31,10 @@ tests += {
     ],
   },
 }
+
+# No meson counterpart to the Makefile's EXTRA_INSTALL is needed.  The meson
+# build installs every contrib and test module into the shared tmp_install for
+# the whole test run, so the CREATE EXTENSION statements in the T17 section of
+# sql/test_explain_redact.sql (tsm_system_rows, test_extensible) already resolve.
+# src/test/modules/index is the precedent: it names two contrib modules in
+# EXTRA_INSTALL and nothing here.
