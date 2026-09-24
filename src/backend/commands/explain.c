@@ -21,6 +21,7 @@
 #include "commands/explain.h"
 #include "commands/explain_dr.h"
 #include "commands/explain_format.h"
+#include "commands/explain_redact.h"
 #include "commands/explain_state.h"
 #include "commands/prepare.h"
 #include "foreign/fdwapi.h"
@@ -146,6 +147,9 @@ static void show_instrumentation_count(const char *qlabel, int which,
 									   PlanState *planstate, ExplainState *es);
 static void show_foreignscan_info(ForeignScanState *fsstate, ExplainState *es);
 static const char *explain_get_index_name(Oid indexId);
+static RedactCtx *explain_redact_context(ExplainState *es);
+static const char *explain_redact_refname(ExplainState *es,
+										  RangeTblEntry *rte, Index rti);
 static bool peek_buffer_usage(ExplainState *es, const BufferUsage *usage);
 static void show_buffer_usage(ExplainState *es, const BufferUsage *usage);
 static void show_wal_usage(ExplainState *es, const WalUsage *usage);
@@ -771,6 +775,55 @@ ExplainPrintSettings(ExplainState *es)
 }
 
 /*
+ * Pseudonym map for this record, created on first use.
+ *
+ * The map outlives the individual plan trees in a record, because a pseudonym
+ * has to denote the same object wherever it appears -- including across the
+ * main plan and the plans of any nested statements.  It is therefore never
+ * reset alongside the per-tree fields of ExplainState, and is left to the
+ * caller's memory context to free (FR-45).
+ *
+ * The allowlist is empty: exemption currently covers pg_catalog and
+ * information_schema only.  T22 adds auto_explain.redact_allow_schemas and
+ * this is where the list will arrive from.
+ */
+static RedactCtx *
+explain_redact_context(ExplainState *es)
+{
+	Assert(es->redact);
+
+	if (es->redact_ctx == NULL)
+		es->redact_ctx = explain_redact_create(NIL);
+
+	return es->redact_ctx;
+}
+
+/*
+ * Reference name to print for a range-table entry under redaction, for the
+ * cases where es->rtable_names holds NULL.
+ *
+ * That list only names the RTEs the plan walk reached, so both callers of this
+ * fall back on rte->eref->aliasname -- which is the user's real alias, and so
+ * needs replacing here rather than printing.
+ *
+ * The keying deliberately matches set_rtable_names() in ruleutils.c: an
+ * unaliased plain relation is keyed by OID, so it gets the same "tN" that
+ * ExplainTargetRel prints as its object name, and everything else is keyed by
+ * range-table index.  Keying it any other way would make the two names
+ * disagree about the same RTE.
+ */
+static const char *
+explain_redact_refname(ExplainState *es, RangeTblEntry *rte, Index rti)
+{
+	RedactCtx  *ctx = explain_redact_context(es);
+
+	if (rte->alias == NULL && rte->rtekind == RTE_RELATION)
+		return explain_redact_name(ctx, REDACT_RELATION, rte->relid);
+
+	return explain_redact_local(ctx, REDACT_ALIAS, rti, 0);
+}
+
+/*
  * ExplainPrintPlan -
  *	  convert a QueryDesc's plan tree to text and append it to es->str
  *
@@ -793,7 +846,30 @@ ExplainPrintPlan(ExplainState *es, QueryDesc *queryDesc)
 	es->pstmt = queryDesc->plannedstmt;
 	es->rtable = queryDesc->plannedstmt->rtable;
 	ExplainPreScanNode(queryDesc->planstate, &rels_used);
-	es->rtable_names = select_rtable_names_for_explain(es->rtable, rels_used);
+
+	/*
+	 * Choose the reference name for each range-table entry.  Under redaction
+	 * the names are chosen by the same pass, but pseudonymized as they are
+	 * assigned rather than afterwards -- see
+	 * select_rtable_names_for_explain_- redacted() and set_rtable_names() for
+	 * why the substitution has to happen inside the assignment.
+	 *
+	 * This one call decides two separate things, and the second is easy to
+	 * overlook.  The list is what ExplainTargetRel() and the Replaces
+	 * property print as an alias, and it is also what
+	 * deparse_context_for_plan_tree() just below builds the deparse context
+	 * from.  So every expression eventually printed through that context
+	 * refers to relations by whatever this list holds.  Expression output is
+	 * still suppressed today, which is the only reason a real alias here
+	 * would have been harmless; leaving it real would turn into a live leak
+	 * the moment T21 re-enables expressions.
+	 */
+	if (es->redact)
+		es->rtable_names =
+			select_rtable_names_for_explain_redacted(es->rtable, rels_used,
+													 explain_redact_context(es));
+	else
+		es->rtable_names = select_rtable_names_for_explain(es->rtable, rels_used);
 	es->deparse_cxt = deparse_context_for_plan_tree(queryDesc->plannedstmt,
 													es->rtable_names);
 	es->printed_subplans = NULL;
@@ -4811,33 +4887,28 @@ ExplainModifyTarget(ModifyTable *plan, ExplainState *es)
 static void
 ExplainTargetRel(Plan *plan, Index rti, ExplainState *es)
 {
-	char	   *objectname = NULL;
+	const char *objectname = NULL;
 	char	   *namespace = NULL;
 	const char *objecttag = NULL;
 	RangeTblEntry *rte;
-	char	   *refname;
+	const char *refname;
 
 	/*
 	 * Every name this function prints was chosen by the user: the table, its
 	 * schema, the alias it was given, a CTE or tuplestore name, or a
-	 * set-returning function.
+	 * set-returning function.  Under redaction each one is either replaced by
+	 * a pseudonym or left out, decided per kind in the switch below.
 	 *
-	 * Returning now, before the " on" is appended, leaves the line reading as
-	 * a bare "Seq Scan", and emits no Relation Name, Schema or Alias in the
-	 * JSON, XML and YAML formats.  Alias is the one to watch there: it is
-	 * printed regardless of VERBOSE, so it would otherwise turn up for every
-	 * table the query scans.
-	 *
-	 * Returning before the switch below also avoids its catalog lookups, so
-	 * redaction does not pay to fetch names it is about to throw away.
+	 * Two of those decisions belong to later tasks, so read the switch before
+	 * changing anything here: the function, CTE and tuplestore names stay
+	 * absent until T17 gives them pseudonyms, and the schema name stays
+	 * absent for good (FR-11).
 	 */
-	if (es->redact)
-		return;
-
 	rte = rt_fetch(rti, es->rtable);
-	refname = (char *) list_nth(es->rtable_names, rti - 1);
+	refname = (const char *) list_nth(es->rtable_names, rti - 1);
 	if (refname == NULL)
-		refname = rte->eref->aliasname;
+		refname = es->redact ? explain_redact_refname(es, rte, rti) :
+			rte->eref->aliasname;
 
 	switch (nodeTag(plan))
 	{
@@ -4853,9 +4924,26 @@ ExplainTargetRel(Plan *plan, Index rti, ExplainState *es)
 		case T_ModifyTable:
 			/* Assert it's on a real relation */
 			Assert(rte->rtekind == RTE_RELATION);
-			objectname = get_rel_name(rte->relid);
-			if (es->verbose)
-				namespace = get_namespace_name_or_temp(get_rel_namespace(rte->relid));
+
+			/*
+			 * An exempt relation -- one in pg_catalog, information_schema or
+			 * an allowlisted schema -- takes the original path, real name and
+			 * all, including its schema when VERBOSE.  Anything else gets
+			 * "tN" and no schema at all: FR-11 drops the schema name of a
+			 * redacted object, since a pseudonym qualified by a real schema
+			 * would hand back part of what the pseudonym was hiding.
+			 */
+			if (!es->redact ||
+				explain_redact_exempt(explain_redact_context(es),
+									  REDACT_RELATION, rte->relid))
+			{
+				objectname = get_rel_name(rte->relid);
+				if (es->verbose)
+					namespace = get_namespace_name_or_temp(get_rel_namespace(rte->relid));
+			}
+			else
+				objectname = explain_redact_name(explain_redact_context(es),
+												 REDACT_RELATION, rte->relid);
 			objecttag = "Relation Name";
 			break;
 		case T_FunctionScan:
@@ -4870,8 +4958,14 @@ ExplainTargetRel(Plan *plan, Index rti, ExplainState *es)
 				 * function, we can get the real name of the function.
 				 * Otherwise, punt.  (Even if it was a single function call
 				 * originally, the optimizer could have simplified it away.)
+				 *
+				 * Redaction punts as well, leaving no Function Name at all,
+				 * because the function name is T17's surface (it becomes
+				 * "fN", alongside the CTE and tuplestore names below).  Do
+				 * not "finish the job" by printing it here: without T17 there
+				 * is nothing to print but the user's real function name.
 				 */
-				if (list_length(fscan->functions) == 1)
+				if (!es->redact && list_length(fscan->functions) == 1)
 				{
 					RangeTblFunction *rtfunc = (RangeTblFunction *) linitial(fscan->functions);
 
@@ -4893,6 +4987,12 @@ ExplainTargetRel(Plan *plan, Index rti, ExplainState *es)
 				TableFunc  *tablefunc = ((TableFuncScan *) plan)->tablefunc;
 
 				Assert(rte->rtekind == RTE_TABLEFUNC);
+
+				/*
+				 * Not redacted: both names below are SQL keywords rather than
+				 * anything the user chose, so they disclose the plan's shape
+				 * and nothing else (FR-27).
+				 */
 				switch (tablefunc->functype)
 				{
 					case TFT_XMLTABLE:
@@ -4915,19 +5015,25 @@ ExplainTargetRel(Plan *plan, Index rti, ExplainState *es)
 			/* Assert it's on a non-self-reference CTE */
 			Assert(rte->rtekind == RTE_CTE);
 			Assert(!rte->self_reference);
-			objectname = rte->ctename;
+			/* CTE name: T17's surface, left absent until then */
+			if (!es->redact)
+				objectname = rte->ctename;
 			objecttag = "CTE Name";
 			break;
 		case T_NamedTuplestoreScan:
 			Assert(rte->rtekind == RTE_NAMEDTUPLESTORE);
-			objectname = rte->enrname;
+			/* Tuplestore name: likewise T17's */
+			if (!es->redact)
+				objectname = rte->enrname;
 			objecttag = "Tuplestore Name";
 			break;
 		case T_WorkTableScan:
 			/* Assert it's on a self-reference CTE */
 			Assert(rte->rtekind == RTE_CTE);
 			Assert(rte->self_reference);
-			objectname = rte->ctename;
+			/* Same CTE name a T_CteScan would print, so same treatment */
+			if (!es->redact)
+				objectname = rte->ctename;
 			objecttag = "CTE Name";
 			break;
 		default:
@@ -5265,7 +5371,7 @@ show_result_replacement_info(Result *result, ExplainState *es)
 	while ((rti = bms_next_member(result->relids, rti)) >= 0)
 	{
 		RangeTblEntry *rte = rt_fetch(rti, es->rtable);
-		char	   *refname;
+		const char *refname;
 
 		/*
 		 * add_outer_joins_to_relids will add join RTIs to the relids set of a
@@ -5280,28 +5386,26 @@ show_result_replacement_info(Result *result, ExplainState *es)
 		/* Count the number of rels that aren't ignored completely. */
 		++nrels;
 
-		/* Work out what reference name to use and add it to the string. */
-		refname = (char *) list_nth(es->rtable_names, rti - 1);
-		if (refname == NULL)
-			refname = rte->eref->aliasname;
-
 		/*
-		 * The loop still has to run under redaction.  The counts it builds up
-		 * decide whether a Replaces line is printed at all, and that decision
-		 * describes the plan rather than the data.  Only the names are held
-		 * back, which leaves the line reading "Scan", "Join" or
-		 * "MinMaxAggregate" with nothing after it.
+		 * Work out what reference name to use and add it to the string.
 		 *
-		 * Note the fallback a few lines above, which is easy to miss:
-		 * es->rtable_names holds NULL for any table the plan did not end up
-		 * using, and rte->eref->aliasname is then the real alias.
+		 * Under redaction these are the same pseudonyms ExplainTargetRel
+		 * prints, taken from the same list, so a "Replaces: Scan on t1" line
+		 * stays relatable to the rest of the plan (FR-92).
+		 *
+		 * Note the fallback below, which is easy to miss: es->rtable_names
+		 * holds NULL for any table the plan did not end up using, and
+		 * rte->eref->aliasname is then the real alias -- so redaction has to
+		 * name the entry itself rather than fall through to it.
 		 */
-		if (!es->redact)
-		{
-			if (buf.len > 0)
-				appendStringInfoString(&buf, ", ");
-			appendStringInfoString(&buf, refname);
-		}
+		refname = (const char *) list_nth(es->rtable_names, rti - 1);
+		if (refname == NULL)
+			refname = es->redact ? explain_redact_refname(es, rte, rti) :
+				rte->eref->aliasname;
+
+		if (buf.len > 0)
+			appendStringInfoString(&buf, ", ");
+		appendStringInfoString(&buf, refname);
 
 		/* Keep track of whether we see anything other than RTE_RESULT. */
 		if (rte->rtekind != RTE_RESULT)

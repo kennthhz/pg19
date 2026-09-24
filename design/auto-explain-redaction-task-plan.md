@@ -29,6 +29,17 @@ diagnostic detail. It cannot open a leak. Contrast the naive ordering — build
 pseudonymization bottom-up and enable output as you go — where a revert in the
 middle leaves a record that prints real names.
 
+*(rev. T15: this property is about **reverts** and it still holds unchanged. What
+it does not cover, and what changes at the Stage 3 / Stage 4 boundary, is the
+direction of a **mistake**. Through T14 a bug could only suppress more than
+intended, which the §10.4 negative controls catch. From T15 a bug can print more
+than intended, and the leak detector only catches the subset where the extra
+thing is a *real* name — a surface re-enabled one task early prints a pseudonym,
+carries no marker, and passes every leak assertion in the suite. Each Stage 4
+task therefore owes a by-name assertion that the surfaces belonging to the tasks
+after it are still absent. T15 wrote the first one; the pattern, including its
+anti-vacuity clause, is in that task's section.)*
+
 ### 1.2 The plan is a stack; unwind from the top
 
 Each task depends only on tasks before it. Reverting the most recent task is
@@ -660,7 +671,29 @@ module.
 
 **Tests.** For each RTE kind, assert the alias is a pseudonym. FR-47
 specifically: two relations whose real names collide must not produce `t1_1` or
-any name-fragment; the uniquifier must be a no-op.
+any name-fragment; ~~the uniquifier must be a no-op~~.
+
+*(rev. T15: **the no-op claim is wrong, and so is the comment T07 left in
+`set_rtable_names()` asserting it.** Generated names can collide. Two unaliased
+RTEs of the same relation are keyed by the same OID, both derive `t1`, and the
+uniquifier fires and produces `t1_1`:*
+
+```
+-- SELECT zsec_id FROM zsec_customers UNION ALL SELECT zsec_id FROM zsec_customers
+Append
+  ->  Seq Scan on t1
+  ->  Seq Scan on t1 t1_1
+```
+
+*The half of FR-47 that matters still holds: the suffix is appended to a
+pseudonym, so no fragment of a real name survives, and the substitution still
+has to happen before the uniquifier for that to be true. What fails is only the
+stronger claim that the uniquifier never runs. The output shape is identical to
+the unredacted plan's (`zsec_customers zsec_customers_1`), so nothing is
+disclosed that was not disclosed before and no code change is warranted — but the
+comment states as a fact something a two-line query disproves, which is worse
+than saying nothing, so it should be corrected when that file is next touched.
+Pinned as a test in the regression file.)*
 
 #### T08 — Layer C: column names
 
@@ -835,8 +868,15 @@ happen rather than absorbed silently:
   `clean` vacuously, since T04 blanks the property the label would sit in. The
   verdict is annotated at the catalog entries and the vacuity is now measured by
   two queries after the sweep, rather than the row being left to read as
-  verification. Repairing the sweep so that a suppressed property reports as
-  such — 33 rows share the defect — is its own task.
+  verification. ~~Repairing the sweep so that a suppressed property reports as
+  such — 33 rows share the defect — is its own task.~~ *(rev. T15: not a separate
+  task after all, or at least not the whole of one. Eleven of the 33 rows became
+  genuine at T15 simply because the property their identifier sits in is printed
+  again, and the remainder will resolve the same way as T16–T21 land. The two
+  FR-96 rows are the exception and will stay vacuous here permanently, because
+  the construct is collapsed by design — their real coverage is the test module.
+  What is left of the original idea is the per-row annotation, which T15 wrote
+  out in full at the vacuity note in that file.)*
 
 #### T14 — Layer B: remaining leaf sites
 
@@ -936,14 +976,129 @@ any of them returns that surface to blanked.
 
 #### T15 — Relation, schema and alias names
 
-`ExplainTargetRel` (`:4599`): `objectname` → `tN`, `namespace` omitted,
-`refname` from layer C — **including** the `eref->aliasname` fallback at
-`:4610`. Plus `Replaces` (`:5036-5069`) with the same fallback at `:5042`.
-Note `Alias` is emitted unconditionally in non-text formats (`:4724`) and is
-not `VERBOSE`-gated.
+*(rev. T15: rewritten to match what was built. The section below listed four
+emission sites and the tests for them; it did not mention the one thing the task
+actually had to discover, which is that `es->redact_ctx` was never allocated
+anywhere in the tree, so passing it to T07's redacted name selector would have
+passed NULL and produced **no redaction** rather than an error. Line numbers are
+as landed.)*
 
-**Tests.** Self-join shows the same `tN` twice; two tables show different
-pseudonyms (FR-40); `Schema` absent; the FR-13a partition fixture.
+**Delivered.** Three edits and two new static helpers, all in
+`src/backend/commands/explain.c` — 147 insertions, 44 deletions. This is the
+first task in Stage 4, and therefore the first task in the plan where the
+deletions matter: up to T13/T14 the changes were pure insertions and "off-mode
+output is unchanged by construction" was an argument rather than a measurement.
+Here the off-mode path was restructured — two locals retyped to `const char *`
+and the `eref->aliasname` fallback rewritten — so it was measured instead (see
+**Revert**).
+
+1. **`explain_redact_context()`** (`:795`) — new. Lazily creates
+   `es->redact_ctx` with `explain_redact_create(NIL)` on first use. Needed
+   because nothing allocated it before: `explain_state.c` sets `es->redact` and
+   stops, and the header's "built on first use" had no first use. The map
+   deliberately outlives the individual plan trees of a record, since a
+   pseudonym has to denote the same object across a main plan and any nested
+   statements (FR-45), so it is not reset with the per-tree fields. The empty
+   allowlist argument is where T22's `auto_explain.redact_allow_schemas` will
+   arrive.
+
+2. **`explain_redact_refname()`** (`:816`) — new. Stands in for the
+   `rte->eref->aliasname` fallback, which is the user's real alias and so cannot
+   be printed. Its keying mirrors `set_rtable_names()` exactly: an unaliased
+   `RTE_RELATION` by **OID**, everything else by range-table index. Keying it
+   any other way makes the reference name and the object name disagree about the
+   same RTE.
+
+3. **`ExplainPrintPlan()`** (`:866`) — `if (es->redact)` selects
+   `select_rtable_names_for_explain_redacted()`, which T07 landed and which had
+   **no caller in the backend** until now (only the test module). This one call
+   decides two things and the second is easy to miss: the list is what
+   `ExplainTargetRel()` and `Replaces` print as an alias, and it is also what
+   `deparse_context_for_plan_tree()` on the next line builds the deparse context
+   from. A real alias here would be harmless only for as long as expression
+   output stays suppressed.
+
+4. **`ExplainTargetRel()`** (`:4887`) — T04's blanket `return` replaced by
+   per-kind handling. Relations get `tN` and no schema; **exempt** relations take
+   the original path unchanged, real name plus `VERBOSE`-gated schema;
+   `xmltable`/`json_table` are untouched because both names are SQL keywords
+   (FR-27). Function, CTE and worktable names are left absent on purpose — they
+   are T17's `fN`/`cteN`, and "finishing the job" here would mean printing the
+   user's real names.
+
+5. **`show_result_replacement_info()`** (`:5386`) — names restored,
+   pseudonymized, from the same list (FR-92). The loop always ran under T04
+   because its counts decide whether the line appears at all.
+
+**Not done here, on purpose.**
+`deparse_context_for_plan_tree_redacted()` (T08) is **still uncalled**. `:874`
+passes the pseudonymized `rtable_names` into the *unredacted* context builder, so
+relation reference names inside the deparse context are pseudonyms while column
+names are assigned real. Harmless today — T04 suppresses every expression
+property, measured across the whole §10.2 catalog — and **T21 owns wiring it**,
+alongside the defensive assertion listed there. Recorded rather than fixed
+because doing it here would land an untestable change.
+
+**Findings.**
+
+- `strcmp(refname, objectname)` alias suppression holds, and by pointer identity
+  rather than by luck: `explain_redact_name()` caches `entry->name` per
+  `(kind, oid)` and hands back the same buffer, so for an unaliased relation both
+  sides are the same pointer. `Seq Scan on t1` stays a two-word tail. Asserted
+  empirically, not argued, because keying the reference name differently would
+  silently change the shape of every unaliased scan line.
+- Two unaliased RTEs of the same relation **do** collide and take a `_1` suffix,
+  giving `Seq Scan on t1 t1_1`. Cosmetic, and identical in shape to the
+  unredacted plan, but it disproves the comment T07 left in `set_rtable_names()`
+  — corrected in T07's section above.
+- FR-15 has no reachable emission site. `ExplainNode()` omits
+  `T_NamedTuplestoreScan` from the list that calls `ExplainScanTarget()`, so the
+  `T_NamedTuplestoreScan` case in `ExplainTargetRel()` has no caller and a named
+  tuplestore scan prints no name in any format, redacted or not. **T17's ENR
+  deliverable is a guard, not a substitution**; its section still lists an ENR
+  test and that test can only be a negative control.
+
+**Tests.** The negative test first, because Stage 4 inverts the failure
+direction: from here a mistake makes output *less* redacted, and the leak sweep
+cannot catch a name that came back early as a **pseudonym** — no marker, no leak,
+no failure. So the function, CTE and worktable names are asserted **absent by
+name**, with an anti-vacuity clause requiring the unredacted plan to print them,
+and the tuplestore name is pinned as unreachable. Then: self-join shows the same
+`tN` twice while two tables show different pseudonyms (FR-40); no `Schema` in any
+of the four formats and no `schema.table` in text (FR-11); the FR-13a partition
+fixture, both identifiers (`Seq Scan on t1 a1`); `Replaces` in all three of
+T01's forms; `pg_class` keeping its real name and its real schema as the negative
+control for the whole rule; and the `Alias` property, which json/xml/yaml emit
+regardless of `VERBOSE` and which a text-only test would miss entirely.
+
+This is also the task that gives the inverted sweep in
+`src/test/regress/sql/explain_redact.sql` its first real signal. Eleven of its 33
+previously-vacuous rows now assert something: the four FR-10 rows, FR-13, the
+alias halves of the two FR-46 rows, both FR-92 rows, the parallel-plan row, and
+FR-11 — which stays an assertion of omission but now distinguishes "schema
+dropped from a named relation" from "nothing printed at all". Enumerated at the
+vacuity note in that file. The remaining rows still need the task that owns
+their surface; repairing the sweep so a suppressed property reports as suppressed
+is no longer the whole answer it looked like at T13.
+
+**Revert.** Reverting the whole task returns these three surfaces to blanked:
+less informative, still safe, and still the rule §1.2 states.
+
+What changes at T15 is the direction of a **mistake**, and that is the reason
+this task's tests are shaped the way they are. Through T14, every error mode was
+"suppressed something it should have kept", which the §10.4 negative controls and
+the plan-shape assertions catch. From T15 the available error mode is
+"printed something it should have withheld", and the leak sweep only catches the
+subset of those where the printed thing is a *real* name. A name that comes back
+early as a **pseudonym** carries no marker and every assertion in the file still
+passes. Hence the by-name negative test for T17's three surfaces, and hence the
+anti-vacuity clause on it.
+
+The partial revert to be careful about is hunk 3 alone. Dropping the
+`select_rtable_names_for_explain_redacted()` call while leaving Stage 3 in place
+is safe *today*, because T04 still suppresses every expression, and becomes a
+live leak the moment T21 lands: the same list feeds the deparse context. T21's
+defensive assertion is what converts that from silent to loud.
 
 #### T16 — Index names
 
@@ -957,12 +1112,31 @@ a pseudonym instead of erroring the record.
 
 #### T17 — CTE, ENR, function-scan, sampling and custom-scan names
 
-`rte->ctename` → `cteN` (`:4688`, `:4700`); `rte->enrname` → `enrN`
-(`:4693`); function-scan `Function Name` → `fN` (`:4653`);
+`rte->ctename` → `cteN` (`:4688`, `:4700`); ~~`rte->enrname` → `enrN`
+(`:4693`)~~; function-scan `Function Name` → `fN` (`:4653`);
 `show_tablesample` method → `fN` (`:3052`); custom-scan provider name.
 
-**Tests.** CTE, recursive CTE (`WorkTable Scan`), ENR, function-in-`FROM`, a
-user-installed `TABLESAMPLE` method, and an extension custom scan.
+*(rev. T15: **the ENR half is a guard, not a substitution.** `ExplainNode()`
+omits `T_NamedTuplestoreScan` from the node list that calls
+`ExplainScanTarget()`, so `ExplainTargetRel()`'s `T_NamedTuplestoreScan` case has
+no caller and no `Tuplestore Name` is ever printed — measured in every format,
+with and without `REDACT`, from inside a trigger with a `REFERENCING NEW TABLE`
+transition table, which is the only way to get an ENR into a plan. T15 left the
+case suppressed and pinned a negative control for it; T17 should keep it
+suppressed and not spend a pseudonym namespace on a path with no caller. See
+FR-15's revised entry in the requirements.)*
+
+**Tests.** CTE, recursive CTE (`WorkTable Scan`), function-in-`FROM`, a
+user-installed `TABLESAMPLE` method, and an extension custom scan. The ENR case
+is a negative control only, already written at T15 — it asserts the name is
+absent **and** reports if a future version starts printing it, which is the only
+thing that would give T17 work here.
+
+Note the three by-name assertions T15 left behind — function, CTE and worktable
+names absent from redacted output, each with an anti-vacuity clause — are
+expected to **fail** when this task lands, and must be inverted rather than
+deleted: the real names must still be absent, and the pseudonyms must now be
+present.
 
 #### T18 — Trigger section
 

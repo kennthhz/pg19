@@ -160,6 +160,19 @@ Two ways to close it, neither attempted in T08:
 Until one is done, FR-12 should be read as "the number is the column's position
 within its range-table entry, never its name" rather than as written.
 
+*(rev. T15: **not resolved, and not even partly.** Worth saying explicitly,
+because T15 is the first task that puts pseudonyms back into output and a reader
+could reasonably assume Stage 4 touched this. It did not. The shortfall is in
+`set_relation_column_names()`, which T15 does not go near, and neither remedy
+above was attempted. What did change is the shortfall's **observability**, and
+only in the negative direction of "still zero": a column pseudonym is printed
+only inside an expression property — `Filter`, `Output`, `Index Cond`, `Sort
+Key`, `Hash Cond`, `Cache Key` — and every one of those is still suppressed, as
+measured across the whole §10.2 fixture catalog. So `t1_c3` cannot be seen in a
+redacted record today and the disclosure is latent. **T21 is the task that makes
+it real**, which makes T21 the deadline for the decision this section asks for,
+not T15.)*
+
 ### 3.1.3 Rendering of `Query Parameters` (open question, not yet decided)
 
 D10 and FR-22 omit the property outright. That decision has been challenged and
@@ -221,12 +234,12 @@ In every redacted record, the following must not appear in **any** field, in
 
 | ID | Item | Required treatment |
 |---|---|---|
-| FR-10 | Table, view, materialized view, foreign table, and partitioned-table names (scan and `INSERT`/`UPDATE`/`DELETE`/`MERGE`/CTAS targets, including the relation names shown in the trigger section) | pseudonym `t1`, `t2`, … |
-| FR-11 | Schema/namespace names of redacted objects | omitted |
+| FR-10 | Table, view, materialized view, foreign table, and partitioned-table names (scan and `INSERT`/`UPDATE`/`DELETE`/`MERGE`/CTAS targets, including the relation names shown in the trigger section) *(rev. T15: landed for every site except the trigger section, which is unreachable until T18. Until T15 this requirement had no coverage at all in the sense that matters: T04 suppressed the whole scan target, so every "clean" verdict in §10.2 was satisfied by an empty line. The scan and DML-target rows now assert a pseudonym is present where the real name was, not that nothing is.)* | pseudonym `t1`, `t2`, … |
+| FR-11 | Schema/namespace names of redacted objects | omitted *(rev. T15: landed and verified in all four formats — text qualifies the object name as `schema.table` while json/xml/yaml emit a separate `Schema` property, so the two are separate assertions. Note what is **not** omitted: an exempt relation keeps its schema, and keeps it `VERBOSE`-gated exactly as without redaction, because exemption restores the original code path rather than adding a new one.)* |
 | FR-12 | Column names — of **every** range-table-entry kind, not only base relations: subquery output names, join output names, function-scan and `ROWS FROM` column aliases, `VALUES` column names, CTE and ENR column names, tablefunc column names *(rev. code audit: for these RTE kinds the printed name comes from `rte->eref->colnames` / `expandRTE()` and there is **no** relid and no catalog attno to key a pseudonym on — see FR-46)* | pseudonym `t1_c3`, where the numeric part is an **opaque sequential per-RTE counter** *(rev. security review: must never be the physical attno, which leaks ordinal position and column count; see FR-43)* |
-| FR-13 | User-visible relation aliases / refnames, including (a) the value used when no alias was assigned because the RTE is absent from the EXPLAIN `rels_used` set, and (b) `RETURNING WITH (OLD AS …, NEW AS …)` aliases *(rev. code audit: both bypass the alias list produced for EXPLAIN)* | derived from the relation pseudonym, or `a1`, `a2`, … when a distinct alias must be shown |
+| FR-13 | User-visible relation aliases / refnames, including (a) the value used when no alias was assigned because the RTE is absent from the EXPLAIN `rels_used` set, and (b) `RETURNING WITH (OLD AS …, NEW AS …)` aliases *(rev. code audit: both bypass the alias list produced for EXPLAIN)* *(rev. T15: (a) landed and covered. (b) is **not** covered yet and its §10.2 assertion is still vacuous — the `OLD`/`NEW` alias reaches output only as a `Var` prefix inside the `Output` list, which stays suppressed until T21, so there is nothing for the fixture to grep either way. "Derived from the relation pseudonym" is exact and load-bearing: an unaliased relation's reference name is keyed by **OID**, so it equals the object name and EXPLAIN prints one identifier, not two; keying it by range-table index would turn every unaliased scan line into `Seq Scan on t1 a1` and change the shape of the output rather than its content. One exception, measured: two unaliased RTEs of the *same* relation both derive `t1`, collide, and the second takes a `_1` suffix — `Seq Scan on t1 t1_1`. Identical in shape to the unredacted `zsec_customers zsec_customers_1`, so nothing extra is disclosed, but it contradicts FR-47's claim that pseudonyms make the uniquifier a no-op.)* | derived from the relation pseudonym, or `a1`, `a2`, … when a distinct alias must be shown |
 | FR-14 | CTE names, in **every** property that can carry one — the scan target, the sub-plan label, and any deparsed sub-plan reference *(rev. code audit: see FR-90)* | `cte1`, `cte2`, … |
-| FR-15 | Ephemeral named tuplestore (ENR) names | `enr1`, … |
+| FR-15 | Ephemeral named tuplestore (ENR) names | `enr1`, … *(rev. T15: **not reachable from EXPLAIN.** `ExplainNode()` omits `T_NamedTuplestoreScan` from the node list that calls `ExplainScanTarget()`, so a named tuplestore scan prints no `Tuplestore Name` and no `Alias` in any format, redacted or not — measured from inside a trigger with a `REFERENCING NEW TABLE` transition table, which is the only way to get an ENR into a plan. The `T_NamedTuplestoreScan` case in `ExplainTargetRel()` has no caller. FR-15 therefore joins FR-94 and FR-98c as a **guard** for a printer path EXPLAIN cannot reach, and T17 has nothing to pseudonymize here unless upstream adds the missing case. A negative control is pinned in the regression file so that if it ever does, the change is reported rather than shipped silently.)* |
 | FR-16 | Index names in **any** property: index scans (`Index Name`), and non-scan sites such as `Conflict Arbiter Indexes` *(rev. security review)* | `i1`, `i2`, … |
 | FR-17 | Trigger names and constraint names (trigger section, `Trigger Name` property) | `trg1`, … / `con1`, … |
 | FR-18 | User-defined function, procedure, aggregate, window-function names — in every emission path: deparsed expressions, `Function Name` / `Function Call` properties, Function-Scan targets, **and TABLESAMPLE method names** (`Sampling:`, `Sampling Method`), which core resolves via a direct function-name lookup rather than the expression deparser *(rev. security review)* | `f1(…)`, …; argument expressions redacted recursively |
@@ -258,7 +271,7 @@ has a test in §10.
 |---|---|---|
 | FR-90 | Sub-plan labels. The `Subplan Name` property (and its text-mode equivalent) is built by prefixing a planner-assigned plan name with `CTE `/`InitPlan `/`SubPlan `, and that plan name is seeded **verbatim from the CTE name** for CTE sub-plans and **from the subquery's alias** for sub-query sub-plans. The same string is re-emitted inside deparsed expressions as `(hashed SubPlan <name>).colN`. Without this requirement a record reads `CTE Name: cte1` on one line and `Subplan Name: CTE secret_customers_cte` on the line above it. | the label keeps its `CTE `/`InitPlan `/`SubPlan ` prefix; the name part becomes `sp1`, `sp2`, … (and, where the sub-plan corresponds to a CTE, the *same* pseudonym as FR-14 assigns to that CTE, so the two lines remain relatable) |
 | FR-91 | Window names. The `Window` property prints the user's `WINDOW w AS (…)` name, and deparsed `Output` prints `OVER <name>` for every window function. Neither is `VERBOSE`-gated. | `w1`, `w2`, …; the same pseudonym in both places |
-| FR-92 | The relation reference names listed by the `Replaces` property (emitted when a scan/join/aggregate was replaced by a `Result` node). | per FR-13 |
+| FR-92 | The relation reference names listed by the `Replaces` property (emitted when a scan/join/aggregate was replaced by a `Result` node). | per FR-13 *(rev. T15: landed. All three forms T01 found are now pinned in their redacted rendering — `Replaces: Scan on t1`, `Replaces: Join on a1, a2`, and `Replaces: MinMaxAggregate` with no name. The counting loop always ran under T04's suppression because it decides whether the line appears at all; T15 restored the names it was building and withholding.)* |
 | FR-93 | Composite-type field names: the field name printed for a field selection (`(col).field`), and the field name printed for composite/array assignment in an `INSERT`/`UPDATE` target list that EXPLAIN displays. These are resolved from the composite type's tuple descriptor, from a row expression's column-name list, or from the RTE's column list — **never** through the ordinary column-name path, so FR-12's treatment does not reach them. | `fld1`, `fld2`, … per record; a field of a redacted composite type is never printed in full |
 | FR-94 | Named-argument labels in a function call (`f(argname => …)`). *(Corrected by T01: **not reachable from EXPLAIN.** The parser resolves named notation to positional order and discards the `NamedArgExpr` wrapper, so `f(argname => x)` deparses as `f(x)` — verified with arguments given out of order, the case that forces reordering and so had the best chance of preserving the labels. ruleutils' `T_NamedArgExpr` branch therefore serves raw parse trees, such as a stored default printed by `pg_get_expr()`, not plan trees. Implement as a **guard**, like FR-98c, and keep the negative control pinned so that if labels ever start surviving into plans it fails rather than shipping silently.)* | `arg1`, `arg2`, … — or the `name =>` decoration omitted entirely (positional rendering), which is also acceptable since redacted output need not re-parse (§3) |
 | FR-95 | XML construction names: the `XMLELEMENT`/`XMLPI` element name, the `XMLATTRIBUTES`/`XMLFOREST` attribute labels, `XMLNAMESPACES` prefixes, and the `COLUMNS` column names of an `XMLTABLE`. These are plain strings on the expression node, **not** constants, so FR-21 does not reach them. Note these appear in `Filter`, which is not `VERBOSE`-gated — not only in the `VERBOSE`-only table-function property. | the construct is **collapsed**: an `XmlExpr` prints as `XMLEXPR(...)`, an `XMLTABLE` table function as `XMLTABLE(...)`, and nothing inside either is deparsed, so none of these names is printed at all. *(rev. T13: was `xml1`, `xml2`, … Pseudonymizing the names **inside** XML and JSON payloads was abandoned as a corner case that did not pay for itself. It took ten guarded deparse sites, five helpers, a pre-order walk of the path tree to keep a `PLAN` clause agreeing with the path labels it names, and a search of the range table for the node's own `varno` to keep a `COLUMNS` entry agreeing with the `Output` list — and that last one has a failure mode, measured as reachable, where a parameterized `LATERAL` scan copies the `TableFunc`, the pointer search finds nothing, and the two disagree. Collapsing costs three guards and is leak-proof by inspection. The keyword is kept, not blanked: it is SQL vocabulary rather than user data, on the same footing as the `pg_catalog` function and operator names §10.4 pins as still printing, and it tells a reader what kind of thing stood here instead of leaving an unexplained gap. **Given up deliberately:** a `Var` inside a collapsed construct no longer prints its column pseudonym, so the record no longer shows which columns fed the construct.)* |
@@ -550,6 +563,21 @@ an index on the aggregated column or the planner produces an ordinary
 IS NOT NULL`) is not detected at all and produces no replacement — recorded as
 a control in the test.
 
+*(rev. T15: landed, and all three forms are pinned in their redacted rendering
+rather than only as leak-scan verdicts:*
+
+```
+Replaces: Scan on t1
+Replaces: Join on a1, a2
+Replaces: MinMaxAggregate
+```
+
+*The two leak-scan rows for this requirement were previously vacuous — T04
+withheld the names while keeping the line — and are now genuine. The names come
+from the same `es->rtable_names` list `ExplainTargetRel()` reads, including the
+`eref->aliasname` fallback for an RTE the plan walk did not reach, so a
+`Replaces` line stays relatable to the scan nodes around it.)*
+
 **FR-93 — composite-type field names.** [V]
 Sites: `FieldSelect` → `get_name_for_var_field()`, printed at ruleutils.c:9712;
 assignment form → `processIndirection()`, printed at ruleutils.c:13193.
@@ -837,6 +865,14 @@ RETURNING WITH (OLD AS zold_secret, NEW AS znew_secret)
 ```
 Assert: no `zold_secret`, `znew_secret`.
 
+*(rev. T15: the assertion is in place and **still vacuous.** These aliases are
+used as the `Var` prefix when the `Output` list is deparsed and reach output
+through no other property, so with expression output suppressed there is nothing
+to find with `REDACT` and the fixture would pass against an implementation that
+did nothing. Measured: the fixture's redacted record emits `Relation Name`,
+`Alias` and the plan structure, and no `Output` at all. T21 is what turns this
+row into a real assertion — and until then FR-13(b) is untested, not verified.)*
+
 **FR-13(a) — the reference-name path for a partition parent.**
 [V — resolved by T01]
 Sites: explain.c:4610 and explain.c:5042.
@@ -858,6 +894,21 @@ INSERT INTO zsec_parted VALUES (1, 'x');      -- ordinary path, parent only
 ```
 Assert: neither `zsec_parted` nor `zsec_parted_p1` appears. T15 must redact
 both names on that line, not only the object name.
+
+*(rev. T15: done, and the mechanism is worth recording because it is what makes
+the two names take different code paths.
+`expand_single_inheritance_child()` sets `childrte->alias` to an `Alias` carrying
+the **parent's** `eref->aliasname`. `set_rtable_names()` keys an RTE with an
+explicit `alias` by range-table index rather than by OID, so the parent's name
+becomes an `aN` while the child's becomes the `tN` of its own OID — the two do
+not collapse into one identifier the way an ordinary unaliased scan's do, which
+is exactly the shape T01 predicted. Measured:*
+
+```
+Seq Scan on t1 a1
+```
+
+*Both identifiers are pseudonyms, and the line keeps its two-identifier shape.)*
 
 **FR-29 / FR-72 — extension option plus `REDACT`.** [V]
 The highest-severity finding. `pg_overexplain` is in-tree.
@@ -1048,7 +1099,10 @@ protects goals 2 and 3:
   anything if the fixture tables hold rows; against an empty table every count
   is zero and the whole set is vacuous.
 - A self-join shows the **same** relation pseudonym twice; two different
-  tables show different pseudonyms (FR-40).
+  tables show different pseudonyms (FR-40). *(rev. T15: verified. The self-join
+  is the case that separates the two halves of the rule — one relation
+  pseudonym, two alias pseudonyms — and it is the case a "number the scans as
+  you meet them" scheme gets wrong.)*
 - With `log_redact = off`, output is byte-identical to the unpatched build
   across the whole existing `auto_explain` and `EXPLAIN` regression suites
   (FR-62), and the existing `ruleutils` suites are byte-identical too.

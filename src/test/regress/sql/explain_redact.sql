@@ -664,9 +664,35 @@ SELECT f.fr,
 -- fixture had stopped reaching the property for some unrelated reason, which
 -- would make the right-hand zero mean nothing.
 --
--- This is the same vacuity as 33 other rows of this file, T05's plan_record and
--- T01's positive control.  Only the two rows T13 owns are annotated; the rest
--- need their own task.
+-- This was the same vacuity as 33 other inverted rows of this file -- the 28
+-- sweep rows above plus the FR-16 index, two FR-92 and parallel-plan rows below
+-- -- and as T05's plan_record and T01's positive control.
+--
+-- T15 resolved part of it *(rev. T15)*.  Eleven of those rows now carry real
+-- signal, because the property that would hold the fixture's expected
+-- identifier is printed again -- as a pseudonym -- instead of being absent.  A
+-- leak through that property would now be found rather than hidden behind a
+-- blank:
+--
+--   FR-10 relation name / UPDATE target / DELETE target / MERGE target
+--                                                    -> Relation Name
+--   FR-13 user-written alias                         -> Alias
+--   FR-46 join output names                          -> Alias (the zsec_ja half)
+--   FR-46 subquery output name + alias               -> Alias (the zsec_sub half)
+--   FR-92 Replaces: relation name / Replaces: join aliases
+--                                                    -> Replaces
+--   the parallel-plan row below                      -> Relation Name
+--   FR-11 schema name (VERBOSE) is still an assertion of *omission*, but it is
+--         no longer vacuous: it now distinguishes "schema dropped from a named
+--         relation" from "nothing printed at all", which is what FR-11 means.
+--
+-- The two FR-46 rows are genuine only for the alias half of what they name; the
+-- column-name half still waits on T21, as does every row whose identifier lives
+-- in a Filter or Output.  The rest wait on the task that owns their surface:
+-- T16 for FR-16, T17 for FR-14 and FR-18, T18 for FR-17, T19 for FR-90 and
+-- FR-91, T20 for FR-98a, T21 for FR-12, FR-20, FR-21, FR-46, FR-93, FR-97,
+-- FR-98d, FR-99 and FR-13b.  The two FR-96 rows are collapsed by design and
+-- will stay vacuous here for good; their real coverage is the test module.
 SELECT (SELECT count(*) FROM zsec_plan(q, 'COSTS OFF, VERBOSE') AS l
          WHERE l LIKE '%Table Function Call%')         AS tfc_plain,
        (SELECT count(*) FROM zsec_plan(q, 'COSTS OFF, VERBOSE, REDACT') AS l
@@ -854,6 +880,274 @@ SELECT zsec_explain_blob('SELECT zsec_ssn FROM zsec_customers WHERE zsec_ssn = '
 SELECT zsec_explain_blob('SELECT zsec_ssn FROM zsec_customers WHERE zsec_ssn = ''x''',
                          'COSTS OFF, REDACT, FORMAT yaml') ~ '^- Plan:'
        AS redacted_yaml_starts_as_a_document;
+
+--
+-- ===========================================================================
+-- T15: relation names, schema names and aliases.
+--
+-- This is the first task in the plan whose effect is to print MORE than the
+-- task before it.  Up to T14, every change moved a name from "printed" to
+-- "suppressed", so a mistake made output more redacted and the inverted sweep
+-- above caught it.  From T15 the direction reverses: three surfaces come back
+-- as pseudonyms, and a mistake -- here, or in any later task that touches
+-- ExplainTargetRel() -- makes output LESS redacted.
+--
+-- The sweep still catches a real name coming back, because a real name carries
+-- the marker.  What it cannot catch is a name that was meant to stay away until
+-- a later task and came back early as a PSEUDONYM: no marker, no leak, no
+-- failure, and a requirement quietly implemented twice or in the wrong place.
+-- That is what the first block below is for, and it is why it comes first.
+-- ===========================================================================
+--
+-- T15 MUST NOT PRINT WHAT T17 OWNS.
+--
+-- ExplainTargetRel() used to return before its switch, which withheld every
+-- name it can print in one stroke.  T15 replaced that with per-kind handling and
+-- deliberately left three kinds unnamed: the set-returning function of a
+-- Function Scan (FR-18), the CTE name of a CTE Scan or a WorkTable Scan (FR-14),
+-- and the name of a named tuplestore (FR-15).  All three are T17's.
+--
+-- Those scan lines are no longer blank -- they read "Function Scan on a1" now,
+-- because the *alias* is T15's surface -- so looking at the output no longer
+-- tells you whether the function name is being withheld or merely absent.  So
+-- assert the real names, not the presence of the alias.
+--
+-- Three clauses, and the third is the one that keeps this honest.  Without it
+-- the check would pass for a query that had stopped reaching the emission site
+-- for some unrelated reason: the same failure mode the zsec_expect column exists
+-- to prevent in the sweep above, which T01 found in six of its own fixtures.
+--
+SELECT v.kind,
+       CASE
+         WHEN NOT EXISTS (SELECT 1 FROM zsec_plan(v.qry, 'COSTS OFF, VERBOSE, REDACT') l
+                           WHERE l LIKE '%' || v.node || '%')
+           THEN 'FAIL: no ' || v.node || ' node in this plan -- assertion is vacuous'
+         WHEN EXISTS (SELECT 1 FROM zsec_plan(v.qry, 'COSTS OFF, VERBOSE, REDACT') l
+                           WHERE l LIKE '%' || v.name || '%')
+           THEN 'FAIL: ' || v.name || ' came back before T17'
+         WHEN NOT EXISTS (SELECT 1 FROM zsec_plan(v.qry, 'COSTS OFF, VERBOSE') l
+                           WHERE l LIKE '%' || v.name || '%')
+           THEN 'FAIL: unredacted output does not print ' || v.name
+                || ' either -- nothing is being tested'
+         ELSE 'ok: ' || v.name || ' still absent, T17 owns it'
+       END AS verdict
+  FROM (VALUES
+        ('Function Scan -> function name (FR-18)', 'Function Scan', 'zsec_func',
+         'SELECT * FROM zsec_func(''x'') AS zsec_fsalias'),
+        ('CTE Scan -> CTE name (FR-14)', 'CTE Scan', 'zsec_cte15',
+         'WITH zsec_cte15 AS MATERIALIZED (SELECT zsec_ssn FROM zsec_customers) SELECT * FROM zsec_cte15 AS zsec_ctealias'),
+        ('WorkTable Scan -> recursive CTE name (FR-14)', 'WorkTable Scan', 'zsec_rec15',
+         'WITH RECURSIVE zsec_rec15(zsec_n) AS (SELECT 1 UNION ALL SELECT zsec_n + 1 FROM zsec_rec15 WHERE zsec_n < 5) SELECT * FROM zsec_rec15')
+       ) AS v(kind, node, name, qry)
+ ORDER BY v.kind COLLATE "C";
+-- The lines themselves, so the shape T17 has to change is on record rather than
+-- inferred: the alias is a pseudonym, the object name is simply not there, and
+-- the Subplan Name reads "CTE" with nothing after it (FR-90, T19's).
+SELECT * FROM zsec_plan('SELECT * FROM zsec_func(''x'') AS zsec_fsalias',
+                        'COSTS OFF, REDACT');
+SELECT * FROM zsec_plan('WITH zsec_cte15 AS MATERIALIZED (SELECT zsec_ssn FROM zsec_customers) SELECT * FROM zsec_cte15 AS zsec_ctealias',
+                        'COSTS OFF, REDACT');
+SELECT * FROM zsec_plan('WITH RECURSIVE zsec_rec15(zsec_n) AS (SELECT 1 UNION ALL SELECT zsec_n + 1 FROM zsec_rec15 WHERE zsec_n < 5) SELECT * FROM zsec_rec15',
+                        'COSTS OFF, REDACT');
+--
+-- The fourth kind, FR-15's named tuplestore, cannot be asserted the same way,
+-- and the reason is a finding rather than a limitation: T_NamedTuplestoreScan is
+-- absent from the node list in ExplainNode() that calls ExplainScanTarget(), so
+-- EXPLAIN never prints a Tuplestore Name -- redacted or not, in any format.  The
+-- case for it in ExplainTargetRel() is unreachable from EXPLAIN, which puts
+-- FR-15 on the same footing as FR-94 and FR-98c: a guard for a path that exists
+-- in the printer but has no caller.
+--
+-- Asserted rather than assumed, because "no name in the output" and "no emission
+-- site in the code" are indistinguishable from the outside, and the difference
+-- decides whether T17 has work to do here.  The third clause reports the change
+-- instead of failing quietly if a future version adds the missing case.
+--
+-- An ENR needs a trigger transition table, so the plan can only be taken from
+-- inside a trigger function; the lines are stashed in a table to get them back
+-- out.  Created here, after the marking-discipline query above, for the same
+-- reason the Memoize fixtures are: so that no earlier plan changes shape.
+CREATE TABLE zsec_enr_src (zsec_v int);
+CREATE TABLE zsec_enr_log (zsec_redacted bool, zsec_ln text);
+CREATE FUNCTION zsec_enr_trig() RETURNS trigger
+LANGUAGE plpgsql AS
+$$
+DECLARE
+    ln text;
+BEGIN
+    FOR ln IN EXECUTE 'EXPLAIN (COSTS OFF, VERBOSE) SELECT * FROM zsec_enr_new' LOOP
+        INSERT INTO zsec_enr_log VALUES (false, ln);
+    END LOOP;
+    FOR ln IN EXECUTE 'EXPLAIN (COSTS OFF, VERBOSE, REDACT) SELECT * FROM zsec_enr_new' LOOP
+        INSERT INTO zsec_enr_log VALUES (true, ln);
+    END LOOP;
+    RETURN NULL;
+END
+$$;
+CREATE TRIGGER zsec_enr_trg AFTER INSERT ON zsec_enr_src
+    REFERENCING NEW TABLE AS zsec_enr_new FOR EACH STATEMENT
+    EXECUTE FUNCTION zsec_enr_trig();
+INSERT INTO zsec_enr_src VALUES (1);
+SELECT CASE
+         WHEN NOT EXISTS (SELECT 1 FROM zsec_enr_log
+                           WHERE zsec_ln LIKE '%Named Tuplestore Scan%')
+           THEN 'FAIL: no Named Tuplestore Scan node -- assertion is vacuous'
+         WHEN EXISTS (SELECT 1 FROM zsec_enr_log
+                       WHERE zsec_redacted AND zsec_ln LIKE '%zsec_enr_new%')
+           THEN 'FAIL: tuplestore name came back before T17'
+         WHEN EXISTS (SELECT 1 FROM zsec_enr_log
+                       WHERE NOT zsec_redacted AND zsec_ln LIKE '%zsec_enr_new%')
+           THEN 'CHANGED: EXPLAIN now prints the tuplestore name -- FR-15 is reachable after all, T17 has work here'
+         ELSE 'ok: absent with and without REDACT -- ExplainScanTarget is not called for this node type'
+       END AS tuplestore_name_verdict;
+--
+-- FR-40: one object, one pseudonym; two objects, two pseudonyms.
+--
+-- The self-join is the case that distinguishes the two halves of the rule, and
+-- it is also the case a naive "number the scans as you meet them" scheme gets
+-- wrong.  The two scans are the same table under different aliases, so the
+-- relation pseudonym must repeat while the alias pseudonyms must not.
+--
+SELECT * FROM zsec_plan('SELECT zsec_x.zsec_id FROM zsec_customers zsec_x JOIN zsec_customers zsec_y ON zsec_x.zsec_id = zsec_y.zsec_id',
+                        'COSTS OFF, REDACT');
+SELECT v.what,
+       (SELECT count(DISTINCT m[1]) FROM zsec_plan(v.qry, 'COSTS OFF, REDACT') l,
+             LATERAL regexp_matches(l, ' on (t[0-9]+)') m) AS relation_pseudonyms,
+       (SELECT count(DISTINCT m[1]) FROM zsec_plan(v.qry, 'COSTS OFF, REDACT') l,
+             LATERAL regexp_matches(l, ' on t[0-9]+ (a[0-9]+)') m) AS alias_pseudonyms
+  FROM (VALUES
+        ('one table joined to itself',
+         'SELECT zsec_x.zsec_id FROM zsec_customers zsec_x JOIN zsec_customers zsec_y ON zsec_x.zsec_id = zsec_y.zsec_id'),
+        ('two different tables',
+         'SELECT zsec_a.zsec_id FROM zsec_customers zsec_a JOIN zsec_orders zsec_b USING (zsec_id)')
+       ) AS v(what, qry)
+ ORDER BY v.what COLLATE "C";
+--
+-- The two-word tail.  ExplainTargetRel() prints the reference name only when it
+-- differs from the object name, and for an unaliased relation both now come from
+-- the same (kind, oid) lookup, so they are the same pointer and the tail stays
+-- one identifier.  That is a claim about pseudonym identity, not about string
+-- equality, and it is cheap to get wrong -- keying the reference name by
+-- range-table index would give "Seq Scan on t1 a1" and change the shape of every
+-- unaliased scan line in the feature.  Measured rather than reasoned about.
+--
+SELECT l AS scan_line, l ~ '^\s*Seq Scan on t[0-9]+$' AS tail_is_one_identifier
+  FROM zsec_plan('SELECT zsec_ssn FROM zsec_customers', 'COSTS OFF, REDACT') l
+ WHERE l LIKE '%Seq Scan%';
+-- Contrast: with a user-written alias the tail is two identifiers, as it is
+-- without redaction.
+SELECT l AS scan_line, l ~ '^\s*Seq Scan on t[0-9]+ a[0-9]+$' AS tail_is_two_identifiers
+  FROM zsec_plan('SELECT zsec_ssn FROM zsec_customers zsec_al', 'COSTS OFF, REDACT') l
+ WHERE l LIKE '%Seq Scan%';
+-- The one case where two unaliased RTEs collide: both are the same relation, so
+-- both want "t1", and set_rtable_names' uniquifier turns the second reference
+-- name into "t1_1" -- which then differs from the object name and prints.  The
+-- comment T07 left in that function claims pseudonyms make the uniquifier a
+-- no-op because generated names cannot collide.  They can, here.  The
+-- consequence is cosmetic and the unredacted plan has the identical shape
+-- ("zsec_customers zsec_customers_1"), so nothing is disclosed that was not
+-- disclosed before -- but the comment is wrong and T15's notes record it.
+SELECT * FROM zsec_plan('SELECT zsec_id FROM zsec_customers UNION ALL SELECT zsec_id FROM zsec_customers',
+                        'COSTS OFF, REDACT');
+--
+-- FR-13a: a partitioned parent puts TWO identifiers on one scan line -- the
+-- partition child as the object name, the parent as the reference name, because
+-- expand_single_inheritance_child() gives the child RTE an explicit alias
+-- carrying the parent's name.  T01's probe found this shape and recorded that
+-- T15 has to redact both; the alias is what makes the second one take the
+-- REDACT_ALIAS path rather than collapsing into the first.
+--
+SELECT l AS partition_scan_line,
+       l ~ '^\s*Seq Scan on t[0-9]+ a[0-9]+$' AS both_identifiers_pseudonymous
+  FROM zsec_plan('SELECT zsec_ssn FROM zsec_parted', 'COSTS OFF, REDACT') l
+ WHERE l LIKE '%Seq Scan%';
+--
+-- FR-11: no schema, in any format.
+--
+-- Text qualifies the object name as "schema.table" and the structured formats
+-- emit a separate Schema property, so the two have to be checked separately;
+-- and both only appear under VERBOSE, so a run without it would report a false
+-- clean.  The third clause is the anti-vacuity guard again: a record that named
+-- no relation at all would satisfy the first two trivially, which is exactly the
+-- state this file was in before T15.
+--
+SELECT fmt.name AS format,
+       CASE
+         WHEN s.b LIKE '%zsec_%' THEN 'FAIL: marker present'
+         WHEN s.b ~* 'schema'    THEN 'FAIL: Schema property emitted'
+         WHEN s.b !~ '\mt1\M'    THEN 'FAIL: no relation pseudonym printed -- assertion is vacuous'
+         ELSE 'ok: relation named, schema omitted'
+       END AS verdict
+  FROM (VALUES ('json'), ('text'), ('xml'), ('yaml')) AS fmt(name),
+       LATERAL (SELECT zsec_explain_blob('SELECT zsec_ssn FROM zsec_customers',
+                                         'COSTS OFF, VERBOSE, REDACT, FORMAT ' || fmt.name)) AS s(b)
+ ORDER BY fmt.name COLLATE "C";
+--
+-- Alias is NOT VERBOSE-gated in the structured formats.  It is emitted for every
+-- scanned relation in every record, including one with no user-written alias at
+-- all, where it repeats the relation pseudonym.  That makes it the widest surface
+-- T15 opened and it is invisible in text output, so a text-only test would miss
+-- a leak here entirely.
+--
+SELECT fmt.name AS format,
+       CASE
+         WHEN s.b LIKE '%zsec_%'              THEN 'FAIL: marker present'
+         WHEN s.b !~ 'Alias'                  THEN 'FAIL: no Alias property -- assertion is vacuous'
+         WHEN s.b !~ 'Alias[^a-z0-9]+t1'      THEN 'FAIL: Alias is not the relation pseudonym'
+         ELSE 'ok: Alias emitted without VERBOSE, holding the relation pseudonym'
+       END AS verdict
+  FROM (VALUES ('json'), ('xml'), ('yaml')) AS fmt(name),
+       LATERAL (SELECT zsec_explain_blob('SELECT zsec_ssn FROM zsec_customers',
+                                         'COSTS OFF, REDACT, FORMAT ' || fmt.name)) AS s(b)
+ ORDER BY fmt.name COLLATE "C";
+--
+-- Exemption: the negative control for the whole rule.
+--
+-- If pg_class came back as "t1" every leak assertion in this file would still
+-- pass and the feature would have made catalog queries unreadable for no gain.
+-- The schema is kept too, and only for exempt relations -- FR-11 drops it for a
+-- redacted one because a pseudonym qualified by a real schema hands back part of
+-- what the pseudonym was hiding.
+--
+SELECT fmt.name AS format,
+       CASE
+         WHEN s.b NOT LIKE '%pg_class%'   THEN 'FAIL: exempt relation was pseudonymized'
+         WHEN s.b NOT LIKE '%pg_catalog%' THEN 'FAIL: exempt schema was dropped'
+         ELSE 'ok: real name and real schema kept'
+       END AS verdict
+  FROM (VALUES ('json'), ('text'), ('xml'), ('yaml')) AS fmt(name),
+       LATERAL (SELECT zsec_explain_blob('SELECT relname FROM pg_class',
+                                         'COSTS OFF, VERBOSE, REDACT, FORMAT ' || fmt.name)) AS s(b)
+ ORDER BY fmt.name COLLATE "C";
+-- And the schema stays VERBOSE-gated for an exempt relation, exactly as it is
+-- without redaction: exemption restores the original code path, it does not add
+-- a new one.
+SELECT * FROM zsec_plan('SELECT relname FROM pg_class', 'COSTS OFF, REDACT');
+SELECT * FROM zsec_plan('SELECT relname FROM pg_class', 'COSTS OFF, VERBOSE, REDACT');
+--
+-- FR-92: the Replaces property, all three forms.
+--
+-- They differ in what follows the replacement type -- a relation name, a list of
+-- aliases, or nothing at all -- and the first two need a non-default
+-- constraint_exclusion while the third needs the default one plus an index on
+-- the aggregated column (zsec_idx_bal exists for it).  T01 established all
+-- three; this pins the redacted rendering of each.
+--
+SET constraint_exclusion = on;
+SELECT v.form, l AS replaces_line
+  FROM (VALUES
+        ('1 scan replaced -- carries a relation name',
+         'SELECT * FROM zsec_excluded WHERE zsec_k < 0'),
+        ('2 join replaced -- carries aliases',
+         'SELECT * FROM zsec_excluded zsec_ja JOIN zsec_excluded zsec_jb USING (zsec_k) WHERE zsec_ja.zsec_k < 0')
+       ) AS v(form, qry),
+       LATERAL zsec_plan(v.qry, 'COSTS OFF, REDACT') l
+ WHERE l LIKE '%Replaces%'
+ ORDER BY v.form COLLATE "C";
+RESET constraint_exclusion;
+SELECT l AS replaces_line_no_name
+  FROM zsec_plan('SELECT min(zsec_bal) FROM zsec_customers', 'COSTS OFF, REDACT') l
+ WHERE l LIKE '%Replaces%';
 
 --
 -- Parallel plans.  A worker's section is produced by the same ExplainNode code,
