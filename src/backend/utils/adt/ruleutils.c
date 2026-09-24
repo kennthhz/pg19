@@ -40,6 +40,7 @@
 #include "commands/defrem.h"
 #include "commands/explain_redact.h"
 #include "commands/tablespace.h"
+#include "common/hashfn.h"
 #include "common/keywords.h"
 #include "executor/spi.h"
 #include "funcapi.h"
@@ -9106,6 +9107,30 @@ get_parameter(Param *param, deparse_context *context)
 	 */
 	if (param->paramkind == PARAM_EXTERN && context->namespaces != NIL)
 	{
+		/*
+		 * Under redaction an external parameter always prints as "$n" and
+		 * never as a function argument name.  The branch below would
+		 * otherwise print "funcname.argname" or "argname", both identifiers
+		 * the user wrote.
+		 *
+		 * Like the operator-class guard in get_rule_expr(), this is not
+		 * reachable from EXPLAIN today.  The only code that fills in argnames
+		 * is print_function_sqlbody(), which builds its own deparse_namespace
+		 * for pg_get_functiondef() and never turns redaction on, so on the
+		 * EXPLAIN path argnames is always NULL and control already reaches
+		 * the "$n" fallback at the end of this function.  Nothing observable
+		 * changes; the guard is here so that a future caller supplying
+		 * argument names cannot leak them.
+		 *
+		 * It repeats that fallback rather than jumping to it, which keeps
+		 * this change an insertion with no existing line moved.
+		 */
+		if (context->redact != NULL)
+		{
+			appendStringInfo(context->buf, "$%d", param->paramid);
+			return;
+		}
+
 		dpns = llast(context->namespaces);
 		if (dpns->argnames &&
 			param->paramid > 0 &&
@@ -10753,6 +10778,41 @@ get_rule_expr(Node *node, deparse_context *context,
 			break;
 
 		case T_CurrentOfExpr:
+
+			/*
+			 * A cursor name is redacted (FR-97).  It is an identifier the
+			 * application chose, and it reaches plan output here: EXPLAIN of
+			 * an "UPDATE ... WHERE CURRENT OF c" prints it inside the TID
+			 * Cond.
+			 *
+			 * Only the named branch needs this.  The other branch prints
+			 * "CURRENT OF $n" from cursor_param, which is a parameter index
+			 * the parser assigned and not anything the user wrote, so it is
+			 * left as it is and this guard falls through to it.
+			 *
+			 * The pseudonym is keyed on a hash of the name because
+			 * explain_redact_local() keys on two integers and a cursor has no
+			 * numeric identity to offer.  The hash is only ever a hash-table
+			 * key; it is never printed and nothing is derived from it.  A
+			 * hash rather than a fixed key so that two different cursors in
+			 * one record cannot both come out as "cur1" -- a data-modifying
+			 * CTE can carry a second DELETE with its own WHERE CURRENT OF,
+			 * which puts two of these in one plan.  Two names that happened
+			 * to hash alike would share a pseudonym, which costs readability
+			 * and leaks nothing.
+			 */
+			if (context->redact != NULL &&
+				((CurrentOfExpr *) node)->cursor_name != NULL)
+			{
+				char	   *curname = ((CurrentOfExpr *) node)->cursor_name;
+				int			curkey = (int) hash_bytes((const unsigned char *) curname,
+													  strlen(curname));
+
+				appendStringInfo(buf, "CURRENT OF %s",
+								 explain_redact_local(context->redact,
+													  REDACT_CURSOR, curkey, 0));
+				break;
+			}
 			{
 				CurrentOfExpr *cexpr = (CurrentOfExpr *) node;
 
@@ -10822,6 +10882,61 @@ get_rule_expr(Node *node, deparse_context *context,
 				{
 					Oid			inferopclass = iexpr->inferopclass;
 					Oid			inferopcinputtype = get_opclass_input_type(iexpr->inferopclass);
+
+					/*
+					 * The operator class of an ON CONFLICT inference element
+					 * is redacted (FR-98c).  An operator class is a catalog
+					 * object, so it takes a pseudonym only when it is not
+					 * exempt; a built-in class such as text_pattern_ops is
+					 * exempt and keeps its real name, printed by the call
+					 * below.
+					 *
+					 * The guard sits at this call site and NOT inside
+					 * get_opclass_name(), which is the opposite of where the
+					 * tablefunc guard went, and the reason is worth spelling
+					 * out because the next reader will otherwise want to
+					 * "fix" it. get_opclass_name() is handed a bare
+					 * StringInfo and no deparse context, so it cannot tell
+					 * whether redaction is active.  Its other two callers are
+					 * pg_get_indexdef_worker() and the partition-bound
+					 * printer, both of which produce DDL that has to name
+					 * real objects and must never redact.  A guard inside the
+					 * function would corrupt pg_get_indexdef() output.
+					 *
+					 * Not reachable from EXPLAIN today, so this ships as a
+					 * guard verified by a direct deparse call rather than by
+					 * SQL. InferenceElem nodes hang off the Query's
+					 * OnConflictExpr; the planner reduces them to a list of
+					 * index OIDs on the ModifyTable node, and EXPLAIN builds
+					 * "Conflict Arbiter Indexes" from those OIDs without ever
+					 * deparsing an inference element.  Keep the guard: if the
+					 * path becomes reachable it is already safe.
+					 *
+					 * The break leaves the enclosing switch in
+					 * get_rule_expr(). Nothing else in this case follows the
+					 * operator class, and context->varprefix has already been
+					 * restored above.
+					 */
+					if (context->redact != NULL &&
+						!explain_redact_exempt(context->redact, REDACT_OPCLASS,
+											   inferopclass))
+					{
+						/*
+						 * get_opclass_name() prints nothing at all when the
+						 * opclass is the default for the input type, and the
+						 * pseudonym has to do the same.  A user-defined class
+						 * can be a type's default, and printing "opc1" for it
+						 * would tell the reader an operator class had been
+						 * specified when none was.
+						 */
+						if (GetDefaultOpClass(inferopcinputtype,
+											  get_opclass_method(inferopclass)) != inferopclass)
+							appendStringInfo(buf, " %s",
+											 explain_redact_name(context->redact,
+																 REDACT_OPCLASS,
+																 inferopclass));
+						break;
+					}
 
 					get_opclass_name(inferopclass, inferopcinputtype, buf);
 				}
@@ -11650,6 +11765,44 @@ get_func_sql_syntax(FuncExpr *expr, deparse_context *context)
 		case F_EXTRACT_TEXT_INTERVAL:
 			/* EXTRACT (x FROM y) */
 			appendStringInfoString(buf, "EXTRACT(");
+
+			/*
+			 * The field is redacted (FR-98d).  "EXTRACT(field FROM x)" reads
+			 * as though the field could only ever be a keyword such as year
+			 * or month, but it is an ordinary text constant and the grammar
+			 * accepts any string at all.  The "unit not recognized" error
+			 * that would reject a bad one is raised at execution time, and
+			 * EXPLAIN without ANALYZE does not execute, so whatever the user
+			 * wrote is planned, deparsed and printed.  Measured:
+			 *
+			 * EXPLAIN (COSTS OFF, VERBOSE) SELECT EXTRACT('any text at all'
+			 * FROM now());
+			 *
+			 * prints the string straight back in the Output list.  So the
+			 * field is user-controlled text and gets the same "?" as any
+			 * other redacted constant.
+			 *
+			 * This site needs a guard of its own because it reads the datum
+			 * directly out of the Const instead of going through
+			 * get_const_expr(), so the redaction applied there does not reach
+			 * it.
+			 *
+			 * Replaced unconditionally rather than checked against the real
+			 * field names: losing "year" versus "month" is accepted, and an
+			 * allowlist would be one more list to keep in step with the
+			 * date/time code.
+			 *
+			 * The two normalization-form sites below -- "x IS <form>
+			 * NORMALIZED" and "NORMALIZE(x, <form>)" -- look like the same
+			 * pattern and are deliberately left alone.  There the form is a
+			 * grammar keyword rather than an expression: "x IS 'whatever'
+			 * NORMALIZED" and "NORMALIZE(x, 'whatever')" are both syntax
+			 * errors, so only NFC, NFD, NFKC and NFKD can ever reach those
+			 * lines and nothing user-derived can.
+			 */
+			if (context->redact != NULL)
+				appendStringInfoChar(buf, '?');
+			else
 			{
 				Const	   *con = (Const *) linitial(expr->args);
 

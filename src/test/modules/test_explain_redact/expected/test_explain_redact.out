@@ -895,6 +895,118 @@ SELECT test_redact_deparse(
 -- carried as such into T21; see the task plan.  The two constructs above and
 -- below it share the same one-token-and-return shape, so what is untested is the
 -- placement of that guard, not the collapse itself.
+--
+-- T14: the remaining leaf sites -- EXTRACT's field, and four guards.
+--
+-- What is testable here was measured before anything was written, and the
+-- measurement is what decided the test set.  test_redact_deparse() deparses the
+-- top plan node's target list, so a site that only ever appears in a qual, or in
+-- a child node, cannot be reached from here at all:
+--
+--   FR-98d, the EXTRACT field -- REACHABLE, and tested below.
+--
+--   FR-97, the cursor name -- NOT reachable.  A CurrentOfExpr only ever appears
+--       in an UPDATE/DELETE qual.  Measured: the same UPDATE through this
+--       harness returns the empty string without RETURNING, because a
+--       ModifyTable has no target list of its own, and returns just the
+--       RETURNING column with one; while plain EXPLAIN (COSTS OFF, VERBOSE) on
+--       that statement shows "TID Cond: CURRENT OF zcur_secret" on the Tid Scan
+--       below it.  The guard is right and the site is real, but nothing this
+--       harness can ask will exercise it.
+--
+--   FR-99, nextval() -- NOT reachable either, one level down rather than in a
+--       qual.  "INSERT INTO t (col) VALUES ('x')" puts nextval('t_id_seq') in
+--       the target list of the Result node feeding the ModifyTable, and this
+--       harness does not descend.  Measured: the empty string from the harness,
+--       against "Output: nextval('zt_zid_seq'::regclass), 'x'::text, ..." on the
+--       Result in plain EXPLAIN (VERBOSE).  Note this is the FR-61 shape going
+--       untested, not a T14 edit: T10 already routed that call through
+--       generate_relation_name(..., redact), and T14 changed nothing here.
+--
+--   FR-98c, the inference-element operator class, and get_parameter()'s
+--       function/argument-name branch -- NOT reachable by construction rather
+--       than by harness shape.  The planner reduces ON CONFLICT inference
+--       elements to a list of index OIDs before EXPLAIN sees them, and the only
+--       code that fills in argnames builds its own deparse context with
+--       redaction off.  Both reasons are written out at the guards themselves.
+--       No SQL is written for either.
+--
+-- The three unreachable ones ship as guards, which is exactly what T13 did with
+-- get_tablefunc(), and they are carried into T21 as such.  Adding a harness
+-- entry point to reach them was considered and rejected: an entry point that
+-- exists only so that a test can pass does not show the production path works.
+--
+-- The fixtures below carry a non-redacted sibling column in the same target list
+-- for the same reason T13's do.  Without it, "no secret in the output" cannot be
+-- told apart from output that was blanked wholesale -- the way this work has
+-- gone green four times while proving nothing.
+ALTER TABLE zsec_t02.zsec_c ADD COLUMN c_when timestamptz;
+-- The last two rows are negative controls, and they are the assertion that would
+-- fail if someone later "fixed" the two normalization-form sites next door to the
+-- EXTRACT one.  Those forms cannot carry user data: the form is a grammar
+-- keyword, so "x IS 'anything' NORMALIZED" and "NORMALIZE(x, 'anything')" are
+-- both syntax errors and only NFC/NFD/NFKC/NFKD can ever reach those lines.  They
+-- stay on the same footing as the built-in operator names T10 keeps.  (The parser
+-- also supplies the form when it is omitted, so both sites are always exercised
+-- -- "x IS NORMALIZED" deparses as "x IS NFC NORMALIZED".  Leaving them alone had
+-- to be a decision, not an oversight.)
+SELECT what,
+       test_redact_deparse(qry, false) AS plain,
+       test_redact_deparse(qry, true)  AS redacted
+  FROM (VALUES
+    ('EXTRACT field',
+     'SELECT c_second, EXTRACT(year FROM c_when) FROM zsec_c'),
+    -- The row that shows why the field is redacted at all.  It reads like a
+    -- keyword, but it is an ordinary text constant and the grammar takes any
+    -- string: the "unit not recognized" error is raised at execution, and EXPLAIN
+    -- without ANALYZE does not execute, so the user's string is planned, deparsed
+    -- and printed.  Unredacted, the marker is right there in the output.
+    ('EXTRACT user text',
+     'SELECT c_second, EXTRACT(''zsecdata-secret'' FROM c_when) FROM zsec_c'),
+    -- A second SQL-syntax EXTRACT overload (interval, not timestamptz), so the
+    -- fixture does not pass on one F_EXTRACT_* case while another goes unguarded.
+    ('EXTRACT interval',
+     'SELECT c_second, EXTRACT(day FROM (c_when - c_when)) FROM zsec_c'),
+    -- Two fields in one target list: both become "?", so no reader can recover
+    -- year-versus-month by comparing them.  That loss is accepted (see FR-98d).
+    ('EXTRACT two fields',
+     'SELECT c_second, EXTRACT(year FROM c_when), EXTRACT(month FROM c_when) FROM zsec_c'),
+    ('IS NORMALIZED form kept',
+     'SELECT c_second, c_second IS NFC NORMALIZED FROM zsec_c'),
+    ('NORMALIZE form kept',
+     'SELECT c_second, NORMALIZE(c_second, NFKD) FROM zsec_c')
+  ) AS t(what, qry)
+ ORDER BY what COLLATE "C";
+          what           |                                        plain                                         |                            redacted                            
+-------------------------+--------------------------------------------------------------------------------------+----------------------------------------------------------------
+ EXTRACT field           | zsec_c.c_second, EXTRACT(year FROM zsec_c.c_when)                                    | t1.t1_c2, EXTRACT(? FROM t1.t1_c10)
+ EXTRACT interval        | zsec_c.c_second, EXTRACT(day FROM (zsec_c.c_when - zsec_c.c_when))                   | t1.t1_c2, EXTRACT(? FROM (t1.t1_c10 - t1.t1_c10))
+ EXTRACT two fields      | zsec_c.c_second, EXTRACT(year FROM zsec_c.c_when), EXTRACT(month FROM zsec_c.c_when) | t1.t1_c2, EXTRACT(? FROM t1.t1_c10), EXTRACT(? FROM t1.t1_c10)
+ EXTRACT user text       | zsec_c.c_second, EXTRACT("zsecdata-secret" FROM zsec_c.c_when)                       | t1.t1_c2, EXTRACT(? FROM t1.t1_c10)
+ IS NORMALIZED form kept | zsec_c.c_second, (zsec_c.c_second IS NFC NORMALIZED)                                 | t1.t1_c2, (t1.t1_c2 IS NFC NORMALIZED)
+ NORMALIZE form kept     | zsec_c.c_second, NORMALIZE(zsec_c.c_second, NFKD)                                    | t1.t1_c2, NORMALIZE(t1.t1_c2, NFKD)
+(6 rows)
+
+-- FR-98d on the marker string itself, the same pair T13 uses for the PASSING
+-- label.  Two booleans rather than one NOT LIKE, because a bare NOT LIKE is also
+-- satisfied by a harness that returned nothing at all -- and because the field is
+-- read straight off the Const datum, so FR-24's placeholder never reached it.
+SELECT test_redact_deparse(
+         'SELECT c_second, EXTRACT(''zsecdata-secret'' FROM c_when) FROM zsec_c',
+         false) LIKE '%zsecdata-secret%' AS extract_field_leaks_unredacted;
+ extract_field_leaks_unredacted 
+--------------------------------
+ t
+(1 row)
+
+SELECT test_redact_deparse(
+         'SELECT c_second, EXTRACT(''zsecdata-secret'' FROM c_when) FROM zsec_c',
+         true) NOT LIKE '%zsecdata-secret%' AS extract_field_absent_redacted;
+ extract_field_absent_redacted 
+-------------------------------
+ t
+(1 row)
+
 RESET search_path;
 DROP SCHEMA zsec_t02 CASCADE;
 NOTICE:  drop cascades to 13 other objects

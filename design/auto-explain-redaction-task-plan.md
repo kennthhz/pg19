@@ -840,16 +840,92 @@ happen rather than absorbed silently:
 
 #### T14 — Layer B: remaining leaf sites
 
-**Delivers.** `T_CurrentOfExpr` cursor name (`:10403`); `T_NextValueExpr`
-(`:10419`), preserving the `nextval('…')` literal shape (FR-99/FR-61); the
-three raw-datum constants in `get_func_sql_syntax()` (`:11284`, `:11306`,
-`:11330`); the `T_InferenceElem` collation and `get_opclass_name()` guard
-(`:10460`, `:10468`, `:13123`/`:13128`) — not reachable from EXPLAIN today, so
-implemented as a guard and verified by direct call, not by SQL;
-`get_parameter()`'s function/argument-name branch guard (`:8836-8842`).
+*(rev. T14: rewritten to match what was built. This section listed six items.
+Four needed code; two were already covered by earlier tasks, and two of the
+"three raw-datum constants" turned out to be sites that must **not** change.
+Line numbers below are as landed, not the stale ones this plan carried.)*
 
-**Tests.** §10.2 FR-97, FR-98c, FR-98d, FR-99 fixtures. For FR-99 assert the
-literal shape survives, not just that the name is gone.
+**Delivered.** Four insertions in `ruleutils.c` plus one `#include` — 144
+insertions, **0 deletions**, which is the whole safety argument for the task:
+no existing line moved, so nothing that was printing before can have stopped.
+
+1. **`T_CurrentOfExpr` cursor name** (FR-97, `:10781-10812`). An early-exit
+   guard above the untouched block, taken only when `cursor_name` is non-NULL,
+   printing `CURRENT OF cur1`. The `cursor_param` branch is deliberately
+   untouched: it prints `$n`, a parser-assigned index, not anything the user
+   wrote. Keyed on `hash_bytes()` of the name, because `explain_redact_local()`
+   keys on two integers and a cursor has no numeric identity to offer. A fixed
+   key would collapse every cursor in one record to `cur1`, and that is
+   reachable — a data-modifying CTE can hold a second `DELETE … WHERE CURRENT
+   OF`, putting two TidScans in one plan. The hash is only ever a hash-table
+   key, never printed. Needs `#include "common/hashfn.h"`.
+2. **`EXTRACT` field** (FR-98d, `:11793-11796`). `if (redact) '?' else` inserted
+   in front of the existing brace block, which becomes the `else` body at its
+   existing indentation. The field is user-controlled text, not a keyword; see
+   the FR-98d amendment for the measurement.
+3. **Inference-element operator class** (FR-98c, `:10883-10932`). Guard at the
+   **call site**, with the exemption test and a replica of `get_opclass_name()`'s
+   default-opclass suppression, then `break` out of `get_rule_expr()`'s switch.
+   `get_opclass_name()` itself is untouched, and that placement is the point:
+   it takes a bare `StringInfo` and no deparse context, and its other two
+   callers (`pg_get_indexdef_worker()`, the partition-bound printer) emit DDL
+   that must name real objects — a guard inside it would corrupt
+   `pg_get_indexdef()` output. The `break` is safe because `context->varprefix`
+   is restored above it and nothing but closing braces follows the call.
+4. **`get_parameter()`'s argnames branch** (`:9124-9130`). Guard at the top of
+   the `PARAM_EXTERN` branch, printing `$n` and returning. It repeats the
+   function's own fallback rather than jumping to it, again to keep the change
+   an insertion with no line moved.
+
+**Already covered — no edit needed.** Both were listed here as work and were
+not:
+
+- **`T_NextValueExpr`** (FR-99, `:10419` → `:10768`). Already reads
+  `generate_relation_name(…, context->redact)` since **T10**. FR-99 is a
+  verification fixture, not an edit.
+- **The inference-element *collation*** (`:10460` → `:10818`). Already
+  `redact_collation_name()` since **T11**.
+
+**Must not change — two of the "three raw-datum constants."**
+`IS <form> NORMALIZED` (`:11825`) and `NORMALIZE(…, <form>)` (`:11849`) are
+grammar keywords, not expressions: both non-keyword variants are syntax errors,
+so nothing user-derived can reach those lines. Kept, on the same footing as the
+built-in operator names T10 keeps, and pinned by a negative control so a future
+"fix" fails. Also untouched: `get_opclass_name()` itself (`:13768`) and its two
+other callers (`:1525`, `:2130`); the hashed-SubPlan `.colN` print (`:9096`,
+which is T19's).
+
+**Tests.** What was testable was **measured first**, and the measurement decided
+the set. `test_redact_deparse()` deparses the top plan node's target list, so:
+
+| fixture | reachable from the harness? | evidence |
+|---|---|---|
+| FR-98d `EXTRACT` | **yes** | `t1.t1_c2, EXTRACT(? FROM t1.t1_c10)` |
+| FR-97 cursor name | **no** — qual only | harness returns `''` for the UPDATE; plain `EXPLAIN (VERBOSE)` shows `TID Cond: CURRENT OF zcur_secret` on the Tid Scan |
+| FR-99 `nextval` shape | **no** — child node | harness returns `''`; the `NextValueExpr` is in the **Result** node's target list, one level below the ModifyTable |
+| FR-98c opclass | **no** — by construction | planner reduces inference elements to index OIDs before EXPLAIN |
+| `get_parameter()` argnames | **no** — by construction | only `print_function_sqlbody()` sets `argnames`, on a context with redaction off |
+
+Landed in `src/test/modules/test_explain_redact`: six EXTRACT/normalization rows
+plus a `LIKE`/`NOT LIKE` pair on a marker field string. Every fixture carries a
+non-redacted sibling column in the same target list — T13's anti-vacuity
+control, without which a green result cannot be told apart from output that was
+blanked wholesale. Two of the six rows are the normalization negative control.
+
+**Ships untested, carried into T21.** The cursor name (FR-97), the `nextval`
+shape (FR-99/FR-61), the opclass guard (FR-98c) and the `get_parameter` guard.
+Same treatment as T13's `get_tablefunc()` guard, and for the same reason: a
+harness entry point added only so that a test can pass does not show the
+production path works. T21 must verify FR-97 and FR-99 through
+`EXPLAIN (REDACT)` once expression properties are un-suppressed — they are on
+that task's list, not discharged here.
+
+**Carried defect, not T14's.** The inference-element path does not honour FR-60:
+`get_opclass_input_type()` and `get_opclass_name()` both `elog(ERROR)` on a
+concurrently dropped operator class, at base as well as after this change. It is
+only FR-60-clean today because the path is unreachable — which is precisely the
+vacuity this work keeps hitting, in a fourth guise. Whoever makes the path
+reachable owns it.
 
 ---
 

@@ -264,7 +264,7 @@ has a test in §10.
 | FR-95 | XML construction names: the `XMLELEMENT`/`XMLPI` element name, the `XMLATTRIBUTES`/`XMLFOREST` attribute labels, `XMLNAMESPACES` prefixes, and the `COLUMNS` column names of an `XMLTABLE`. These are plain strings on the expression node, **not** constants, so FR-21 does not reach them. Note these appear in `Filter`, which is not `VERBOSE`-gated — not only in the `VERBOSE`-only table-function property. | the construct is **collapsed**: an `XmlExpr` prints as `XMLEXPR(...)`, an `XMLTABLE` table function as `XMLTABLE(...)`, and nothing inside either is deparsed, so none of these names is printed at all. *(rev. T13: was `xml1`, `xml2`, … Pseudonymizing the names **inside** XML and JSON payloads was abandoned as a corner case that did not pay for itself. It took ten guarded deparse sites, five helpers, a pre-order walk of the path tree to keep a `PLAN` clause agreeing with the path labels it names, and a search of the range table for the node's own `varno` to keep a `COLUMNS` entry agreeing with the `Output` list — and that last one has a failure mode, measured as reachable, where a parameterized `LATERAL` scan copies the `TableFunc`, the pointer search finds nothing, and the two disagree. Collapsing costs three guards and is leak-proof by inspection. The keyword is kept, not blanked: it is SQL vocabulary rather than user data, on the same footing as the `pg_catalog` function and operator names §10.4 pins as still printing, and it tells a reader what kind of thing stood here instead of leaving an unexplained gap. **Given up deliberately:** a `Var` inside a collapsed construct no longer prints its column pseudonym, so the record no longer shows which columns fed the construct.)* |
 | FR-96 | JSON/XML path *labels* and `PASSING` labels: the `… AS <name>` given to a `JSON_TABLE` root path, to each `NESTED PATH`, to each name in a `PLAN` clause, and to each `PASSING` argument of `JSON_TABLE`/`JSON_QUERY`/`JSON_VALUE`/`JSON_EXISTS`/`XMLTABLE`, plus a `JSON_TABLE` `COLUMNS` column name. FR-24 covers the path *string* because it is a constant; these labels are raw identifiers. | collapsed exactly as in FR-95: a `JSON_QUERY`/`JSON_VALUE`/`JSON_EXISTS` expression prints as `JSONEXPR(...)` and a `JSON_TABLE` table function as `JSON_TABLE(...)`. *(rev. T13: was `path1`, `path2`, … / `arg1`, …; same rationale and same deliberate loss as FR-95, whose note carries both. `JSON_OBJECT` and `JSON_ARRAY` are **not** collapsed and need no guard — they carry no raw identifier, their keys are `Const`s, and they already print as `JSON_OBJECT(?::unknown : t1_c1 …)` under FR-21.)* |
 | FR-97 | Cursor names, printed as `CURRENT OF <name>` inside the `TID Cond` of an `UPDATE`/`DELETE … WHERE CURRENT OF`. Cursor names are application-chosen identifiers. | `cur1`, `cur2`, … |
-| FR-98 | Names and values that reach output through a *second*, non-primary code path, and are therefore missed by a fix applied only at the primary path: (a) the `COLLATE` and `USING` decorations appended to sort keys, which are assembled from a raw collation-name and a raw operator-name lookup **after** expression deparsing has finished; (b) collation names attached by an explicit `COLLATE` expression and by an `ON CONFLICT` inference element; (c) operator-class names, including their schema qualification, printed for an inference element; (d) constants read directly out of the node datum by the SQL-syntax function printer (`EXTRACT(<field> FROM …)`, `IS <form> NORMALIZED`, `NORMALIZE(…, <form>)`). | per FR-19 / FR-20 / FR-21 as applicable; `opc1` for operator classes |
+| FR-98 | Names and values that reach output through a *second*, non-primary code path, and are therefore missed by a fix applied only at the primary path: (a) the `COLLATE` and `USING` decorations appended to sort keys, which are assembled from a raw collation-name and a raw operator-name lookup **after** expression deparsing has finished; (b) collation names attached by an explicit `COLLATE` expression and by an `ON CONFLICT` inference element; (c) operator-class names, including their schema qualification, printed for an inference element; (d) constants read directly out of the node datum by the SQL-syntax function printer — the `EXTRACT(<field> FROM …)` field. ~~`IS <form> NORMALIZED`, `NORMALIZE(…, <form>)`~~ *(rev. T14: the two normalization forms are **deliberately kept**. They read like the same pattern, and they are not: the form is a grammar keyword, so no user-derived string can reach those lines. Measured, both variants are syntax errors. Same footing as the built-in operator names FR-19 exempts.)* | per FR-19 / FR-20 / FR-21 as applicable; `opc1` for operator classes |
 | FR-99 | Sequence names. A serial/identity default is printed as `nextval('<sequence>')` in an `INSERT` target list. *(Amends FR-10's object list, which did not name sequences.)* | per FR-10 (`t1`); note the pseudonym is emitted **inside** a quoted literal, so the surrounding `nextval('…')` shape must be preserved (FR-61) |
 
 ### 5.3 Items that must be preserved
@@ -643,6 +643,15 @@ ROLLBACK;
 ```
 Assert: no `zcur_secret`; `TID Cond` contains `CURRENT OF cur1`.
 
+*(rev. T14: the code ships **untested**, and this fixture is the reason —
+it needs `EXPLAIN (REDACT)` to print expression properties, which T21 does.
+The deparse harness cannot substitute: measured, a `CurrentOfExpr` only ever
+appears in an UPDATE/DELETE qual, so the same statement through
+`test_redact_deparse()` returns the empty string without RETURNING and only the
+RETURNING column with one, while plain `EXPLAIN (VERBOSE)` shows
+`TID Cond: CURRENT OF zcur_secret` on the Tid Scan below the ModifyTable.
+Carried into T21 on the same footing as T13's `get_tablefunc()` guard.)*
+
 **FR-98(a) — sort-key `COLLATE` / `USING`, assembled after deparse.** [V]
 Site: explain.c:2866 (`get_collation_name`), 2881 (`get_opname`). These are
 appended to the sort-key string in explain.c, *after* `deparse_expression()`
@@ -673,19 +682,83 @@ the redaction branch anyway, and assert by code inspection (or a
 `deparse_expression()` unit call) rather than by SQL. Delete the guard only if
 someone proves the path can never become reachable.
 
+*(rev. T14: landed, and unreachability re-confirmed by reading the planner
+rather than taken from this note — `arbiterElems` hangs off the Query's
+`OnConflictExpr`, `createplan.c` reduces it to `ModifyTable.arbiterIndexes`, a
+list of index OIDs, and that is what explain.c iterates. The `InferenceElem`
+list is never copied into the plan. The guard therefore sits at the **call
+site** in `get_rule_expr()`, not inside `get_opclass_name()`: that function
+takes a bare `StringInfo` and no deparse context, so it cannot tell whether
+redaction is on, and its other two callers — `pg_get_indexdef_worker()` and the
+partition-bound printer — emit DDL that must name real objects. A guard inside
+it would corrupt `pg_get_indexdef()`. The guard also replicates the function's
+suppression of a type's default opclass, so a user-defined default does not
+start printing `opc1` where nothing printed before. Verified by inspection; no
+SQL, and none invented.*
+
+*One thing this path does **not** honour, noted here because it is the same
+vacuity in another guise: FR-60. Both `get_opclass_input_type()` and
+`get_opclass_name()` `elog(ERROR)` on a concurrently dropped operator class, at
+base as well as after T14. Not a regression and not T14's to fix — but the path
+is only FR-60-clean today because it is unreachable, which is worth exactly
+nothing the moment it becomes reachable. Whoever makes it reachable owns this.)*
+
 **FR-98(d) — constants read straight from the node datum.** [V]
 Sites: ruleutils.c:11284 (`EXTRACT` field), 11306 (`IS … NORMALIZED`), 11330
 (`NORMALIZE`). These bypass the constant printer entirely.
 
+~~All three need FR-21 treatment.~~ *(rev. T14: narrowed to one of the three,
+and the narrowing is a measurement rather than a judgement. Only the `EXTRACT`
+field can carry user data; the two normalization forms cannot, and are kept.)*
+
+**The `EXTRACT` field is redacted, unconditionally.** It reads as though it
+could only ever be a keyword such as `year` or `month`, but it is an ordinary
+text constant and the grammar accepts any string at all. The "unit not
+recognized" error that would reject a bad one is raised at *execution*, and
+EXPLAIN without ANALYZE does not execute — so whatever the user wrote is
+planned, deparsed and printed. Measured:
+
 ```sql
-SELECT zid FROM zcustomers WHERE EXTRACT(year FROM zcol_when) = 2020;
-SELECT zid FROM zcustomers WHERE zcol_ssn IS NFC NORMALIZED;
-SELECT normalize(zcol_ssn, NFKC) FROM zcustomers;
+EXPLAIN (COSTS OFF, VERBOSE) SELECT EXTRACT('zsecdata-secret' FROM now());
+--  Result
+--    Output: EXTRACT("zsecdata-secret" FROM now())
 ```
-Assert: the value `2020` is rendered `?`; the record is well-formed; the
-field/form keywords (`year`, `NFC`, `NFKC`) may remain, since they are
-grammar keywords rather than data — but the test must pin that choice so a
-future change to redact them is deliberate.
+
+So the field is user-controlled text and takes the same `?` as any other
+redacted constant. Replaced unconditionally rather than checked against an
+allowlist of valid units: that alternative was **rejected** as a second list to
+keep in step with the date/time code, and losing `year` versus `month` is
+accepted.
+
+**The `IS <form> NORMALIZED` and `NORMALIZE(…, <form>)` forms are kept.** They
+cannot carry user data. The form is a grammar keyword, not an expression, so
+only `NFC`/`NFD`/`NFKC`/`NFKD` can ever reach those lines. Measured — both
+non-keyword variants fail to parse, before planning, before deparse:
+
+```sql
+SELECT 'x' IS 'zsecdata-secret' NORMALIZED;  -- ERROR: syntax error
+SELECT NORMALIZE('x', 'zsecdata-secret');    -- ERROR: syntax error
+```
+
+Same footing as the built-in operator names FR-19 exempts: PostgreSQL's own
+words, disclosing nothing, and worth keeping because a reader needs them.
+Note the parser supplies the form when it is omitted (`x IS NORMALIZED`
+deparses as `x IS NFC NORMALIZED`), so both sites are always exercised — which
+is why leaving them alone had to be a decision rather than an omission.
+
+```sql
+SELECT c_second, EXTRACT(year FROM c_when) FROM zsec_c;
+SELECT c_second, EXTRACT('zsecdata-secret' FROM c_when) FROM zsec_c;
+SELECT c_second, c_second IS NFC NORMALIZED FROM zsec_c;
+SELECT c_second, NORMALIZE(c_second, NFKD) FROM zsec_c;
+```
+Assert: the field is rendered `?` and the marker string is absent, while `NFC`
+and `NFKD` still print and the sibling column still carries its pseudonym. The
+last part is not decoration — without a sibling that prints, "no marker in the
+output" cannot be told apart from output that was blanked wholesale. Verified
+by `test_redact_deparse()` in `src/test/modules/test_explain_redact`, which
+reaches this site through a plan's target list; the two normalization rows are
+the negative control that fails if either form is ever "fixed".
 
 **FR-99 — sequence name inside a quoted literal.** [V]
 Site: ruleutils.c:10419 (`nextval('…')` via `generate_relation_name`).
@@ -696,6 +769,16 @@ EXPLAIN (REDACT, VERBOSE) INSERT INTO zcustomers (zcol_ssn) VALUES ('x');
 Assert: no `zcustomers_zid_seq`; the output still has the shape
 `nextval('t2'::regclass)` or `nextval('t2')` — the surrounding literal must
 not be destroyed (FR-61).
+
+*(rev. T14: **no edit was needed** — T10 already routed this call through
+`generate_relation_name(…, redact)`, so the name half is covered. What remains
+unverified is the FR-61 *shape*, and this fixture is still the only vehicle for
+it. Measured, the deparse harness cannot stand in: for
+`INSERT INTO t (col) VALUES ('x')` the `NextValueExpr` sits in the target list
+of the **Result** node feeding the ModifyTable — plain `EXPLAIN (VERBOSE)` shows
+`Output: nextval('zt_zid_seq'::regclass), 'x'::text, …` there — and the harness
+deparses only the top node's target list, returning the empty string. Deferred
+to T21.)*
 
 **FR-46 — columns of range-table entries that have no relid.** [V]
 This is the structural test for the key-domain fix. Each fixture names its
