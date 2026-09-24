@@ -803,6 +803,26 @@ explain_redact_context(ExplainState *es)
 }
 
 /*
+ * The map to pass to a deparse that runs in both modes, which is NULL when not
+ * redacting.
+ *
+ * The function above asserts es->redact, because its callers all sit inside an
+ * "if (es->redact)" and a NULL return would be a bug there.  The expression
+ * deparse sites are the other shape: with the suppressions lifted they run
+ * unconditionally and hand the map straight to deparse_expression_redacted(),
+ * where NULL is well defined and means "do not redact".  Writing that as a
+ * ternary at each of the eight sites would put the es->redact test back at the
+ * call sites, one per site to get wrong; this keeps the decision in one place,
+ * for the same reason show_sortorder_options() and explain_get_index_name()
+ * take the ExplainState rather than a finished name.
+ */
+static RedactCtx *
+explain_redact_context_or_null(ExplainState *es)
+{
+	return es->redact ? explain_redact_context(es) : NULL;
+}
+
+/*
  * Reference name to print for a range-table entry under redaction, for the
  * cases where es->rtable_names holds NULL.
  *
@@ -2791,17 +2811,6 @@ show_plan_tlist(PlanState *planstate, List *ancestors, ExplainState *es)
 	bool		useprefix;
 	ListCell   *lc;
 
-	/*
-	 * Redaction drops every expression that would be printed.
-	 *
-	 * The checks for it sit in the seven functions that actually call the
-	 * expression printer, rather than at the thirty-odd places that call
-	 * those functions.  Putting them here means a new caller added later is
-	 * covered from the start, instead of leaking until somebody notices.
-	 */
-	if (es->redact)
-		return;
-
 	/* No work if empty tlist (this occurs eg in bitmap indexscans) */
 	if (plan->targetlist == NIL)
 		return;
@@ -2840,8 +2849,9 @@ show_plan_tlist(PlanState *planstate, List *ancestors, ExplainState *es)
 		TargetEntry *tle = (TargetEntry *) lfirst(lc);
 
 		result = lappend(result,
-						 deparse_expression((Node *) tle->expr, context,
-											useprefix, false));
+						 deparse_expression_redacted((Node *) tle->expr,
+													 context, useprefix, false,
+													 explain_redact_context_or_null(es)));
 	}
 
 	/* Print results */
@@ -2860,14 +2870,14 @@ show_expression(Node *node, const char *qlabel,
 	char	   *exprstr;
 
 	/*
-	 * The busiest of those seven functions, and so the most important check
-	 * of the set.  Everything that goes through show_qual(), show_scan_qual()
-	 * or show_upper_qual() ends up here: Filter, Index Cond, Recheck Cond,
-	 * TID Cond, Join Filter, Merge Cond, Hash Cond, Run Condition, One-Time
-	 * Filter, Conflict Filter and Order By.
+	 * The busiest of the deparse sites in this file by a wide margin, and so
+	 * the one that most needs the map to arrive.  Everything that goes
+	 * through show_qual(), show_scan_qual() or show_upper_qual() ends up
+	 * here: Filter, Index Cond, Recheck Cond, TID Cond, Join Filter, Merge
+	 * Cond, Hash Cond, Run Condition, One-Time Filter, Conflict Filter and
+	 * Order By, plus Function Call and Table Function Call from their own
+	 * callers.  All of them are one call.
 	 */
-	if (es->redact)
-		return;
 
 	/* Set up deparsing context */
 	context = set_deparse_context_plan(es->deparse_cxt,
@@ -2875,7 +2885,8 @@ show_expression(Node *node, const char *qlabel,
 									   ancestors);
 
 	/* Deparse the expression */
-	exprstr = deparse_expression(node, context, useprefix, false);
+	exprstr = deparse_expression_redacted(node, context, useprefix, false,
+										  explain_redact_context_or_null(es));
 
 	/* And add to es->str */
 	ExplainPropertyText(qlabel, exprstr, es);
@@ -3013,18 +3024,21 @@ show_grouping_sets(PlanState *planstate, Agg *agg,
 	ListCell   *lc;
 
 	/*
-	 * Dropping the whole section takes the grouping-set nesting with it, not
-	 * only the key expressions.  That is more than is strictly needed, since
-	 * the nesting describes the plan rather than the data.
+	 * This is the point the earlier note here pointed forward to: there are
+	 * substitute names to print inside the nesting now, so the nesting comes
+	 * back with them.
 	 *
-	 * It is the safe direction to err in, though.  This stage of the feature
-	 * withholds everything, and later stages hand things back one at a time,
-	 * so anything given back too early cannot be taken away again by a
-	 * revert. The nesting returns once there are substitute names to print
-	 * inside it.
+	 * Worth being explicit that it is one edit and not two.  Dropping the
+	 * section had taken the grouping-set structure with it -- the "Grouping
+	 * Sets" group, the per-set "Grouping Set" group and the nested key lists,
+	 * all of which describe the plan rather than the data -- because
+	 * withholding more than necessary was the safe direction while nothing
+	 * printable existed to go inside.  Everything that builds that structure
+	 * sits below where the early return stood, here and in
+	 * show_grouping_set_keys(), so restoring the keys restores the nesting in
+	 * the same move.  Keys inside a flattened section would have been a third
+	 * behaviour, neither the suppressed one nor the upstream one.
 	 */
-	if (es->redact)
-		return;
 
 	/* Set up deparsing context */
 	context = set_deparse_context_plan(es->deparse_cxt,
@@ -3104,8 +3118,9 @@ show_grouping_set_keys(PlanState *planstate,
 			if (!target)
 				elog(ERROR, "no tlist entry for key %d", keyresno);
 			/* Deparse the expression, showing any top-level cast */
-			exprstr = deparse_expression((Node *) target->expr, context,
-										 useprefix, true);
+			exprstr = deparse_expression_redacted((Node *) target->expr,
+												  context, useprefix, true,
+												  explain_redact_context_or_null(es));
 
 			result = lappend(result, exprstr);
 		}
@@ -3162,23 +3177,17 @@ show_sort_group_keys(PlanState *planstate, const char *qlabel,
 	int			keyno;
 
 	/*
-	 * The keys themselves are deparsed expressions, so they stay suppressed
-	 * until T21 enables expression output.  This return is what suppresses
-	 * them.
+	 * Lifting the return that stood here does two things, and the second is
+	 * easy to miss: it starts printing the keys, and it puts
+	 * show_sortorder_options() on a live path for the first time.
 	 *
-	 * It also, today, suppresses the COLLATE and USING decorations that
-	 * show_sortorder_options() tacks onto a key.  That function now takes the
-	 * ExplainState and redacts those two names itself, so it no longer
-	 * depends on this check -- but it cannot be demonstrated while this
-	 * return stands, because a decoration is appended to the deparsed key
-	 * string and there is no way to print " COLLATE <name>" without the
-	 * expression it decorates. Do not lift this return in order to show the
-	 * decorations working: what would come out with it is the user's real
-	 * column names.  Lifting it is T21's job, and T21 is where that guard
-	 * starts producing output.
+	 * That function pseudonymizes the collation of a COLLATE decoration and
+	 * the operator of a USING decoration, and as long as this function
+	 * returned early its guards were never executed -- a decoration is
+	 * appended to the deparsed key string, so there was no way to reach one
+	 * without the expression it decorates.  Its guards are unchanged by this
+	 * commit and are now load-bearing, on the same line of output as the key.
 	 */
-	if (es->redact)
-		return;
 
 	if (nkeys <= 0)
 		return;
@@ -3202,8 +3211,9 @@ show_sort_group_keys(PlanState *planstate, const char *qlabel,
 		if (!target)
 			elog(ERROR, "no tlist entry for key %d", keyresno);
 		/* Deparse the expression, showing any top-level cast */
-		exprstr = deparse_expression((Node *) target->expr, context,
-									 useprefix, true);
+		exprstr = deparse_expression_redacted((Node *) target->expr, context,
+											  useprefix, true,
+											  explain_redact_context_or_null(es));
 		resetStringInfo(&sortkeybuf);
 		appendStringInfoString(&sortkeybuf, exprstr);
 		/* Append sort order information, if relevant */
@@ -3367,12 +3377,14 @@ show_window_def(WindowAggState *planstate, List *ancestors, ExplainState *es)
 	 * was asked for.  It becomes "wN" here (FR-91).
 	 *
 	 * The PARTITION BY / ORDER BY keys and the frame offsets are deparsed
-	 * expressions -- show_window_keys() and
-	 * get_window_frame_options_for_explain() both call plain
-	 * deparse_expression() -- which makes them T21's surface, not this
-	 * task's. They stay suppressed until then.  Do not "finish the job" by
-	 * re-enabling them alongside the name: there is nothing to print in their
-	 * place today but the user's real column names and literals.
+	 * expressions, and they are now printed, pseudonymized by the deparser --
+	 * show_window_keys() through deparse_expression_redacted(), and the frame
+	 * offsets through get_window_frame_options_for_explain(), which derives
+	 * the map from the deparse context it is handed.  That second one is
+	 * worth knowing about before touching this function: it assembles a
+	 * deparse_context of its own, so it is the one deparse on this path that
+	 * the guard inside deparse_expression_pretty() cannot see.  If a frame
+	 * offset ever prints a real literal again, that is where to look.
 	 *
 	 * KEYED ON winref, AND DELIBERATELY NOT HASHED.  The other printer of
 	 * this name is get_windowfunc_expr_helper() in ruleutils.c, which emits
@@ -3405,54 +3417,51 @@ show_window_def(WindowAggState *planstate, List *ancestors, ExplainState *es)
 	else
 		appendStringInfoString(&wbuf, quote_identifier(wagg->winname));
 
-	if (!es->redact)
+	appendStringInfoString(&wbuf, " AS (");
+
+	/* The key columns refer to the tlist of the child plan */
+	ancestors = lcons(wagg, ancestors);
+	if (wagg->partNumCols > 0)
 	{
-		appendStringInfoString(&wbuf, " AS (");
-
-		/* The key columns refer to the tlist of the child plan */
-		ancestors = lcons(wagg, ancestors);
-		if (wagg->partNumCols > 0)
-		{
-			appendStringInfoString(&wbuf, "PARTITION BY ");
-			show_window_keys(&wbuf, outerPlanState(planstate),
-							 wagg->partNumCols, wagg->partColIdx,
-							 ancestors, es);
-			needspace = true;
-		}
-		if (wagg->ordNumCols > 0)
-		{
-			if (needspace)
-				appendStringInfoChar(&wbuf, ' ');
-			appendStringInfoString(&wbuf, "ORDER BY ");
-			show_window_keys(&wbuf, outerPlanState(planstate),
-							 wagg->ordNumCols, wagg->ordColIdx,
-							 ancestors, es);
-			needspace = true;
-		}
-		ancestors = list_delete_first(ancestors);
-		if (wagg->frameOptions & FRAMEOPTION_NONDEFAULT)
-		{
-			List	   *context;
-			bool		useprefix;
-			char	   *framestr;
-
-			/* Set up deparsing context for possible frame expressions */
-			context = set_deparse_context_plan(es->deparse_cxt,
-											   (Plan *) wagg,
-											   ancestors);
-			useprefix = (es->rtable_size > 1 || es->verbose);
-			framestr = get_window_frame_options_for_explain(wagg->frameOptions,
-															wagg->startOffset,
-															wagg->endOffset,
-															context,
-															useprefix);
-			if (needspace)
-				appendStringInfoChar(&wbuf, ' ');
-			appendStringInfoString(&wbuf, framestr);
-			pfree(framestr);
-		}
-		appendStringInfoChar(&wbuf, ')');
+		appendStringInfoString(&wbuf, "PARTITION BY ");
+		show_window_keys(&wbuf, outerPlanState(planstate),
+						 wagg->partNumCols, wagg->partColIdx,
+						 ancestors, es);
+		needspace = true;
 	}
+	if (wagg->ordNumCols > 0)
+	{
+		if (needspace)
+			appendStringInfoChar(&wbuf, ' ');
+		appendStringInfoString(&wbuf, "ORDER BY ");
+		show_window_keys(&wbuf, outerPlanState(planstate),
+						 wagg->ordNumCols, wagg->ordColIdx,
+						 ancestors, es);
+		needspace = true;
+	}
+	ancestors = list_delete_first(ancestors);
+	if (wagg->frameOptions & FRAMEOPTION_NONDEFAULT)
+	{
+		List	   *context;
+		bool		useprefix;
+		char	   *framestr;
+
+		/* Set up deparsing context for possible frame expressions */
+		context = set_deparse_context_plan(es->deparse_cxt,
+										   (Plan *) wagg,
+										   ancestors);
+		useprefix = (es->rtable_size > 1 || es->verbose);
+		framestr = get_window_frame_options_for_explain(wagg->frameOptions,
+														wagg->startOffset,
+														wagg->endOffset,
+														context,
+														useprefix);
+		if (needspace)
+			appendStringInfoChar(&wbuf, ' ');
+		appendStringInfoString(&wbuf, framestr);
+		pfree(framestr);
+	}
+	appendStringInfoChar(&wbuf, ')');
 
 	ExplainPropertyText("Window", wbuf.data, es);
 	pfree(wbuf.data);
@@ -3490,8 +3499,9 @@ show_window_keys(StringInfo buf, PlanState *planstate,
 		if (!target)
 			elog(ERROR, "no tlist entry for key %d", keyresno);
 		/* Deparse the expression, showing any top-level cast */
-		exprstr = deparse_expression((Node *) target->expr, context,
-									 useprefix, true);
+		exprstr = deparse_expression_redacted((Node *) target->expr, context,
+											  useprefix, true,
+											  explain_redact_context_or_null(es));
 		if (keyno > 0)
 			appendStringInfoString(buf, ", ");
 		appendStringInfoString(buf, exprstr);
@@ -3552,15 +3562,14 @@ show_tablesample(TableSampleClause *tsc, PlanState *planstate,
 	 * while a method installed by an extension becomes "fN".
 	 *
 	 * The arguments and the REPEATABLE seed are a deparsed expression list
-	 * and a deparsed constant, which makes them T21's surface rather than
-	 * this task's, and they stay suppressed until then.  Do not "finish the
-	 * job" by re-enabling them alongside the method name: there is nothing to
-	 * print in their place today but the user's real literal values.
+	 * and a deparsed constant, so they are now printed with the deparser
+	 * substituting for each literal -- "f1 (?::real) REPEATABLE (?::double
+	 * precision)" rather than the numbers the user wrote.
 	 *
 	 * The seed deserves a second look on its own account, because it looks
-	 * like a harmless number.  It is what makes a sample repeatable, so
-	 * printing it beside the row count tells a reader which rows were
-	 * examined.
+	 * like a harmless number and is the one value here whose substitution
+	 * matters most.  It is what makes a sample repeatable, so printing it
+	 * beside the row count tells a reader which rows were examined.
 	 */
 
 	/* Get the tablesample method name */
@@ -3570,27 +3579,26 @@ show_tablesample(TableSampleClause *tsc, PlanState *planstate,
 	else
 		method_name = get_func_name(tsc->tsmhandler);
 
-	if (!es->redact)
+	/* Set up deparsing context */
+	context = set_deparse_context_plan(es->deparse_cxt,
+									   planstate->plan,
+									   ancestors);
+	useprefix = es->rtable_size > 1;
+
+	/* Deparse parameter expressions */
+	foreach(lc, tsc->args)
 	{
-		/* Set up deparsing context */
-		context = set_deparse_context_plan(es->deparse_cxt,
-										   planstate->plan,
-										   ancestors);
-		useprefix = es->rtable_size > 1;
+		Node	   *arg = (Node *) lfirst(lc);
 
-		/* Deparse parameter expressions */
-		foreach(lc, tsc->args)
-		{
-			Node	   *arg = (Node *) lfirst(lc);
-
-			params = lappend(params,
-							 deparse_expression(arg, context,
-												useprefix, false));
-		}
-		if (tsc->repeatable)
-			repeatable = deparse_expression((Node *) tsc->repeatable, context,
-											useprefix, false);
+		params = lappend(params,
+						 deparse_expression_redacted(arg, context,
+													 useprefix, false,
+													 explain_redact_context_or_null(es)));
 	}
+	if (tsc->repeatable)
+		repeatable = deparse_expression_redacted((Node *) tsc->repeatable,
+												 context, useprefix, false,
+												 explain_redact_context_or_null(es));
 
 	/* Print results */
 	if (es->format == EXPLAIN_FORMAT_TEXT)
@@ -3600,46 +3608,25 @@ show_tablesample(TableSampleClause *tsc, PlanState *planstate,
 		ExplainIndentText(es);
 		appendStringInfo(es->str, "Sampling: %s", method_name);
 
-		/*
-		 * The parentheses go with the arguments they hold, so a redacted line
-		 * reads "Sampling: f1" rather than "Sampling: f1 ()".  An empty
-		 * argument list would read as a method that takes no arguments, which
-		 * no sampling method does, and would be a worse description of the
-		 * plan than saying nothing.
-		 */
-		if (!es->redact)
+		appendStringInfoString(es->str, " (");
+		foreach(lc, params)
 		{
-			appendStringInfoString(es->str, " (");
-			foreach(lc, params)
-			{
-				if (!first)
-					appendStringInfoString(es->str, ", ");
-				appendStringInfoString(es->str, (const char *) lfirst(lc));
-				first = false;
-			}
-			appendStringInfoChar(es->str, ')');
-			if (repeatable)
-				appendStringInfo(es->str, " REPEATABLE (%s)", repeatable);
+			if (!first)
+				appendStringInfoString(es->str, ", ");
+			appendStringInfoString(es->str, (const char *) lfirst(lc));
+			first = false;
 		}
+		appendStringInfoChar(es->str, ')');
+		if (repeatable)
+			appendStringInfo(es->str, " REPEATABLE (%s)", repeatable);
 		appendStringInfoChar(es->str, '\n');
 	}
 	else
 	{
 		ExplainPropertyText("Sampling Method", method_name, es);
-
-		/*
-		 * Both properties omitted rather than emitted empty, which is how
-		 * every other suppressed expression property in this file behaves.
-		 * params is already NIL and repeatable already NULL under redaction,
-		 * so this guard is saying who owns the decision (T21) rather than
-		 * doing work.
-		 */
-		if (!es->redact)
-		{
-			ExplainPropertyList("Sampling Parameters", params, es);
-			if (repeatable)
-				ExplainPropertyText("Repeatable Seed", repeatable, es);
-		}
+		ExplainPropertyList("Sampling Parameters", params, es);
+		if (repeatable)
+			ExplainPropertyText("Repeatable Seed", repeatable, es);
 	}
 }
 
@@ -4175,30 +4162,32 @@ show_memoize_info(MemoizeState *mstate, List *ancestors, ExplainState *es)
 									   ancestors);
 
 	/*
-	 * A narrower check than the six above, and the only one of its kind here.
-	 * This function also prints the cache hit, miss and eviction counts and
-	 * the memory estimates, and all of those have to keep appearing:
-	 * redaction that removed them would be deletion rather than redaction,
-	 * and the point of the feature is that a plan stays diagnosable.
+	 * The check lifted from here was the narrowest of the nine, and covered
+	 * the Cache Key alone -- the only thing in this function that is built
+	 * out of the user's expressions.
 	 *
-	 * Cache Mode is either "binary" or "logical" and says nothing about the
-	 * data, so it stays as well.  Only the key expressions go.
+	 * Everything else this function prints was already outside it and stays
+	 * outside it, so nothing below needed touching: the cache hit, miss,
+	 * eviction and overflow counts, the capacity and hit-ratio estimates, the
+	 * peak memory, and Cache Mode, which is "binary" or "logical" and says
+	 * nothing about the data.  Withholding any of those would be deletion
+	 * rather than redaction, and the point of the feature is that a plan
+	 * stays diagnosable.
 	 */
-	if (!es->redact)
+	foreach(lc, mplan->param_exprs)
 	{
-		foreach(lc, mplan->param_exprs)
-		{
-			Node	   *expr = (Node *) lfirst(lc);
+		Node	   *expr = (Node *) lfirst(lc);
 
-			appendStringInfoString(&keystr, separator);
+		appendStringInfoString(&keystr, separator);
 
-			appendStringInfoString(&keystr, deparse_expression(expr, context,
-															   useprefix, false));
-			separator = ", ";
-		}
-
-		ExplainPropertyText("Cache Key", keystr.data, es);
+		appendStringInfoString(&keystr,
+							   deparse_expression_redacted(expr, context,
+														   useprefix, false,
+														   explain_redact_context_or_null(es)));
+		separator = ", ";
 	}
+
+	ExplainPropertyText("Cache Key", keystr.data, es);
 	ExplainPropertyText("Cache Mode", mstate->binary_mode ? "binary" : "logical", es);
 
 	pfree(keystr.data);

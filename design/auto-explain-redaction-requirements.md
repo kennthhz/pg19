@@ -181,6 +181,23 @@ this is schema shape rather than data, but it has to be a recorded decision: T21
 changes the scale from "a few module fixtures" to every `Output` and `Filter` line
 of every record.)*
 
+*(rev. T21b: **deferred, deliberately, and still open.** T21b has landed, so the
+scale change described just above is no longer prospective: `t1_c3` now appears in
+every `Output`, `Filter`, `Index Cond`, `Sort Key`, `Hash Cond` and `Cache Key`
+line of every redacted record, rather than in a handful of module fixtures. The
+decision taken with that in view is to accept the disclosure as schema shape and
+leave FR-12 unamended, so the requirement stays on record as not met rather than
+being quietly relaxed to match the code. Neither remedy above was attempted here;
+both remain available, and neither is any harder now than before.
+
+Note that **T12 reached the same shortfall from a different direction**, which is
+worth recording because it makes the gap wider than this section alone describes.
+T12 pseudonymizes composite field names, and its journal observes that a column
+pseudonym's number tracks `attnum` rather than first-use order — the same cause as
+this section's, arrived at while reasoning about a completely different name class.
+So the "position, never the name" reading above is the right reading of the
+feature as a whole, not a local caveat about `set_relation_column_names()`.)*
+
 ### 3.1.3 Rendering of `Query Parameters` (open question, not yet decided)
 
 D10 and FR-22 omit the property outright. That decision has been challenged and
@@ -212,6 +229,21 @@ record: FR-21's `?::text` appears inside the newly live expression properties
 while the bound-parameter list is still absent entirely. The `maxlen` point above
 is unaffected and still holds — any redaction test belongs *after* the existing
 `maxlen == 0` check, which `explain.c:1274` returns ahead of today.)*
+
+*(rev. T21b: **deferred, deliberately, and still open.** `Query Parameters` stays
+omitted; FR-22 and D10 are unamended and no code changed. What has changed is that
+the asymmetry this section objects to is now **live and visible in a single
+record** rather than argued in the abstract: T21b lifted the expression
+suppressions, so `?::text` is printed inside `Filter` and `Output` while the
+bound-parameter list beside it is absent entirely. The same secret still discloses
+more when inlined into the SQL than when bound.
+
+Deferring was chosen over amending because resolving it means amending FR-22 and
+D10, which is a requirements change and its own task — folding it into the commit
+that changes output would have put a policy decision inside the flip. The point of
+recording it here is that the inconsistency is now **accepted rather than
+unnoticed**: a reader comparing FR-21 against FR-22 in a live record is seeing a
+known open question, not a bug.)*
 
 ## 4. Definitions
 

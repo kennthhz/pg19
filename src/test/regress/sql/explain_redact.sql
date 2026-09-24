@@ -939,12 +939,19 @@ SELECT * FROM zsec_plan('SELECT zsec_ssn FROM zsec_customers ORDER BY zsec_ssn D
 RESET enable_bitmapscan;
 RESET enable_seqscan;
 
--- Memoize is the only narrow guard in explain.c -- its Cache Key goes while its
--- Cache Mode and counters stay -- so it is the one most easily broken by a later
--- edit widening it to the whole function.
+-- Memoize held the only narrow guard in explain.c -- its Cache Key went while its
+-- Cache Mode and counters stayed -- so it is the one place where a later edit
+-- widening a guard to the whole function would be easiest to miss.
+--
+-- *(rev. T21b: the guard is gone and the Cache Key is printed, so the assertion
+-- is read from the other side.  The fixture's point is unchanged: nobody widened
+-- the narrow guard.  Before, that meant "Cache Key absent, Cache Mode present";
+-- now it means "Cache Key present AND pseudonymized, Cache Mode still present".
+-- The Cache Mode clause did not move -- it was always the clause that caught a
+-- too-wide guard, and it still is.)*
 --
 -- The verdict states explicitly whether a Memoize node was reached at all.  A
--- plan that does not memoize would otherwise satisfy "no Cache Key" trivially,
+-- plan that does not memoize would otherwise satisfy the whole check trivially,
 -- which is the failure mode T01 found in six of its own fixtures: passing
 -- without executing the target.
 -- Dedicated tables, because none of the fixtures above produce a Memoize node:
@@ -968,11 +975,14 @@ SET enable_mergejoin = off;
 SELECT CASE
          WHEN NOT EXISTS (SELECT 1 FROM zsec_plan(q, o) l WHERE l LIKE '%Memoize%')
            THEN 'no Memoize node in this plan -- guard not exercised here'
-         WHEN EXISTS (SELECT 1 FROM zsec_plan(q, o) l WHERE l LIKE '%Cache Key%')
-           THEN 'FAIL: Cache Key survived redaction'
+         WHEN NOT EXISTS (SELECT 1 FROM zsec_plan(q, o) l WHERE l LIKE '%Cache Key%')
+           THEN 'FAIL: Cache Key absent -- still suppressed'
+         WHEN EXISTS (SELECT 1 FROM zsec_plan(q, o) l
+                       WHERE l LIKE '%Cache Key%' AND l ~* '(zsec_|zsecdata-)')
+           THEN 'FAIL: real name inside the Cache Key'
          WHEN NOT EXISTS (SELECT 1 FROM zsec_plan(q, o) l WHERE l LIKE '%Cache Mode%')
            THEN 'FAIL: Cache Mode was suppressed too -- guard is too wide'
-         ELSE 'ok: key withheld, mode kept'
+         ELSE 'ok: key pseudonymized, mode kept'
        END AS memoize_verdict
   FROM (VALUES ('SELECT * FROM zsec_memo_outer o JOIN zsec_memo_inner i ON i.zsec_k = o.zsec_k',
                 'COSTS OFF, REDACT')) AS v(q, o);
@@ -1827,42 +1837,49 @@ SELECT v.method, fmt.name AS format,
                                          'COSTS OFF, REDACT, FORMAT ' || fmt.name)) AS s(b)
  ORDER BY v.method COLLATE "C", fmt.name COLLATE "C";
 --
--- THE NEGATIVE CONTROL THAT MATTERS MOST IN THIS SECTION.
---
--- The sampling arguments and the REPEATABLE seed are T21's, not T17's, and this
--- is the assertion that catches someone re-enabling them early while "finishing
--- the job" on the method name next to them.  Nothing else here would notice: the
--- seed is a bare number, it carries no marker, and the leak sweep is blind to it.
+-- THE ASSERTION THAT MATTERS MOST IN THIS SECTION.
 --
 -- The seed is the item to care about, and it does not look like it.  It is what
 -- makes a sample reproducible, so printing it beside a row count tells a reader
--- exactly which rows were examined.
+-- exactly which rows were examined.  Nothing else in this suite would notice it
+-- coming back: the seed is a bare number, it carries no marker, and the leak
+-- sweep is structurally blind to it.
 --
--- Four clauses.  The first two are the requirement; the third is the anti-vacuity
--- guard -- a record with no Sample Scan in it satisfies the first two for free --
--- and the fourth pins the text rendering, because dropping the arguments without
--- dropping the parentheses they sit in would leave "Sampling: bernoulli ()",
--- which describes a sampling method that takes no arguments.  No method does.
+-- *(rev. T21b: the arguments and the seed are printed now, substituted by the
+-- deparser.  The clause that carries the weight -- the seed VALUE 987654321
+-- absent -- is unchanged and runs first.  What changed is the two clauses that
+-- asserted the PROPERTIES absent: those are gone, because the properties exist,
+-- and in their place the substituted forms "?::real" and "?::double precision"
+-- must both be PRESENT.  That is what keeps the seed clause from being satisfied
+-- by the property not being printed at all -- the same anti-vacuity role the "no
+-- sampling at all" clause plays for the node itself.)*
 --
 SELECT fmt.name AS format,
        CASE
-         WHEN s.b LIKE '%Sampling Parameters%' THEN 'FAIL: Sampling Parameters emitted'
-         WHEN s.b LIKE '%Repeatable Seed%'     THEN 'FAIL: Repeatable Seed emitted'
          WHEN s.b LIKE '%987654321%'           THEN 'FAIL: the seed value itself is present'
          WHEN s.b NOT LIKE '%Sampling%'        THEN 'FAIL: no sampling at all -- assertion is vacuous'
-         ELSE 'ok: method named, arguments and seed both absent'
+         WHEN s.b NOT LIKE '%?::real%'         THEN 'FAIL: argument not substituted -- assertion is vacuous'
+         WHEN s.b NOT LIKE '%?::double precision%'
+                                               THEN 'FAIL: seed not substituted -- assertion is vacuous'
+         ELSE 'ok: method named, argument and seed both substituted'
        END AS verdict
   FROM (VALUES ('json'), ('text'), ('xml'), ('yaml')) AS fmt(name),
        LATERAL (SELECT zsec_explain_blob('SELECT zsec_ssn FROM zsec_customers TABLESAMPLE BERNOULLI (10) REPEATABLE (987654321)',
                                          'COSTS OFF, REDACT, FORMAT ' || fmt.name)) AS s(b)
  ORDER BY fmt.name COLLATE "C";
--- The text line verbatim, and the shape assertion on it.  "Sampling: bernoulli"
--- with nothing after it -- no parentheses, empty or otherwise.
-SELECT l AS sampling_line, l ~ '^\s*Sampling: bernoulli$' AS no_empty_parens
+-- The text line verbatim, and the shape assertion on it.
+-- *(rev. T21b: was "Sampling: bernoulli" with nothing after it, asserted by
+-- '^\s*Sampling: bernoulli$'.  The full substituted form is the assertion now, so
+-- the exempt method name (T17) and the two substituted values (FR-21) are all
+-- pinned on one line.  Anchored at both ends for the same reason the old one was:
+-- this is the rendering, not a containment test.)*
+SELECT l AS sampling_line,
+       l ~ '^\s*Sampling: bernoulli \(\?::real\) REPEATABLE \(\?::double precision\)$'
+         AS substituted_shape
   FROM zsec_plan('SELECT zsec_ssn FROM zsec_customers TABLESAMPLE BERNOULLI (10) REPEATABLE (987654321)',
                  'COSTS OFF, REDACT') l
  WHERE l LIKE '%Sampling%';
--- And unredacted, so the difference is on record and the suppression above is not
+-- And unredacted, so the difference is on record and the substitution above is not
 -- mistaken for a fixture that never had arguments to print.
 SELECT l AS sampling_line_plain
   FROM zsec_plan('SELECT zsec_ssn FROM zsec_customers TABLESAMPLE BERNOULLI (10) REPEATABLE (987654321)',
@@ -2576,11 +2593,21 @@ SELECT (regexp_match(b, 'InitPlan (\w+)'))[1] AS unredacted_initplan_name,
 --
 -- FR-91: the Window property, all four formats.
 --
--- Eight clauses, and the last five are the ones that matter.  A pseudonymized
--- name with the body still attached would satisfy "no marker" and leak every
--- column in the window definition, so the body is asserted absent four ways --
--- the " AS (" that would introduce it, the two key introducers, the frame
--- keywords, and the two frame offsets by value.
+-- *(rev. T21b: the body is printed now, so the five clauses that asserted it
+-- absent are inverted to assert it PRESENT AND PSEUDONYMIZED -- with one
+-- exception, and the exception is the important part of this note.
+--
+-- THE TWO FRAME-OFFSET CLAUSES DID NOT MOVE.  424242 and 515151 are still
+-- asserted absent by value, and they are now the only check in this suite on
+-- get_window_frame_options_for_explain() in ruleutils.c, which builds its own
+-- deparse_context and so is the one deparse on the EXPLAIN path that the guard
+-- inside deparse_expression_pretty() cannot see.  Before T21b derived the
+-- pseudonym map there, lifting the suppression in show_window_def() printed
+-- these two integers verbatim while every other clause here still passed.  Do
+-- not weaken them into keyword checks.
+--
+-- The marker clause gets stronger for free: a column name leaking inside the
+-- body now has a body to leak into.)*
 --
 -- count(*) rather than rank() on purpose: rank() is frame-insensitive and the
 -- planner rewrites its frame to a default, so an unredacted rank() record does
@@ -2590,25 +2617,29 @@ SELECT (regexp_match(b, 'InitPlan (\w+)'))[1] AS unredacted_initplan_name,
 SELECT * FROM zsec_plan('SELECT zsec_ssn, count(*) OVER zsec_wina FROM zsec_customers WINDOW zsec_wina AS (PARTITION BY zsec_ssn ORDER BY zsec_bal ROWS BETWEEN 424242 PRECEDING AND 515151 FOLLOWING)', 'COSTS OFF, REDACT');
 SELECT fmt.name AS format,
        CASE
+         WHEN s.b LIKE '%424242%' OR s.b LIKE '%515151%'
+           THEN 'FAIL: frame offset value printed'
          WHEN s.b LIKE '%zsec_wina%'   THEN 'FAIL: real window name present'
          WHEN s.b LIKE '%zsec_%'       THEN 'FAIL: marker present'
          WHEN s.b !~ '\mw1\M'           THEN 'FAIL: no window pseudonym -- assertion is vacuous'
-         WHEN s.b ~ 'w1 AS'             THEN 'FAIL: window body introduced'
-         WHEN s.b LIKE '%PARTITION BY%' THEN 'FAIL: partition key printed'
-         WHEN s.b LIKE '%ORDER BY%'     THEN 'FAIL: ordering key printed'
-         WHEN s.b ~ 'PRECEDING|FOLLOWING|UNBOUNDED|CURRENT ROW'
-           THEN 'FAIL: frame printed'
-         WHEN s.b LIKE '%424242%' OR s.b LIKE '%515151%'
-           THEN 'FAIL: frame offset value printed'
-         ELSE 'ok: Window is w1, body absent'
+         WHEN s.b !~ 'w1 AS'            THEN 'FAIL: window body absent -- still suppressed'
+         WHEN s.b NOT LIKE '%PARTITION BY t1_c2%'
+           THEN 'FAIL: partition key missing or not pseudonymized'
+         WHEN s.b NOT LIKE '%ORDER BY t1_c3%'
+           THEN 'FAIL: ordering key missing or not pseudonymized'
+         WHEN s.b NOT LIKE '%ROWS BETWEEN ?::bigint PRECEDING AND ?::bigint FOLLOWING%'
+           THEN 'FAIL: frame missing or offsets not substituted'
+         ELSE 'ok: Window is w1 with a pseudonymized body'
        END AS fr91_verdict
   FROM (VALUES ('json'), ('text'), ('xml'), ('yaml')) AS fmt(name),
        LATERAL (SELECT zsec_explain_blob('SELECT zsec_ssn, count(*) OVER zsec_wina FROM zsec_customers WINDOW zsec_wina AS (PARTITION BY zsec_ssn ORDER BY zsec_bal ROWS BETWEEN 424242 PRECEDING AND 515151 FOLLOWING)',
                                          'COSTS OFF, REDACT, FORMAT ' || fmt.name)) AS s(b)
  ORDER BY fmt.name COLLATE "C";
--- The negative control, one boolean per absence clause above.  All five must be
--- true or the corresponding clause is asserting the absence of something that
--- was never going to be there.
+-- The negative control.  All five must be true.  Two of them still back absence
+-- clauses (the real window name, and each frame offset by value); the other two
+-- now back presence clauses instead, and they stay because a presence clause on a
+-- pseudonymized body is only meaningful if the unredacted record has a body with
+-- a real name in it to be pseudonymized.
 SELECT b LIKE '%zsec_wina%'   AS name_leaks_unredacted,
        b ~ 'zsec_wina AS'      AS body_introduced_unredacted,
        b LIKE '%PARTITION BY%' AS partition_key_present_unredacted,

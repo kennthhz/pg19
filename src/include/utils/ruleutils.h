@@ -58,6 +58,16 @@ extern List *deparse_context_for_plan_tree_redacted(PlannedStmt *pstmt,
 													struct RedactCtx *redact);
 
 /*
+ * The pseudonym map a deparse context carries, or NULL if it is not redacting.
+ *
+ * For code that holds a deparse context and has to fill in a deparse_context
+ * of its own -- it can derive the map instead of being passed it, and so stays
+ * correct for callers it has not met.  deparse_namespace is private to
+ * ruleutils.c, so the handle cannot be reached any other way.
+ */
+extern struct RedactCtx *deparse_context_redaction(List *dpcontext);
+
+/*
  * Whether any namespace in a deparse context carries a pseudonym map.
  *
  * For the two guards that have to tell a redacting deparse context from an

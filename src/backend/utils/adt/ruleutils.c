@@ -3738,20 +3738,36 @@ deparse_expression_redacted(Node *expr, List *dpcontext,
 }
 
 /*
- * deparse_context_is_redacting
- *		Does any namespace in this deparse context carry a pseudonym map?
+ * deparse_context_redaction
+ *		The pseudonym map this deparse context carries, or NULL if none.
  *
- * Exists so that callers outside this file can ask the question without
- * seeing deparse_namespace, which is private here.  There are two, and both
- * are guards rather than ordinary logic: the one in
- * deparse_expression_pretty() below, and the one in ExplainPrintPlan() that
- * checks a redacted EXPLAIN actually built a redacting context.
+ * Exists so that callers outside this file can recover the map without seeing
+ * deparse_namespace, which is private here.  The map is installed on the
+ * namespace when the context is built -- by
+ * deparse_context_for_plan_tree_redacted() or
+ * select_rtable_names_for_explain_redacted() -- so any code holding a context
+ * can ask what it is deparsing against rather than having to be told.
+ *
+ * Returning the handle rather than a bool is the point.  A function that
+ * assembles a deparse_context of its own, instead of going through
+ * deparse_expression*(), has to fill in context.redact itself, and the only
+ * correct value is the one the namespace it was handed already carries.
+ * Deriving it here makes such a function right for every caller it has and
+ * every caller it gains, which is the argument T13 settled for get_rule_expr()
+ * and T16 for explain_get_index_name().  The alternative -- a RedactCtx
+ * parameter -- would change an exported signature and hand the obligation back
+ * to each call site, which is precisely the per-site audit the eight converted
+ * deparse_expression() calls in explain.c had to go through one at a time.
+ * get_window_frame_options_for_explain() is the one such function today.
  *
  * NIL, which deparse_expression() accepts and means "no Vars expected", gives
- * false without a special case, since the loop then runs zero times.
+ * NULL with no special case, since the loop then runs zero times.  A context
+ * with several namespaces of which only some redact cannot arise from either
+ * installing function -- both set every namespace they build -- and the first
+ * handle found is returned if it ever did.
  */
-bool
-deparse_context_is_redacting(List *dpcontext)
+struct RedactCtx *
+deparse_context_redaction(List *dpcontext)
 {
 	ListCell   *lc;
 
@@ -3760,10 +3776,26 @@ deparse_context_is_redacting(List *dpcontext)
 		deparse_namespace *dpns = (deparse_namespace *) lfirst(lc);
 
 		if (dpns->redact != NULL)
-			return true;
+			return dpns->redact;
 	}
 
-	return false;
+	return NULL;
+}
+
+/*
+ * deparse_context_is_redacting
+ *		Does any namespace in this deparse context carry a pseudonym map?
+ *
+ * The bool form of the accessor above, kept separate because its two callers
+ * are guards rather than ordinary logic and read better as a question: the one
+ * in deparse_expression_pretty() below, and the one in ExplainPrintPlan() that
+ * checks a redacted EXPLAIN actually built a redacting context.  Neither wants
+ * the handle, only the fact.
+ */
+bool
+deparse_context_is_redacting(List *dpcontext)
+{
+	return deparse_context_redaction(dpcontext) != NULL;
 }
 
 /* ----------
@@ -7282,6 +7314,27 @@ get_window_frame_options(int frameOptions,
 
 /*
  * Return the description of a window's framing options as a palloc'd string
+ *
+ * The frame offsets of a ROWS/RANGE/GROUPS BETWEEN are expressions, and under a
+ * redacted EXPLAIN they are literals out of the user's query: "ROWS BETWEEN 3
+ * PRECEDING" discloses the 3.  So this function has to redact -- and it is out
+ * of reach of the guard that catches every other deparse site, because it
+ * assembles its own deparse_context and calls get_window_frame_options()
+ * directly.  It never passes through deparse_expression_pretty(), so that
+ * function's refusal to deparse a redacting namespace unredacted never gets a
+ * chance to fire here.  With context.redact hardcoded NULL, as it was before
+ * this, the offsets printed real values silently the moment show_window_def()
+ * started printing the frame string at all.
+ *
+ * The map is derived from the namespace the caller handed us rather than taken
+ * as a new parameter.  The weaker reason is that this is exported in
+ * ruleutils.h and every redaction-aware entry point this feature added was a
+ * new symbol, precisely so no existing signature changed under an extension.
+ * The stronger reason is that the namespace already knows the answer -- it was
+ * given the handle when the context was built, necessarily before this call --
+ * so deriving it is correct for the one caller in the tree and for any caller
+ * added later, with nothing for that caller to remember.  See
+ * deparse_context_redaction() for the general form of the argument.
  */
 char *
 get_window_frame_options_for_explain(int frameOptions,
@@ -7305,7 +7358,7 @@ get_window_frame_options_for_explain(int frameOptions,
 	context.inGroupBy = false;
 	context.varInOrderBy = false;
 	context.appendparents = NULL;
-	context.redact = NULL;
+	context.redact = deparse_context_redaction(dpcontext);
 
 	get_window_frame_options(frameOptions, startOffset, endOffset, &context);
 
@@ -9918,8 +9971,8 @@ get_rule_expr(Node *node, deparse_context *context,
 				 * arguments given out of order, the case that forces the
 				 * reordering.  What this branch serves is a raw parse tree,
 				 * such as a stored default printed by pg_get_expr(), and a
-				 * redacted query text (§3.1.1, deferred) would reach it.
-				 * One branch is cheaper to own than an argued-safe raw
+				 * redacted query text (§3.1.1, deferred) would reach it. One
+				 * branch is cheaper to own than an argued-safe raw
 				 * identifier.
 				 */
 				if (context->redact != NULL)

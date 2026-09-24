@@ -1147,31 +1147,42 @@ CREATE TABLE zsec_t02.zsec_ts (zsec_k int, zsec_v text);
 -- whole difference from the built-in "bernoulli"/"system" that the regress file
 -- measures keeping their real names.
 --
--- The text line VERBATIM is the assertion, not a LIKE.  "Sampling: f1" with
--- nothing after it: the arguments are T21's surface and stay suppressed, and the
--- parentheses go with the arguments they held -- a line reading "Sampling: f1 ()"
--- would describe a sampling method that takes no arguments, and none does.
+-- The text line VERBATIM is the assertion, not a LIKE: "Sampling: f1 (?::bigint)".
+-- *(rev. T21b: was "Sampling: f1" with nothing after it, while the argument list
+-- was suppressed.  T21b prints the arguments, substituted by the deparser, so the
+-- method name still comes from the catalog lookup here (fN, FR-18) while the row
+-- count comes back as a "?" placeholder (FR-21).  Two different mechanisms on one
+-- line, which is why the whole line rather than a LIKE is the assertion.)*
 --
 -- No REPEATABLE clause here, and not by choice: system_rows sets
 -- repeatable_across_queries = false, so the parser rejects REPEATABLE on it
 -- outright ("tablesample method system_rows does not support REPEATABLE").  The
--- seed half of the suppression is therefore measured on the built-in BERNOULLI
--- fixture in src/test/regress/sql/explain_redact.sql, where a REPEATABLE clause
--- is legal; what is measured here is the argument list, using a row count no
--- other part of a plan could produce by accident.
+-- seed is therefore measured on the built-in BERNOULLI fixture in
+-- src/test/regress/sql/explain_redact.sql, where a REPEATABLE clause is legal;
+-- what is measured here is the argument list, using a row count no other part of
+-- a plan could produce by accident.
 --
 SELECT zsec_t02_blob('SELECT zsec_k FROM zsec_ts TABLESAMPLE system_rows (987654321)',
                      'COSTS OFF, REDACT') AS redacted_text;
 SELECT zsec_t02_blob('SELECT zsec_k FROM zsec_ts TABLESAMPLE system_rows (987654321)',
                      'COSTS OFF') AS plain_text;
+-- *(rev. T21b: the clause asserting "Sampling Parameters" absent is gone, because
+-- T21b emits that property.  The clause that carried the weight -- the argument
+-- VALUE 987654321 absent -- is untouched and now runs first.  In place of the
+-- suppression clause, the substituted "?::bigint" must be PRESENT, so the value
+-- assertion cannot be satisfied by the property not being there at all; that is
+-- the same anti-vacuity role the f1 clause plays for the method name.
+-- "Repeatable Seed" stays asserted absent, but for a different reason than
+-- before: this query has no REPEATABLE clause for the parser to accept, so the
+-- property has nothing to print rather than being withheld.)*
 SELECT fmt.name AS format,
        CASE
          WHEN s.b LIKE '%system_rows%'         THEN 'FAIL: real method name present'
-         WHEN s.b LIKE '%Sampling Parameters%' THEN 'FAIL: Sampling Parameters emitted'
-         WHEN s.b LIKE '%Repeatable Seed%'     THEN 'FAIL: Repeatable Seed emitted'
          WHEN s.b LIKE '%987654321%'           THEN 'FAIL: the argument value itself is present'
+         WHEN s.b LIKE '%Repeatable Seed%'     THEN 'FAIL: Repeatable Seed emitted'
          WHEN s.b !~ '\mf1\M'                  THEN 'FAIL: no method pseudonym -- assertion is vacuous'
-         ELSE 'ok: method is f1, arguments absent'
+         WHEN s.b NOT LIKE '%?::bigint%'       THEN 'FAIL: no substituted argument -- assertion is vacuous'
+         ELSE 'ok: method is f1, argument substituted'
        END AS verdict
   FROM (VALUES ('json'), ('text'), ('xml'), ('yaml')) AS fmt(name),
        LATERAL (SELECT zsec_t02_blob('SELECT zsec_k FROM zsec_ts TABLESAMPLE system_rows (987654321)',
