@@ -173,6 +173,14 @@ redacted record today and the disclosure is latent. **T21 is the task that makes
 it real**, which makes T21 the deadline for the decision this section asks for,
 not T15.)*
 
+*(rev. T21 plan amendment: that deadline now has a named place to be met. The task
+plan's T21 section carries a **decide or defer before starting** subsection
+listing this question and §3.1.3's, to be settled before **T21b** — the commit
+that lifts the expression suppressions — lands. Deferring is defensible, since
+this is schema shape rather than data, but it has to be a recorded decision: T21b
+changes the scale from "a few module fixtures" to every `Output` and `Filter` line
+of every record.)*
+
 ### 3.1.3 Rendering of `Query Parameters` (open question, not yet decided)
 
 D10 and FR-22 omit the property outright. That decision has been challenged and
@@ -196,6 +204,14 @@ the redaction test *after* the existing `maxlen == 0` check.
 
 Resolving this requires amending FR-22 and D10 and is a prerequisite to changing
 the code.
+
+*(rev. T21 plan amendment: the task plan's T21 section carries a **decide or defer
+before starting** subsection naming this question and §3.1.2's, to be settled
+before **T21b** lands. T21b is where the inconsistency becomes legible in a single
+record: FR-21's `?::text` appears inside the newly live expression properties
+while the bound-parameter list is still absent entirely. The `maxlen` point above
+is unaffected and still holds — any redaction test belongs *after* the existing
+`maxlen == 0` check, which `explain.c:1274` returns ahead of today.)*
 
 ## 4. Definitions
 

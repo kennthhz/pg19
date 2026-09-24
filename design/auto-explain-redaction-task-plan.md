@@ -3,7 +3,7 @@
 | | |
 |---|---|
 | **Status** | v1.0 — derived from [requirements v1.2](auto-explain-redaction-requirements.md) and [implementation design v1.2](auto-explain-redaction-implementation-design.md) |
-| **Shape** | 23 tasks in 6 stages. One task = one revertible commit (or a small series landed together). |
+| **Shape** | 25 tasks in 6 stages. One task = one revertible commit (or a small series landed together). *(rev. T21 plan amendment: was 23. T21 is now T21a / T21b / T21c; see that section for why the flip had to be its own commit.)* |
 | **Related** | [requirements](auto-explain-redaction-requirements.md) · [implementation design](auto-explain-redaction-implementation-design.md) |
 
 ---
@@ -56,12 +56,19 @@ assertion.)*
 Each task depends only on tasks before it. Reverting the most recent task is
 always safe and always leaves every earlier task's value intact.
 
-**Reverting out of order is not safe after T21.** Once T21 re-enables
+**Reverting out of order is not safe after T21b.** Once T21b re-enables
 expression output, tasks T06–T20 are load-bearing for the redaction contract:
-reverting, say, T09 (constant redaction) while T21 is in place would print real
-literal values. If you need to unwind past T21, revert T21 first. T21's commit
-message must say this, and T21 ships a defensive assertion (see the task) so
+reverting, say, T09 (constant redaction) while T21b is in place would print real
+literal values. If you need to unwind past T21b, revert T21b first. T21b's commit
+message must say this, and T21a ships a defensive assertion (see that task) so
 the mistake fails loudly rather than silently.
+
+*(rev. T21 plan amendment: T21 is now three tasks and the flip is entirely inside
+T21b, which is what keeps this paragraph true of a single commit. T21a installs
+the redacted deparse context and the assertion and changes no output; T21c adds
+tests only. Reverting T21b alone returns to suppression — the safe direction §1.1
+requires — and leaves T21a's guard in place, which is the state that makes a
+later out-of-order revert fail loudly.)*
 
 ### 1.3 No user-visible surface until the contract is complete
 
@@ -196,6 +203,13 @@ only for the fixtures, so it catches paths the catalog missed.
 > sites belong, not a side effect of T18. Note that this also means nothing in the
 > suite would fail if the tripwire were deleted, which is worth knowing before
 > anyone treats its presence as evidence of anything.)***
+>
+> ***(rev. T21 plan amendment: **T21a now owns that decision** — wire it into the
+> emission path, or amend this section to stop counting it. Leaving it a
+> listed-but-uncalled mechanism past T21 is the one outcome ruled out, because
+> T21b is where its reach would have paid: output returns across nine guards at
+> once, and this is the only one of the four mechanisms that names a line rather
+> than a symptom.)***
 
 **Periodic re-audit of the source enumeration (judgement, not a gate).** The
 residual weakness is not detection, it is enumeration: did we find every place in
@@ -1762,7 +1776,16 @@ disclose nothing.
 are suppressed by T04's return either way. The FR-60 property at both sites is lost,
 and T21 must not be applied on top of a reverted T20.
 
-#### T21 — Re-enable expression output
+#### T21 — Re-enable expression output — **split into T21a / T21b / T21c**
+
+*(rev. T21 plan amendment, no code: this section described one task. A review
+against the tree at T20 found six gaps in it, and three of the six are about
+work the section named in a single clause. It is now three tasks — T21a installs
+the redacted deparse context, T21b lifts the suppressions, T21c verifies — with
+the material that spans all three kept here. The revert story is unchanged and is
+the reason the split lands this way round: the flip is entirely inside T21b, so
+reverting T21b returns to suppression, which is the safe direction §1.2 requires.
+T21a and T21c change no output at all.)*
 
 **Goal.** The flip. `Filter`, `Output`, `Index Cond`, all key properties,
 `Cache Key`, `Function Call`, `Table Function Call`, `Sampling Parameters`,
@@ -1772,73 +1795,371 @@ emitted through `deparse_expression_redacted()`.
 This is the highest-risk task in the plan and it is deliberately last. Its risk
 was moved into T06–T20, all of which are already landed and unit-tested.
 
-**Delivers — three required steps, not one.** *(rev. T20: step 3 added. Step 1 was added by T19. The pattern is worth naming: every task that lands a guard it cannot execute pushes a confirmation obligation onto T21, and T21 is the only place any of them can be discharged.)*
+**Three required steps, redistributed — and the pattern behind them is worth
+keeping.** *(rev. T20: step 3 added. Step 1 was added by T19.)* Every task that
+lands a guard it cannot execute pushes a confirmation obligation onto T21, and
+T21 is the only place any of them can be discharged. That is why the third
+sub-task is verification rather than a footnote on the second: by the time the
+flip lands, T21 is carrying T20's unexecuted sort-key guard, FR-97 and FR-99 from
+T14, and the whole of Stage 3's layer-B work, none of which any earlier task could
+demonstrate through `EXPLAIN`. Step 1 is T21a. Step 2 is T21b. Step 3 and the
+accumulated obligations are T21c.
 
-1. **`explain.c:918` must call `deparse_context_for_plan_tree_redacted()`.** *(rev. T20: `:917` was off by one; the call is at `:918`, re-verified against the current tree.)*
-   *(rev. T19: this step was missing from this section and it is not a detail.)*
-   `ExplainPrintPlan()` calls the **non-redacted**
-   `deparse_context_for_plan_tree()` today, unconditionally, in both modes. T06
-   added the `_redacted()` variant and nothing in the backend calls it: its only
-   callers are its own NULL-passing wrapper and
-   `src/test/modules/test_explain_redact`. So `context->redact` is NULL on every
-   EXPLAIN path, and **every layer-B guard landed by T09–T14 and T19 is unreached
-   there** — not merely unprinted. If T21 does only what the sentence below used
-   to say, expression output comes back with no `RedactCtx` in the context and
-   every one of those guards falls through to the real name. That is precisely
-   the leak the whole of Stage 3 exists to prevent, and it would ship looking
-   like a working feature: the properties would be populated, plausible, and
-   unredacted. Two further consequences, both already true: the test module is
-   the only place any layer-B guard executes today, so its coverage carries more
-   weight than a unit test normally would; and no amount of T09–T20 testing
-   through `EXPLAIN` can detect this, because the code under test is not reached.
+**The two mechanisms — both required, and setting one does not set the other.**
+This is the correction that most changes the shape of the task, and it is why
+step 1 and step 2 are now separate commits rather than two bullets. There are
+**two distinct `redact` fields** in `ruleutils.c`, on two different structs, set
+by two different functions. Writing one does not write the other.
 
-2. **Replace the T04 suppression of the `show_*` calls** with calls that pass the
-   `RedactCtx`.
+| | `deparse_namespace.redact` (ruleutils.c:146) | `deparse_context.redact` (ruleutils.c:220) |
+|---|---|---|
+| set by | `deparse_context_for_plan_tree_redacted()` only — `dpns->redact = redact` at **:3890**, and `select_rtable_names_for_explain_redacted()` at **:4013** | `deparse_expression_pretty()` only, from its parameter — `context.redact = redact` at **:3780**, which is what `deparse_expression_redacted()` (`:3730`) passes |
+| installed when | the deparse **context is built**, before any expression is deparsed | each **individual expression** is deparsed |
+| read for | relation aliases (**:3960–3968**, **:4150–4159**) and **column names**, via `explain_redact_column()` at **:4783–4799** | every leaf emitter T09–T14 and T19 landed: constants, function names, operators, types, collations, sub-plan names, window names |
+| owned by | **T21a** | **T21b** |
 
-3. **Confirm T20's sort-key guard starts producing output.** *(rev. T20.)*
-   `show_sortorder_options()` (explain.c`:3240`) pseudonymizes the `COLLATE`
+The context-build timing is not an implementation accident and the function's own
+header comment (`:3851–3854`) says why: column names are settled in
+`deparse_context_for_plan_tree_redacted()` itself, under
+`set_simple_column_names()` → `set_relation_column_names()`, so installing the
+handle on the expression call instead "would therefore be too late for every
+column name in the plan."
+
+So there are **two** failure modes, not one, and they are complementary:
+
+- **T21a alone** — pseudonymized column names next to **real constants and real
+  function names**. The namespace carries the map, so `t1_c3` comes out right;
+  nothing installed a handle on the per-expression context, so every layer-B
+  guard falls through.
+- **T21b alone** (lift the suppressions, leave the eight plain
+  `deparse_expression()` call sites as they are, or convert only some) —
+  pseudonymized constants next to **real column names**. Or, if T21a never
+  happened at all, real everything.
+
+Both produce output that is **populated, plausible and unredacted**, which is the
+worst failure mode this feature has: nothing errors, no property is missing, and
+a reviewer reading the record sees a working feature. Note the asymmetry in how
+easy each is to make: T21a is one call site, and T21b is a per-call-site
+conversion over **8 plain `deparse_expression()` calls** in `explain.c` —
+`:2806`, `:2841`, `:3070`, `:3168`, `:3456`, `:3550`, `:3554`, `:4158` — so
+"converted seven of eight" is the likelier mistake of the two. *(The review that
+produced this amendment said ten; it is eight, re-counted twice against the tree.
+The argument is unaffected.)* For scale on how little of this is exercised today:
+`deparse_expression_redacted()` has **exactly one caller in the whole tree**,
+`src/test/modules/test_explain_redact`, and
+`deparse_context_for_plan_tree_redacted()` has two — its own NULL-passing wrapper
+at `ruleutils.c:3843` and that same test module. Nothing in the backend calls
+either.
+
+**A third hazard, already flagged in the tree — read the comment, do not
+rediscover it.** `set_deparse_for_query()` does `memset(dpns, 0, sizeof(...))` at
+`ruleutils.c:4247`, which **clears `dpns->redact`**, and the note above it at
+`:4235–4246` explains the consequence: a sub-query deparsed through
+`get_query_def()` assigns real column names even when the enclosing deparse was
+redacting. It also records why that is currently unreachable from EXPLAIN — the
+planner converts every `SubLink` into a `SubPlan`, so scalar, `EXISTS`, `ANY`,
+`ARRAY` and in-`CASE` sublinks all deparse as `(InitPlan ...).colN` from
+`get_parameter()` and never enter that function, checked rather than assumed —
+and that it is a latent hazard nonetheless. Whoever does T21a must read that
+comment before deciding the guard's placement, because the guard and this hazard
+interact: a namespace that has had its handle memset away no longer looks
+redacting to any check that tests the namespace.
+
+**Decide or defer before starting.** Two spec questions are recorded as
+unresolved in the requirements, and T21 is where each stops being theoretical.
+Neither is a code task; both are decisions,
+and both should be settled or explicitly deferred **before T21b lands**, because
+that is the commit that makes them visible. Each requirements section now carries
+a one-line forward reference here, so the two documents agree.
+
+- **`Query Parameters` — FR-22 / D10, requirements §3.1.3.** The requirements
+  record that the omission "has been challenged and is not settled", that the
+  stated reason (disclosing `params->numParams`) is weak relative to what the
+  design deliberately keeps, and that resolving it "is a prerequisite to changing
+  the code". T21b is what makes the inconsistency legible in a single record:
+  FR-21 renders an inline literal as `?::text` **inside** the newly live
+  expression properties, while the bound-parameter list is absent entirely — the
+  same secret disclosing more when written into the SQL than when bound. The
+  sound part of D10 survives either way and the requirements already say how to
+  keep it: place any redaction test *after* the existing `maxlen == 0` check
+  (`explain.c:1274` returns ahead of it today), so enabling redaction never
+  discloses more than `log_parameter_max_length = 0` already does. **Decision
+  needed: amend FR-22/D10, or record the asymmetry as accepted.** Do not change
+  the code under FR-22 without one or the other.
+- **FR-12 column numbering — requirements §3.1.2.** `t1_c3` discloses that the
+  column is third in its range-table entry. §3.1.2 records this as **not met**,
+  explains that it is structural rather than an oversight
+  (`set_relation_column_names()` must name every column, before anything knows
+  which the plan touches), and gives two candidate fixes — lazy assignment behind
+  an accessor, or reference-set precomputation from a plan walk. The reason it is
+  T21's business and nobody else's is scale, and §3.1.2's own T15 note names T21
+  as the deadline: today a column pseudonym appears in no redacted record at all,
+  because every property that can carry one is suppressed. After T21b it is in
+  **every `Output` and `Filter` line of every record**. **Decision needed: pick a
+  fix, or amend FR-12 to say the number is the column's position within its
+  range-table entry and never its name.** Deferring is defensible — it is schema
+  shape, not data — but it must be a recorded decision rather than a silent
+  change of scale.
+
+**Expected outcome, stated in advance: the inverted sweep converts in bulk.**
+The inverted leak sweep stands at **18 of 35** rows carrying real signal (T19's
+bookkeeping; T20 added none and promoted none). Most of the remaining 17 are
+vacuous for one reason: their fixture's marked name reaches output only through an
+expression property, so the row's "clean" verdict today means *the property is
+absent*, not *the name is absent from a property that exists*. T21b converts them
+as a side effect — this is the single largest promotion in the plan, and the only
+one that arrives without anybody writing a fixture.
+
+Recording it as an **expectation** rather than discovering it is the point. It
+gives T21c a real obligation: go row by row, and for each row that does **not**
+convert, say why. A row that fails to convert after T21b is a signal about that
+surface — either the property is still suppressed (a missed guard from T21b's
+enumeration), or the name reaches output by a path nobody has modelled, or the row
+is one of the permanent exceptions the file already names (the FR-96 rows, FR-15,
+FR-22/FR-23 as unreachable from plain `EXPLAIN`). It is **not** acceptable to read
+a non-converting row as leftover bookkeeping. Expect the count to land near
+35/35 and treat every gap as a finding.
+
+#### T21a — Redacted deparse context, the two-sided guard, and the tripwire decision
+
+**Goal.** Install `deparse_context_for_plan_tree_redacted()` on the EXPLAIN path
+and make the deparse entry point refuse to produce unredacted output from a
+redacting namespace. **Changes no byte of output** — every expression property is
+still suppressed by T04 when this lands — and is fully provable through
+`src/test/modules/test_explain_redact`. It turns T21b from a hunt into a flip.
+
+**Step 1 — `explain.c:918` must call `deparse_context_for_plan_tree_redacted()`.**
+*(rev. T20: `:917` was off by one; the call is at `:918`, re-verified against the
+current tree.)* *(rev. T19: this step was missing from this section and it is not
+a detail.)* `ExplainPrintPlan()` calls the **non-redacted**
+`deparse_context_for_plan_tree()` today, unconditionally, in both modes — on the
+line immediately after the `es->redact` branch that already selects
+`select_rtable_names_for_explain_redacted()` for the alias list, which is what
+makes the omission easy to miss. So `dpns->redact` is NULL on every EXPLAIN path
+and, through it, every column name in the plan is assigned from the real one. Two
+further consequences, both already true: the test module is the only place any
+layer-B guard executes today, so its coverage carries more weight than a unit test
+normally would; and no amount of T09–T20 testing through `EXPLAIN` can detect
+this, because the code under test is not reached.
+
+**Step 1's verification, which exists today.** The test module already calls
+`deparse_context_for_plan_tree_redacted()` (`test_explain_redact.c:621`) and
+`deparse_expression_redacted()` (`:633`) against a plan and asserts the returned
+string. T21a's own assertion is that the **EXPLAIN path** now builds the same kind
+of context: assert through the module that a context built the way
+`ExplainPrintPlan()` builds it yields `t1_c3`-shaped column names, and — the part
+that matters — that this holds for a plan whose columns are never referenced by
+any live property, since output is still suppressed here.
+
+**The defensive assertion, specified to catch both halves.** The previous version
+of this section specified it as: fire when `es->redact` is set and the deparse
+context carries no `RedactCtx`. That catches a missing or reverted step 1. It
+**cannot** catch the other half of the two-mechanism finding — a `show_*` site
+still calling plain `deparse_expression()` while the namespace *does* carry the
+map — and that is the likelier mistake, because it has eight call sites to hide in
+against step 1's one. The guard must catch both:
+
+> **Put the check in the deparse entry point, not in explain.c, and invert its
+> question.** `deparse_expression_pretty()` (`ruleutils.c:3761`) already holds
+> both halves of the state: the `deparse_namespace` it is about to deparse
+> against, and the `redact` parameter it was handed. It must `elog(ERROR)` — not
+> assert-only — when the namespace carries a `RedactCtx` and the parameter does
+> not. That single condition covers the whole surface: a `show_*` site that calls
+> plain `deparse_expression()` passes NULL and trips it, and an `es->redact`
+> EXPLAIN whose context was never built redacted cannot reach a redacting
+> namespace at all, so it is caught by the explain.c-side half below. The
+> question stops being "did the caller remember to use the redacted variant" and
+> becomes "the callee will not deparse a redacting namespace unredacted" — the
+> same principle T13 settled for `get_rule_expr` and T16 for
+> `explain_get_index_name`: whether every caller wants the same answer, and here
+> every caller of a redacting namespace does.
+>
+> **Keep the explain.c-side half too**, as specified before: if `es->redact` is
+> set and `es->deparse_cxt`'s namespace carries no `RedactCtx`, error rather than
+> emit. The two are not redundant. The ruleutils half cannot see the case where
+> the map was never installed, because with no map there is nothing to notice; the
+> explain.c half cannot see an unconverted call site, because the context is fine
+> and only the call is wrong.
+>
+> **FR-62 is why the ruleutils condition is phrased on the namespace and not on
+> the parameter.** `deparse_expression()` is public API — `pg_get_expr`,
+> `pg_get_viewdef`, `pg_get_ruledef`, FDW deparse and any extension call it with
+> `redact = NULL`, which is correct and must stay silent. Only
+> `deparse_context_for_plan_tree_redacted()` and
+> `select_rtable_names_for_explain_redacted()` ever install a namespace handle, so
+> conditioning the refusal on the namespace leaves every off-mode caller
+> untouched by construction rather than by a whitelist. Check this against the
+> `memset` hazard at `ruleutils.c:4247` before writing it: a namespace that has
+> been memset no longer carries the handle, so it will not trip the guard — that
+> is the latent hole the note at `:4235–4246` describes, and the guard does not
+> close it. Say so in the comment rather than implying coverage the check does not
+> have.
+
+**Both halves must be verified, separately, and neither verification is a
+thought experiment.** The explain.c half by perturbation: temporarily revert step
+1 and confirm the assertion fires rather than output appearing. Restore, and do
+not commit the perturbation. The ruleutils half **does not need a perturbation and
+must not wait for T21b**, because the test module can reach it directly — build a
+context with `deparse_context_for_plan_tree_redacted()` and a non-NULL handle,
+then call the plain `deparse_expression()` on an expression from that plan, and
+assert the error. That is a committed negative test rather than a temporary edit,
+and it is available here precisely because the module already does both halves of
+the setup (`test_explain_redact.c:621` and `:633`). A guard that has never been
+observed to fire is exactly the state T20 documented for its own; the whole reason
+this sub-task exists before the flip is that here both halves *can* be observed.
+T21c repeats both against live output, where the failure they prevent first has a
+visible shape.
+
+**The tripwire: wire it or stop counting it.** §2.1 lists
+`explain_redact_tripwire()` as one of four completeness mechanisms and describes
+it as firing at the moment of the write for *any* query touching a marked object,
+not only for fixtures. As of T18 it has **no caller anywhere in the backend** —
+its only caller tree-wide is its own unit test at
+`test_explain_redact.c:326` — so §2.1's argument currently rests on three
+mechanisms, which that section already admits. T21 is exactly when its reach would
+pay: output returns across nine guards at once, and the tripwire is the only
+mechanism of the four that names a line rather than a symptom. **This sub-task
+owns the decision, either way**: wire it into the emission path — the natural
+sites are `ExplainPropertyText()`/the property writers, or each converted
+`show_*` after the deparse returns — or decide not to, and amend §2.1 to stop
+counting it. It must not be left implied. If it is wired, it belongs here rather
+than in T21b, because arming it while output is still suppressed is the safe
+order and costs nothing: in an assert build it only traps, and in a non-assert
+build the header's macro makes it a no-op.
+
+**Revert.** Nothing observable changes; expression properties are suppressed by
+T04 either way. The guard and the context handle are lost, which is why T21b must
+not be applied on top of a reverted T21a.
+
+#### T21b — Lift the expression suppressions
+
+**Goal.** Step 2: replace the T04 suppressions with calls that pass the
+`RedactCtx`. This is the commit that changes output, and it is the only one of the
+three that does.
+
+**The enumeration, because "the show_* calls" is not a specification.** T04's
+section enumerates 21 properties for the same reason: "blank the names" was never
+one code site. The failure mode this guards against is not hypothetical — T13
+shipped with 5 of 10 sites wired while its own journal claimed all 10, and nothing
+in the suite noticed. Verified against the tree at T20; **7 functions, 9 guards**,
+because `show_tablesample` has three.
+
+**Must be lifted — 7 functions, 9 guards:**
+
+| line | guard as it stands | function | surface |
+|---|---|---|---|
+| 2765 | `if (es->redact) return;` | `show_plan_tlist` | `Output` |
+| 2832 | `if (es->redact) return;` | `show_expression` | the busiest of the set — everything through `show_qual()`, `show_scan_qual()` and `show_upper_qual()` arrives here: `Filter`, `Conflict Filter`, `Order By`, `Index Cond`, `Recheck Cond`, `TID Cond`, `Join Filter`, `Merge Cond`, `Hash Cond`, `Run Condition`, `One-Time Filter`, and `Function Call` / `Table Function Call` from `:2377`/`:2391` |
+| 2989 | `if (es->redact) return;` | `show_grouping_sets` | grouping-set keys **and the nesting**. Its own comment records that the nesting is plan structure rather than data and was dropped only because Stage 2 erred safe, with "the nesting returns once there are substitute names to print inside it" — this is that point. Restoring the keys without the nesting would be a *third* behavior, not a step towards upstream. |
+| 3143 | `if (es->redact) return;` | `show_sort_group_keys` | `Sort Key` / `Group Key`, and **T20's activation point** — see T21c |
+| 3371 | `if (!es->redact) { … }` | `show_window_def` | the whole body: `" AS ("`, `PARTITION BY`, `ORDER BY` (both via `show_window_keys`), the frame string, and the closing `")"`. The window **name** at `:3364` is T19's and is already live — do not touch it. |
+| 3536 | `if (!es->redact) { … }` | `show_tablesample` | the deparse-context setup and the argument/seed deparse |
+| 3573 | `if (!es->redact) { … }` | `show_tablesample` | text-format `Sampling: f1 (…)` argument list. The parentheses go with the arguments by design: `Sampling: f1 ()` would describe a method that takes none. |
+| 3600 | `if (!es->redact) { … }` | `show_tablesample` | non-text `Sampling Parameters` and `Repeatable Seed` |
+| 4150 | `if (!es->redact) { … }` | `show_memoize_info` | `Cache Key` only. The hit/miss/eviction counts, the memory estimates and `Cache Mode` are outside this guard and must stay outside it. |
+
+`show_tablesample` also has `if (es->redact)` at **`:3530`**, six lines above the
+first of its three. That is T17's pseudonymized method-name lookup and it is
+already correct and live. It is the easiest wrong line in the file to grab.
+
+**Must NOT be touched — the extension five. FR-25 keeps this output suppressed
+permanently, not until T21:**
+
+| line | site |
+|---|---|
+| 675 | `explain_per_plan_hook` |
+| 2448 | `show_foreignscan_info` |
+| 2459 | `ExplainCustomScan` |
+| 2629 | `explain_per_node_hook` |
+| 5499 | `ExplainForeignModify` |
+
+The reason is in the tree at `:675`: the hook is handed the `ExplainState` and the
+whole plan tree and can print anything it likes, including by calling the
+expression printer directly. Nothing explain.c does constrains that, and
+`pg_overexplain` in our own tree is the demonstration — from that hook it prints
+the entire range table, column names included. T21a's ruleutils-side guard does
+**not** make these safe to lift: an extension can build its own deparse context.
+
+**Must stay omitted — the permanent three:** `Settings` (`:725`, FR-26),
+`Query Text` (`:1228`, FR-23), `Query Parameters` (`:1274`, FR-22 — and see the
+decide-or-defer note above; if FR-22 is amended, that is its own task, not part of
+this lift).
+
+**The risk runs in both directions, and only one direction has a detector.** A
+**missed** site leaves a property blank: recoverable, visible as a §10.2 sweep row
+that failed to convert, and in the safe direction §1.1 describes. An
+**over-lift** re-enables extension output that FR-25 forbids: it discloses, and it
+carries no marker, so the leak sweep cannot see it — an FDW's remote SQL is the
+user's query, not a `zsec_`-marked fixture name. So the two lists above are not
+symmetric in consequence, and the negative controls in §10.4 that assert the
+extension surfaces are still absent are load-bearing for this commit specifically.
+
+**Commit message must say what §1.2 requires:** this is the commit that makes
+T06–T20 load-bearing, and an out-of-order revert of any of them must revert this
+one first.
+
+**Revert.** Returns to expression suppression: less informative, still safe.
+Reverting this sub-task is the correct first move if anything downstream of T06
+needs unwinding.
+
+#### T21c — Verification with expressions live
+
+**Goal.** Discharge everything the plan has been accumulating against T21. Adds
+tests only; changes no behavior. Splitting it out is not bookkeeping — it is the
+only sub-task whose scope is known in advance to exceed the other two combined,
+and folding it into T21b would make the commit that changes output the same commit
+that grows the suite by most of §10.2.
+
+1. **The whole §10.2 catalog re-run with expressions live.** This is the first
+   point at which most of it is meaningful, and per the preamble the expected
+   result is the sweep converting from 18/35 towards 35/35 — with a written reason
+   for every row that does not.
+2. **§10.3's full mode matrix.**
+3. **§10.4's negative controls, which now matter far more than they did.** Exempt
+   function and operator names, core type labels, and plan structure must all be
+   present *inside* expressions — a task can "pass" by blanking more than it
+   should, and from here that would look like success. Plus the extension-surface
+   absence controls that T21b's over-lift risk makes load-bearing.
+4. **T20's sort-key guard, which this is the deadline for.**
+   `show_sortorder_options()` (`explain.c:3240`) pseudonymizes the `COLLATE`
    collation and the `USING` operator itself, and as landed it is **never entered
-   under redaction**: `show_sort_group_keys()` returns early, because a decoration
-   is appended to the deparsed key string and the string cannot be printed without
-   the expression. Lifting that return is step 2's job, and the instant it is
+   under redaction** — `show_sort_group_keys()` returns early, because a
+   decoration is appended to the deparsed key string and the string cannot be
+   printed without the expression. T21b lifts that return, and the instant it is
    lifted T20's guard goes from unexecuted to load-bearing on the same line of
-   output as the key expression. Until then **T20 has no verification reach at
-   all** — not through EXPLAIN, and not through
-   `src/test/modules/test_explain_redact` either, because the function is `static`
-   in explain.c and out of the module's reach.
+   output as the key expression. Until then T20 has no verification reach at all:
+   not through EXPLAIN, and not through `src/test/modules/test_explain_redact`
+   either, because the function is `static` in explain.c and out of the module's
+   reach.
 
-   So T21's tests **must** include, in a sort key: a **user-defined collation**
+   So these tests **must** include, in a sort key: a **user-defined collation**
    and a **user-defined ordering operator**. Assert `coll`*N* and `op`*N* in
    `Sort Key`, with `COLLATE "C"` and `USING <` as the exempt negative controls
    (T11 and T10). Without both, T20 ships permanently unverified — and unlike the
    FR-94 / FR-98c / FR-15 guards, T20 is **not** an unreachable-path guard that
-   can be left argued; it is a reachable path that this task makes reachable.
-   Note that neither name exists in the tree's off-mode expected output in a form
-   this build runs: the only user-defined ordering operator is `USING <^` in
+   can be left argued; it is a reachable path that T21b makes reachable. Neither
+   name exists in the tree's off-mode expected output in a form this build runs:
+   the only user-defined ordering operator is `USING <^` in
    `contrib/postgres_fdw`, and the user collations are in `collate.icu.utf8.out`,
-   which self-skips under `with_icu = no`. T21 creates its own.
+   which self-skips under `with_icu = no`. T21c creates its own.
+5. **FR-97 and FR-99, carried here by T14.** The cursor name and the `nextval`
+   sequence argument ship untested in T14 because the deparse harness cannot reach
+   them; both are EXPLAIN-only production paths. Verify them here.
+6. **Both halves of T21a's guard, re-checked against live output.** T21a verifies
+   them with output still suppressed — the explain.c half by a temporary revert of
+   step 1, the ruleutils half by a committed negative test in the module. Repeat
+   both here with output live, and add the perturbation that was not available
+   then: point one of T21b's converted `show_*` sites back at plain
+   `deparse_expression()` and confirm the ruleutils error fires **rather than a
+   property appearing with real column names in it**. That is the check that
+   matters most in the whole task, because it is the only one that exercises the
+   feature's worst failure mode — a populated, plausible, unredacted property —
+   and it only has a visible shape once properties are populated at all. Not
+   committed.
 
-   Same shape as step 1, and the same failure mode: nothing errors, nothing looks
-   wrong, the property is simply populated with a real name.
-
-Plus a **defensive assertion**: if `es->redact` is set and the deparse context
-carries no `RedactCtx`, error rather than emit. That converts an out-of-order
-revert of T06–T20 (§1.2) from a silent leak into a loud failure — **and, as of
-the finding above, it is also the check that would have caught step 1.** Write it
-so that it fires on exactly that state: `es->redact` true and the context's
-`redact` pointer NULL. Verify it by temporarily reverting step 1 and confirming
-the assertion fires rather than output appearing.
-
-**Tests.** The whole §10.2 catalog re-run with expressions enabled — this is
-the first point at which most of it is meaningful. Including step 3's user
-collation and user ordering operator in a sort key, which is not optional. Plus §10.3's full mode
-matrix. Plus the §10.4 negative controls, which now matter far more: exempt
-function and operator names, core type labels, and plan structure must all be
-present *inside* expressions.
-
-**Revert.** Returns to expression suppression: less informative, still safe.
-Reverting this task is the correct first move if anything downstream of T06
-needs unwinding.
+**Revert.** Loses verification, changes no output. This is the one sub-task whose
+revert is *not* in the safe direction in any meaningful sense: it leaves T21b in
+place with its assurance removed. Do not revert it in isolation; revert T21b.
 
 ---
 
@@ -1908,7 +2229,17 @@ T02  RedactCtx ──► T03 ExplainState ──► T04 total suppression ──
                                        ▼
                               T20 sort decorations
                                        ▼
-                              T21 ENABLE EXPRESSIONS   ◄── requires all of T06–T20
+                         T21a redacted deparse context + guard
+                              (no output change; provable
+                               through the test module)
+                                       ▼
+                         T21b ENABLE EXPRESSIONS   ◄── requires all of T06–T21a
+                              (the only commit that changes output;
+                               revert this one first, §1.2)
+                                       ▼
+                         T21c verification with expressions live
+                              (§10.2 re-run, §10.3 matrix, §10.4
+                               controls, T20's guard, FR-97/FR-99)
                                        ▼
                               T22 allowlist ─► T23 docs
 ```
@@ -1920,9 +2251,19 @@ collapse reads nothing but the `context->redact != NULL` test that T06 puts in
 place — no pseudonym counter, no key domain, no agreement with any other task's
 naming — so it can land anywhere after T06. Stage 4 tasks
 T15–T19 are likewise independent of each other. Two orderings are mandatory:
-T20 before T21, and **T04a before any Stage 4 task** — otherwise the narrowing
+T20 before T21b, and **T04a before any Stage 4 task** — otherwise the narrowing
 tasks are validated against thirty fixtures instead of the whole suite, which is
 the difference between the two completeness regimes described in §2.1.
+
+*(rev. T21 plan amendment: T21's three parts are strictly ordered among themselves
+and cannot be parallelised, which is unlike every other adjacent group in this
+diagram. T21a before T21b because T21b's guard against its own likeliest mistake
+lives in T21a — lifting a suppression while the deparse context carries no handle
+is precisely the populated-but-unredacted failure the split exists to prevent.
+T21b before T21c because T21c's largest obligation, the §10.2 re-run, has nothing
+to assert until properties are populated. The T20 ordering tightens rather than
+moves: T20 must precede **T21b** specifically, since T21b is what first enters
+`show_sortorder_options()` under redaction.)*
 
 ## 5. Rollback matrix
 
@@ -1930,10 +2271,12 @@ the difference between the two completeness regimes described in §2.1.
 |---|---|---|
 | T23 | docs only | yes |
 | T22 | allowlisted schemas re-redact | yes — strictly safer |
-| T21 | expressions suppressed again | yes — strictly safer |
-| T15–T20 (after T21) | that surface returns to blanked | yes |
-| T06–T14 (after T21) | **would leak** | **no** — revert T21 first (§1.2); the T21 assertion makes this fail loudly |
-| T06–T14 (before T21) | none; output already suppressed | yes |
+| T21c | verification removed; output unchanged | yes, but do not — it leaves T21b in place with its assurance gone; revert T21b instead |
+| T21b | expressions suppressed again | yes — strictly safer |
+| T21a | no output change; loses the two-sided guard and the deparse handle | yes **only after T21b is reverted** — reverting it under a live T21b is the leak §1.2 describes, with the guard that would catch it removed in the same commit |
+| T15–T20 (after T21b) | that surface returns to blanked | yes |
+| T06–T14 (after T21b) | **would leak** | **no** — revert T21b first (§1.2); T21a's assertion makes this fail loudly |
+| T06–T14 (before T21b) | none; output already suppressed | yes |
 | T04a | loses the strongest completeness check; output unchanged | yes, but do not — every later task's assurance drops to the fixture catalog alone |
 | T05 | no correlation token; feature usable but hard to operate | yes |
 | T04 | feature disappears; tree returns to today's behavior | yes |
