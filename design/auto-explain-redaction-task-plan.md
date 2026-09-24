@@ -1498,45 +1498,162 @@ What the tests must cover, with the finding that makes each one necessary:
 
 #### T19 — Sub-plan labels and window names
 
-`Subplan Name` → `CTE spN` / `InitPlan spN` / `SubPlan spN` (`:1661`,
-`:5152-5156`), sharing the map with T17's `cteN` so the two lines stay
-relatable (FR-90); `get_parameter()`'s `(hashed SubPlan …).colN` (`:8798`);
-`show_window_def` → `wN` (`:2912`); `get_windowfunc_expr_helper()`'s
-`OVER <winname>` (`:11194`) — dormant until T21 but landed and unit-tested
-here.
+*(rev. T19: rewritten to match what was built. The original text is preserved
+only where it was right; five of its claims were not, and each correction is
+named so a reader can tell a change of plan from a change of fact.)*
 
-*(rev. T17: **the shared map is keyed on `hash_bytes(name)`, and that is what
-T19 has to use.** "Sharing the map with T17's `cteN`" above is right but not
-specific enough to act on, so: the entry point is
-`explain_redact_by_name(es, REDACT_CTE, name)` (explain.c `:843`), which hashes
-the name string and calls `explain_redact_local()`. It is keyed on the string
-rather than on the range-table index precisely so that T19 can reach it — a
-`SubPlan` carries `plan_name` and no range-table index. T19 must pass the CTE
-name it finds in `plan_name` **after** stripping the `CTE `/`InitPlan `/`SubPlan `
-prefix the label adds, and must not build a second map.
+**Landed.** explain.c +136/−59, ruleutils.c +155/−7. Two EXPLAIN-side sites and
+five deparse-side sites.
 
-**One case where the two cannot agree, and T19 needs it before writing the FR-90
-fixture.** `choose_plan_name()` (planner.c) **uniquifies a duplicate CTE name**:
-where two CTEs in one statement share a name, the second sub-plan is named
-`name_1`. That string hashes differently from the `ctename` on the scan target,
-so the sub-plan label and the `CTE Name` get different `cteN` for what is one
-CTE — and, symmetrically, the two same-named CTEs collapse onto one `cteN` on
-the scan-target side. Readability cost inside a single record, no disclosure;
-the same tradeoff T14 accepted for cursor names. Do not write the FR-90 fixture
-with duplicate CTE names and do not treat this as a regression; if it needs
-closing, the fix is on the planner-name side and is its own task.
+| # | Site | Prints | Key |
+|---|---|---|---|
+| 1 | explain.c `ExplainSubPlans()` (`:5820-5831`) | `CTE cteN` / `InitPlan spN` / `SubPlan spN` | `hash_bytes(plan_name)` for CTE, else `plan_id` |
+| 2 | explain.c `show_window_def()` (`:3286-3297`) | `Window: wN` — **name only** | `winref` |
+| 3 | ruleutils.c `get_parameter()` (`:9100-9119`) | `(hashed SubPlan spN).colN` | via `redact_subplan_name()` |
+| 4 | ruleutils.c `get_rule_expr()` `T_SubPlan` (`:9998-10023`) | `EXISTS(SubPlan spN)`, `ARRAY(SubPlan spN)` | same |
+| 5 | ruleutils.c `get_rule_expr()` `T_AlternativeSubPlan` (`:10048-10070`) | same strings; node never reaches a finished plan | same — guard only |
+| 6 | ruleutils.c `get_windowfunc_expr_helper()` decompilation arm (`:11705-11721`) | `wN`; `pg_get_viewdef()` path, no redacting caller today | guard only |
+| 7 | ruleutils.c `get_windowfunc_expr_helper()` EXPLAIN arm (`:11745-11765`) | `OVER wN` | `winref` |
 
-The keying is already exercised across two independent printers, which is the
-part T19 does not have to re-establish: T17 measured the `CTE Scan` and the
-`WorkTable Scan` of one recursive CTE both printing `cte1`, since the
-self-reference RTE carries the same `ctename`. What is **not** established is
-agreement with `plan_name`, because the label is still bare — that is T19's
-fixture to write and the reason T17's regress section calls its recursive case
-an FR-90 *rehearsal* rather than a proof.)*
+**`winref` is an exact key; T17's `cteN` is a hash. Both are right, and the
+difference is in what the printers share, not in taste.** `show_window_def()`
+holds `wagg->winref`, and `get_windowfunc_expr_helper()` already matches
+`wfunc->winref` against `wagg->winref` in order to *find* the name it prints — so
+both sides hold the same integer and
+`explain_redact_local(ctx, REDACT_WINDOW, winref, 0)` makes them one map entry,
+with no collision risk and no agreement on a hash input to get wrong. A CTE has
+no such luxury: three printers name it and one of them, the `Subplan Name` label,
+holds only a string, so the string had to be the key. Each site carries a comment
+saying this, because the two decisions sit one screen apart and read as an
+oversight otherwise. Hash the window name only if some future printer of it turns
+up holding the string alone.
 
-**Tests.** The FR-90 CTE fixture asserting the `CTE Name` and `Subplan Name`
-pseudonyms resolve to the same object — with a **unique** CTE name, per the
-uniquifier note above; the FR-91 window fixture; a hashed subplan.
+**Non-CTE sub-plans are keyed on `plan_id`.** The index into
+`PlannedStmt.subplans`, unique within the statement, and both printers hold the
+`SubPlan` node — so this is the same exact-key argument as `winref`, in a second
+namespace (`REDACT_SUBPLAN`, prefix `sp`). Only the CTE half hashes, and only
+because it has to arrive at a map that is already string-keyed.
+
+**`Window: wN` has no ` AS (`, and that was a decision.** `show_window_keys()`
+and `get_window_frame_options_for_explain()` both call plain
+`deparse_expression()`, so the `PARTITION BY`/`ORDER BY` keys and the frame
+offsets are T21's surface; T19 re-enabled the name only, exactly as T17 did for
+`Sampling:`. Printing `Window: w1 AS ()` to satisfy the requirement's stated
+regex would have been worse than failing it — empty parentheses are a **valid**
+window definition meaning no partition, no ordering and the default frame, so the
+record would assert something false about the plan. The requirement was phased
+instead; see requirements §10.2 FR-91.
+
+**Five corrections to the pre-T19 text, and the first two would have caused bugs.**
+
+1. **"after stripping the `CTE `/`InitPlan `/`SubPlan ` prefix" — WRONG, and
+   stripping would have been the bug.** `plan_name` carries no prefix. It is
+   seeded bare by `choose_plan_name()` — from `cte->ctename` at subselect.c:980,
+   or from `sublinktype_to_string()` (`exists_1`, `any_2`, `expr_3`) at
+   subselect.c:226 — and the prefix is built by the `psprintf()` calls in
+   `ExplainSubPlans()` itself, which never write it back. So the string to hash is
+   `sp->plan_name` verbatim, byte-identical to the `rte->ctename` T17 hashes.
+   Hashing `"CTE " || plan_name` instead produces `Subplan Name: CTE cte2` over
+   `CTE Name: cte1`; that was built on a scratch tree to confirm the fixture
+   catches it, and all four format rows went red.
+
+2. **The deparse side has THREE `plan_name` prints, not one.** The plan named
+   only `get_parameter()`, and the design's FR-90 table listed only
+   `get_parameter()` at `:8798`. `get_rule_expr()`'s `T_SubPlan` case (row 4
+   above) also prints it and is EXPLAIN-reachable — a testexpr-less `SubPlan` in a
+   target list, i.e. a correlated `EXISTS` or `ARRAY` subquery, arrives there and
+   not at `get_parameter()`. Omitting it would have left a live leak for T21. The
+   line numbers "~9984 and ~10015" in the T19 brief were attributed to
+   `get_parameter()`; those are `get_rule_expr()`, and `get_parameter()`'s print
+   was at `:9091-9099`. All three now route through one static helper,
+   `redact_subplan_name()`.
+
+3. **The CTE case is detected structurally, and already was.**
+   `ExplainSubPlans()` branches on `sp->subLinkType == CTE_SUBLINK` — the same
+   test the non-redacted arm uses — so no string matching was needed and none was
+   added.
+
+4. **Upstream already prints `wN`.** `name_active_windows()` (planner.c) invents
+   `w1`, `w2`, … for *unnamed* window clauses "for the benefit of EXPLAIN". Two
+   consequences: `wagg->winname` is never NULL on an EXPLAIN-reachable plan, so
+   the existing unconditional `quote_identifier()` was safe and so is the
+   pseudonym path; and a redacted `w1` and an unredacted `w1` **need not be the
+   same window**. Cosmetic namespace overlap, independent counters, nothing
+   disclosed — pinned as a fixture so nobody later reads agreement into it.
+
+5. **`OVER wN` and `Window: wN` cannot be shown agreeing in one record, and the
+   test task must not fake it.** `Output` is suppressed until T21, and would print
+   the real name even then for the reason in T21's checklist below. Worse,
+   comparing across two records is **unsound**: `explain_redact_local()` numbers
+   pseudonyms in **first-use order**, and the two surfaces visit windows in
+   different orders — measured, a two-window query whose target list mentions the
+   bottom window first has the deparse side calling it `w1` while EXPLAIN, walking
+   top down, calls the other one `w1`. Both cautions are pinned rather than
+   asserted.
+
+**The uniquifier limit, carried forward from T17 and not to be "fixed".**
+`choose_plan_name()` renames a second CTE of the same name to `name_1`, which
+hashes differently from the `ctename` the scan target still carries. Two CTEs
+sharing a name in one statement therefore get a label and a scan target with
+different `cteN`, and the record can show a `cteN` no scan target mentions.
+Readability cost inside one record, no disclosure — and since it carries no
+marker and no real name, the leak sweep is blind to it, which is why it is pinned
+as a fixture. If it needs closing, the fix is on the planner-name side and is its
+own task.
+
+**Tests, as landed.**
+
+* **FR-90 agreement, all four formats, and it is not vacuous.** `Subplan Name:
+  "CTE cte1"` against `CTE Name: "cte1"`, with per-format extraction patterns —
+  one format-agnostic pattern would compare text's single string with itself. The
+  unredacted control shows the *same* real name in both places, which is what
+  makes "the same pseudonym" the right demand. Failure demonstrated twice: the
+  duplicate-name query above returns label set `{cte1,cte2}` against scan-target
+  set `{cte1}` in-tree, and the perturbed build in correction 1 turned all four
+  rows red.
+* **Non-CTE labels.** One statement, one uncorrelated and one correlated
+  sub-plan, `InitPlan sp1` and `SubPlan sp2`, asserted **distinct**. The
+  unredacted control shows `expr_1` / `expr_2` — planner-made names that carry no
+  marker, which is exactly why the sweep cannot see this surface.
+* **FR-91.** `Window: w1` in all four formats, with five absence clauses: the
+  ` AS (`, the partition key, the ordering key, the frame keywords, and both frame
+  offsets **by value**. The offsets are values, not identifiers, so no marker
+  convention reaches them. `count(*)` not `rank()`: `rank()` is frame-insensitive
+  and the planner rewrites its frame to a default, so an unredacted `rank()`
+  record does not contain the offsets and the absence clauses would assert
+  nothing. Negative control is one boolean per absence clause.
+* **Module coverage of the deparse sites** —
+  `src/test/modules/test_explain_redact`, which is the **only** place any of them
+  executes today (see T21's checklist). All four EXPLAIN-reachable strings
+  measured: `(InitPlan sp1).col1`, `EXISTS(SubPlan sp1)`, `ARRAY(SubPlan sp1)`,
+  `hashed SubPlan sp1`, `rank() OVER w1`. Two fixture facts that cost an
+  experiment each and are recorded so they are not rediscovered: a
+  **non-equality** correlation is required for `EXISTS(SubPlan …)`, because an
+  equality correlation becomes a hashed ANY and lands back in `get_parameter()`;
+  and the `hashed ` marker **is** module-reachable through that same rewrite,
+  contrary to the working note that said it was not.
+* **Not covered, and stated rather than skipped.** FR-40 for sub-plans — one
+  sub-plan referenced twice keeping one pseudonym — could not be produced:
+  PostgreSQL does not CSE scalar subqueries, so two occurrences are always two
+  `plan_id`s even when the planner duplicates a subquery written once (measured:
+  `expr_1` / `expr_2` unredacted). It rests on the key being an identity, argued
+  from the code; it **is** measured for CTEs, in T17's "one CTE scanned twice"
+  fixture.
+
+**Sweep bookkeeping.** Two existing rows **promoted**, none added, none
+relabelled away. Both `FR-90 Subplan Name carries CTE name` and `FR-91 window
+name` reach their marker through a property T19 itself changed — `Subplan Name`,
+which read `CTE` with nothing after it from T04 to T18, and `Window`, which T04
+suppressed entirely — so the T17 precedent (add a row when the surface is
+someone else's) did not apply. Sweep stays 30 rows; inverted rows carrying real
+signal 16/35 → **18/35**. One correction to T17's arithmetic recorded in the
+file: the FR-90 row stopped being *entirely* vacuous at T17, since its fixture is
+a CTE and `CTE Name` was live from then, so by any-surface accounting the counts
+would be 16/17/18 rather than 15/16/18. The file's convention throughout is
+own-surface accounting; the two agree from here on.
+
+**Revert.** Sub-plan labels return to a bare `CTE`/`InitPlan`/`SubPlan` and the
+`Window` property disappears again. Strictly safer, less informative — §1.1.
 
 #### T20 — Sort-key `COLLATE` / `USING` decorations
 
@@ -1560,11 +1677,36 @@ emitted through `deparse_expression_redacted()`.
 This is the highest-risk task in the plan and it is deliberately last. Its risk
 was moved into T06–T20, all of which are already landed and unit-tested.
 
-**Delivers.** Replace the T04 suppression of the `show_*` calls with calls that
-pass the `RedactCtx`. Plus a **defensive assertion**: if `es->redact` is set and
-the deparse context carries no `RedactCtx`, error rather than emit. That
-converts an out-of-order revert of T06–T20 (§1.2) from a silent leak into a
-loud failure.
+**Delivers — two required steps, not one.**
+
+1. **`explain.c:917` must call `deparse_context_for_plan_tree_redacted()`.**
+   *(rev. T19: this step was missing from this section and it is not a detail.)*
+   `ExplainPrintPlan()` calls the **non-redacted**
+   `deparse_context_for_plan_tree()` today, unconditionally, in both modes. T06
+   added the `_redacted()` variant and nothing in the backend calls it: its only
+   callers are its own NULL-passing wrapper and
+   `src/test/modules/test_explain_redact`. So `context->redact` is NULL on every
+   EXPLAIN path, and **every layer-B guard landed by T09–T14 and T19 is unreached
+   there** — not merely unprinted. If T21 does only what the sentence below used
+   to say, expression output comes back with no `RedactCtx` in the context and
+   every one of those guards falls through to the real name. That is precisely
+   the leak the whole of Stage 3 exists to prevent, and it would ship looking
+   like a working feature: the properties would be populated, plausible, and
+   unredacted. Two further consequences, both already true: the test module is
+   the only place any layer-B guard executes today, so its coverage carries more
+   weight than a unit test normally would; and no amount of T09–T20 testing
+   through `EXPLAIN` can detect this, because the code under test is not reached.
+
+2. **Replace the T04 suppression of the `show_*` calls** with calls that pass the
+   `RedactCtx`.
+
+Plus a **defensive assertion**: if `es->redact` is set and the deparse context
+carries no `RedactCtx`, error rather than emit. That converts an out-of-order
+revert of T06–T20 (§1.2) from a silent leak into a loud failure — **and, as of
+the finding above, it is also the check that would have caught step 1.** Write it
+so that it fires on exactly that state: `es->redact` true and the context's
+`redact` pointer NULL. Verify it by temporarily reverting step 1 and confirming
+the assertion fires rather than output appearing.
 
 **Tests.** The whole §10.2 catalog re-run with expressions enabled — this is
 the first point at which most of it is meaningful. Plus §10.3's full mode

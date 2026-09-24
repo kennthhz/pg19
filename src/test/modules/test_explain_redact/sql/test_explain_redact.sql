@@ -782,6 +782,165 @@ SELECT test_redact_deparse(
          true) NOT LIKE '%zsecdata-secret%' AS extract_field_absent_redacted;
 
 --
+-- T19: the three sub-plan-name sites and the window name in ruleutils.c.
+--
+-- THIS IS THE ONLY PLACE ANY OF THESE FOUR GUARDS EXECUTES TODAY, AND THAT IS A
+-- STRONGER STATEMENT THAN IT SOUNDS.  ExplainPrintPlan() builds its deparse
+-- context with deparse_context_for_plan_tree(), not the _redacted() variant, so
+-- context->redact is NULL on every EXPLAIN path in both modes -- every layer-B
+-- guard from T09 onward is unreached there, not merely unprinted.  This harness
+-- calls deparse_context_for_plan_tree_redacted() directly, so it is the whole of
+-- the coverage these sites have.  Taking it rather than arguing structurally.
+--
+-- FOUR SITES, AND ALL FOUR ARE REACHED.  What decided each fixture:
+--
+--   get_parameter(), "(InitPlan spN).colN" -- an UNCORRELATED scalar subquery in
+--       the target list.  find_param_generator() searches dpns->plan->initPlan
+--       first, so the InitPlan's output Param resolves and the reference prints.
+--
+--   get_rule_expr() case T_SubPlan, "EXISTS(SubPlan spN)" -- this branch is
+--       taken only when subplan->testexpr is NULL, i.e. when a SubPlan node sits
+--       in the expression itself rather than being reached through a Param.  That
+--       needs a CORRELATED subquery, so it is not pulled up or turned into an
+--       InitPlan, AND a correlation the planner cannot convert to a hashed ANY.
+--       An equality correlation becomes "exists_to_any" and lands back in
+--       get_parameter(); "<" stays an EXISTS SubPlan.  ARRAY() is the same branch
+--       reached by a different sublink type and is kept as a second witness,
+--       because the branch prints the name from two arms depending on
+--       useHashTable.
+--
+--   the "hashed " arm of get_parameter() -- reached, via the equality-correlated
+--       EXISTS above.  The planner rewrites it to a hashed ANY sub-plan, so the
+--       literal word "hashed" is printed in front of the pseudonym.  It stays,
+--       and should: it describes how the plan evaluates the sub-plan.
+--
+--   get_windowfunc_expr_helper(), "OVER wN" -- the top plan node of a windowed
+--       query IS the WindowAgg, and its WindowFuncs are in its target list, so
+--       the EXPLAIN arm of that function runs, matches WindowFunc->winref against
+--       WindowAgg->winref, and prints the name it finds.
+--
+-- NOT REACHED, AND NOT WRITTEN FOR: get_rule_expr() case T_AlternativeSubPlan.
+-- Its own comment in ruleutils.c says the node never appears in a finished plan,
+-- so nothing -- this harness included -- can reach it.  It carries the guard on
+-- the same footing as T13's get_tablefunc() and T14's three unreachable sites:
+-- guarded so that the file has no unguarded plan_name print left to
+-- re-adjudicate, tested by nothing.
+--
+-- Every fixture carries a non-redacted sibling in the same target list, for the
+-- reason the T13 and T14 fixtures do: "no secret in the output" cannot otherwise
+-- be told apart from output that was blanked wholesale.
+SELECT what,
+       test_redact_deparse(qry, false) AS plain,
+       test_redact_deparse(qry, true)  AS redacted
+  FROM (VALUES
+    ('01 InitPlan reference',
+     'SELECT c_second, (SELECT max(zsec_c1) FROM zsec_b) FROM zsec_c'),
+    ('02 EXISTS SubPlan',
+     'SELECT c_second, EXISTS (SELECT 1 FROM zsec_b WHERE zsec_c1 < zsec_c.c_first) FROM zsec_c'),
+    ('03 ARRAY SubPlan',
+     'SELECT c_second, ARRAY(SELECT zsec_c1 FROM zsec_b WHERE zsec_c1 < zsec_c.c_first) FROM zsec_c'),
+    ('04 hashed SubPlan reference',
+     'SELECT c_second, EXISTS (SELECT 1 FROM zsec_b WHERE zsec_c1 = zsec_c.c_first) FROM zsec_c'),
+    ('05 OVER window name',
+     'SELECT c_second, rank() OVER zsec_w19 FROM zsec_c WINDOW zsec_w19 AS (PARTITION BY c_first ORDER BY c_third)')
+  ) AS t(what, qry)
+ ORDER BY what COLLATE "C";
+
+-- The name-by-name assertions, because the pairs above are read by eye and the
+-- expected file would still match if a pseudonym came back as the real name
+-- somewhere a reader skimmed past.  Each row: the real name must be in the plain
+-- deparse and gone from the redacted one, and the pseudonym must be present --
+-- the third clause is what keeps the second from being satisfied by an empty
+-- string.
+SELECT what,
+       test_redact_deparse(qry, false) LIKE '%' || realname || '%' AS leaks_unredacted,
+       test_redact_deparse(qry, true)  NOT LIKE '%' || realname || '%' AS absent_redacted,
+       test_redact_deparse(qry, true)  ~ pseudo AS pseudonym_present
+  FROM (VALUES
+    ('01 InitPlan reference', 'expr_1',
+     'SELECT c_second, (SELECT max(zsec_c1) FROM zsec_b) FROM zsec_c',
+     '\(InitPlan sp[0-9]+\)\.col[0-9]+'),
+    ('02 EXISTS SubPlan', 'exists_1',
+     'SELECT c_second, EXISTS (SELECT 1 FROM zsec_b WHERE zsec_c1 < zsec_c.c_first) FROM zsec_c',
+     'EXISTS\(SubPlan sp[0-9]+\)'),
+    ('03 ARRAY SubPlan', 'array_1',
+     'SELECT c_second, ARRAY(SELECT zsec_c1 FROM zsec_b WHERE zsec_c1 < zsec_c.c_first) FROM zsec_c',
+     'ARRAY\(SubPlan sp[0-9]+\)'),
+    ('04 hashed SubPlan reference', 'exists_to_any_1',
+     'SELECT c_second, EXISTS (SELECT 1 FROM zsec_b WHERE zsec_c1 = zsec_c.c_first) FROM zsec_c',
+     'hashed SubPlan sp[0-9]+'),
+    ('05 OVER window name', 'zsec_w19',
+     'SELECT c_second, rank() OVER zsec_w19 FROM zsec_c WINDOW zsec_w19 AS (PARTITION BY c_first ORDER BY c_third)',
+     'OVER w[0-9]+')
+  ) AS t(what, realname, qry, pseudo)
+ ORDER BY what COLLATE "C";
+
+--
+-- FR-91's analogue of the FR-90 agreement claim, and the answer is that it
+-- CANNOT be observed in one record today.  Said plainly rather than approximated.
+--
+-- "OVER wN" and show_window_def()'s "Window: wN" pass the identical winref to the
+-- identical explain_redact_local(ctx, REDACT_WINDOW, winref, 0), so within ONE
+-- RedactCtx they are one map entry and agree by construction.  But one record
+-- cannot contain both: the Window property comes from EXPLAIN, "OVER" comes from
+-- a deparsed Output list, and Output is suppressed until T21 -- and would print
+-- the real name even then, because of the NULL redact context noted at the top of
+-- this section.  So there is no query that shows the agreement end to end, and no
+-- fixture here pretends to.
+--
+-- WHAT MUST NOT BE DONE INSTEAD, measured so that nobody tries it.  Comparing a
+-- wN from this harness against a wN from EXPLAIN is NOT sound, because pseudonyms
+-- are numbered in FIRST-USE order within a record and the two surfaces visit
+-- windows in different orders.  The query below has two named windows, and the
+-- target list mentions the one the plan puts at the BOTTOM first.  This harness
+-- therefore calls that window w1; EXPLAIN, walking the plan top down, calls the
+-- OTHER one w1.  Two records, one string, two different windows.
+--
+-- The same caution applies to the unnamed case for a different reason:
+-- name_active_windows() in the planner already invents "w1", "w2" for windows the
+-- user never named, so an unredacted wN and a redacted wN can collide too.  Both
+-- halves are pinned in src/test/regress/sql/explain_redact.sql, where the EXPLAIN
+-- side of the comparison is available; this is the deparse side of the same pair.
+SELECT test_redact_deparse(
+         'SELECT count(*) OVER zsec_w19b, rank() OVER zsec_w19a FROM zsec_c'
+         ' WINDOW zsec_w19a AS (PARTITION BY c_first), zsec_w19b AS (ORDER BY c_third)',
+         false) AS plain_two_windows;
+SELECT test_redact_deparse(
+         'SELECT count(*) OVER zsec_w19b, rank() OVER zsec_w19a FROM zsec_c'
+         ' WINDOW zsec_w19a AS (PARTITION BY c_first), zsec_w19b AS (ORDER BY c_third)',
+         true) AS redacted_two_windows;
+
+-- Two distinct sub-plans in one record must not share a pseudonym.  That is what
+-- keying on plan_id gives, and a constant or a per-record counter shared between
+-- kinds would fail it.
+SELECT test_redact_deparse(
+         'SELECT (SELECT max(zsec_c1) FROM zsec_b), (SELECT min(zsec_c1) FROM zsec_b) FROM zsec_c',
+         true) AS two_subplans_two_pseudonyms;
+
+-- THE OTHER HALF -- FR-40 applied to sub-plans, one sub-plan referenced twice
+-- keeping one pseudonym -- COULD NOT BE PRODUCED, and the attempt is recorded so
+-- that the gap is not mistaken for an oversight.  PostgreSQL does not
+-- common-subexpression-eliminate scalar subqueries, so two occurrences are always
+-- two SubPlan nodes with two plan_ids.  That holds even when the subquery is
+-- WRITTEN once and duplicated by the planner: pulling up "(SELECT (SELECT max(..))
+-- AS x) s" and selecting x twice deparses as expr_1 and expr_2 unredacted, so
+-- there were two sub-plans all along and sp1/sp2 below is the correct answer, not
+-- a collision.  A BETWEEN over two uncorrelated subqueries reaches neither, since
+-- it lives in a qual and this harness deparses only the top node's target list.
+--
+-- So the "same sub-plan, same pseudonym" property rests on the map key being
+-- plan_id, which explain_redact_local() looks up by identity -- argued from the
+-- code, not measured here.  It is measured for CTEs, where a repeated reference
+-- IS producible: see the "one CTE scanned twice" fixture in
+-- src/test/regress/sql/explain_redact.sql.
+SELECT test_redact_deparse(
+         'SELECT x, x FROM (SELECT (SELECT max(zsec_c1) FROM zsec_b) AS x) s',
+         false) AS written_once_planned_twice_plain;
+SELECT test_redact_deparse(
+         'SELECT x, x FROM (SELECT (SELECT max(zsec_c1) FROM zsec_b) AS x) s',
+         true) AS written_once_planned_twice_redacted;
+
+--
 -- T17: the two surfaces that need an extension loaded.
 --
 -- Everything else in this file tests the engine directly, because at T02 nothing

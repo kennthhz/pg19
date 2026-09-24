@@ -459,11 +459,45 @@ New in v1.2:
   the two lines stay relatable. Second site, layer B:
   `get_parameter()` prints `(hashed SubPlan <plan_name>).colN` at
   ruleutils.c:8798 and must use the same map.
+
+  *(rev. T19 — three corrections to this bullet, all landed.* ***One:*** *there
+  are **three** layer-B sites, not one. `get_rule_expr()`'s `T_SubPlan` case also
+  prints `plan_name`, and it is EXPLAIN-reachable; `T_AlternativeSubPlan` prints
+  it too and is not. See §4.3.3 for the corrected table.* ***Two:*** *nothing has
+  to be stripped off `sp->plan_name`. The prefix is built by the `psprintf()`
+  calls in `ExplainSubPlans()` and never enters `plan_name`, so the string to hash
+  is the bare name and is byte-identical to the `rte->ctename` T17 hashes.
+  `ExplainSubPlans()` also already branches on `sp->subLinkType == CTE_SUBLINK`,
+  so the CTE case is detected structurally and no string matching was needed.*
+  ***Three:*** *the `rte->eref->aliasname` seed named above was refuted at T01 and
+  does not reach this property — a subquery in `FROM` becomes a `SubqueryScan`
+  alias or is flattened away, and no `Subplan Name` is produced either way. Only
+  the CTE seed reaches it. Non-CTE sub-plans therefore get their own namespace
+  keyed on `plan_id` rather than on a hash, since both printers hold the
+  `SubPlan` node. Landed at explain.c:5820-5831; the label is redacted at its one
+  construction point, which covers all four output formats.)*
 - **`show_window_def()` — window names (FR-91).** explain.c:2912
   (`quote_identifier(wagg->winname)`) → emitted at 2957. `WindowAgg->winname`
   comes from `WindowClause->name` (createplan.c:6686). Not `VERBOSE`-gated.
   Second site, layer B: `get_windowfunc_expr_helper()` at ruleutils.c:11194
   prints `OVER <winname>` and must resolve to the same `wN`.
+
+  *(rev. T19 — landed, **name only**, and two things this bullet did not say.*
+  ***The key is `winref`, not a hash.*** *`get_windowfunc_expr_helper()` already
+  matches `WindowFunc->winref` against `WindowAgg->winref` to find the name it is
+  about to print, so both printers hold the same exact integer and "must resolve
+  to the same `wN`" is satisfied by construction rather than by agreeing on a
+  hash input. That is deliberately unlike the CTE decision one screen away, and
+  each site says so, because the two look inconsistent otherwise.*
+  ***The body stays suppressed, and that changes the requirement's shape.***
+  *`show_window_keys()` and `get_window_frame_options_for_explain()` call plain
+  `deparse_expression()`, so the keys and frame are T21's. A redacted line reads
+  `Window: w1` with **no** ` AS (` — not `Window: w1 AS ()`, which would be a
+  valid window definition meaning no partition, no ordering and the default
+  frame, and would therefore describe the plan falsely. FR-91's `^w[0-9]+ AS \(`
+  assertion is now phased in the requirements §10.2 rather than met here.
+  Landed at explain.c:3286-3341, where the body move is a pure re-indent —
+  `git diff -w` shows nothing for it.)*
 - **`show_result_replacement_info()` — `Replaces` (FR-92).** explain.c:5036-5069
   builds a comma-separated refname list, with the same
   `rte->eref->aliasname` fallback at explain.c:5042 as `ExplainTargetRel`.
@@ -587,8 +621,34 @@ New in v1.2:
 | `T_InferenceElem` | 10460, 10468 | collation and `get_opclass_name()` (13123/13128, schema-qualified). Not reachable from EXPLAIN today; implement as a guard | FR-98c |
 | `get_func_sql_syntax()` | 11284, 11306, 11330 | constants read straight from the datum: `EXTRACT` field, `IS … NORMALIZED` form, `NORMALIZE` form. **Never pass through `get_const_expr()`** | FR-98d |
 | `T_NextValueExpr` | 10419 | sequence name via `generate_relation_name()` inside `simple_quote_literal()` — the pseudonym must not break the `nextval('…')` shape | FR-99 |
-| `get_parameter()` | 8798 | `(hashed SubPlan <plan_name>).colN` — same map as FR-90 | FR-90 |
-| `get_windowfunc_expr_helper()` | 11194 | `OVER <winname>` — same map as FR-91 | FR-91 |
+| `get_parameter()` | 8798 → **9099 (as landed)** | `(hashed SubPlan <plan_name>).colN` — same map as FR-90 | FR-90 |
+| `get_rule_expr()` `case T_SubPlan:` | **9984 → 10005 (as landed)** | `EXISTS(SubPlan <plan_name>)`, `ARRAY(SubPlan …)`, `(rescan …)` — the testexpr-less arm, which prints the name because no referencing `Param` exists to imply it. **EXPLAIN-reachable** | FR-90 |
+| `get_rule_expr()` `case T_AlternativeSubPlan:` | **10015 → 10047 (as landed)** | same strings. **Not** reachable — the node never appears in a finished plan (see its own comment). Guard only | FR-90 |
+| `get_windowfunc_expr_helper()` | 11194 → **11705 (decompilation, guard only) and 11745 (EXPLAIN, as landed)** | `OVER <winname>` — same map as FR-91, keyed on the `winref` this function already matches to find the name | FR-91 |
+
+*(rev. T19 — **this table listed ONE `plan_name` print and there are three.** The
+correction matters, because the one it omitted from the Emits column is
+EXPLAIN-reachable: a testexpr-less `SubPlan` in a target list — a correlated
+`EXISTS` or `ARRAY` subquery — arrives at `get_rule_expr()`'s `T_SubPlan` case,
+not at `get_parameter()`, and prints `plan_name` there. Leaving it unguarded
+would have left a live leak for T21 to walk into. All three now take the guard,
+through one shared static helper `redact_subplan_name()`, so the CTE-hashes /
+`plan_id`-keys rule lives in one place on the deparse side rather than three.*
+
+*The line numbers in the original column were also wrong in a way worth naming
+rather than silently fixing: the brief that produced this table attributed
+"~9984 and ~10015" to `get_parameter()`. Those two are `get_rule_expr()`;
+`get_parameter()`'s print was at 9091-9099. Anchor on function names, not on
+these numbers — they moved again when the guards landed.*
+
+*Reachability, measured through `src/test/modules/test_explain_redact` rather than
+argued: all three EXPLAIN-reachable sites execute. `(InitPlan sp1).col1` from an
+uncorrelated scalar subquery in a target list; `EXISTS(SubPlan sp1)` from a
+**non-equality** correlated `EXISTS` (an equality correlation becomes a hashed ANY
+and lands back in `get_parameter()`); `ARRAY(SubPlan sp1)` as a second witness on
+the same branch; `hashed SubPlan sp1` from the equality-correlated form, which
+also shows the `hashed ` marker survives as intended. `T_AlternativeSubPlan` is
+unreachable by anything and has no fixture.)*
 | `get_range_partbound_string()` | 3921 | builds a zeroed `deparse_context` then calls `get_const_expr()`; latent rather than live, since `T_PartitionBoundSpec` does not appear in plan expressions | FR-64 |
 
 #### 4.3.4 Paths confirmed *not* to need changes

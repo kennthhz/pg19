@@ -276,6 +276,17 @@ INSERT INTO zsec_fixtures (fr, note, opts, zsec_expect, qry) VALUES
 ('FR-46', 'CTE column aliases',       'COSTS OFF', 'zsec_cc',
  'WITH zsec_cte2(zsec_cc) AS MATERIALIZED (SELECT zsec_ssn FROM zsec_customers) SELECT * FROM zsec_cte2 WHERE zsec_cc = ''x'''),
 -- FR-90/91: sub-plan labels and window names.
+--
+-- *(rev. T19: both of these rows are now GENUINE in the inverted sweep below --
+-- promoted, not replaced, because each reaches its marker through a property
+-- T19 itself changed.  The FR-90 row's is "Subplan Name", which read "CTE" with
+-- nothing after it from T04 until T19; the FR-91 row's is "Window", which T04
+-- suppressed entirely.  Neither fixture needed editing, and neither assertion
+-- needed inverting: both still say "the marker must not appear", and now say it
+-- about a property that is printed.  What the sweep still cannot see is the part
+-- that matters most for FR-90 -- whether the label's cteN is the SAME cteN as
+-- the CTE Scan's -- because two disagreeing pseudonyms carry no marker.  That is
+-- asserted in the T19 section, not here.)*
 ('FR-90', 'Subplan Name carries CTE name', 'COSTS OFF', 'zsec_cte3',
  'WITH zsec_cte3 AS MATERIALIZED (SELECT zsec_ssn FROM zsec_customers) SELECT * FROM zsec_cte3'),
 ('FR-91', 'window name',              'COSTS OFF', 'zsec_win',
@@ -931,8 +942,8 @@ SELECT f.fr,
 -- column-name half still waits on T21, as does every row whose identifier lives
 -- in a Filter or Output.  The rest wait on the task that owns their surface:
 -- T17 for FR-14 and FR-18, T18 for FR-17, T19 for FR-90 and
--- FR-91, T20 for FR-98a, T21 for FR-12, FR-20, FR-21, FR-46, FR-93, FR-97,
--- FR-98d, FR-99 and FR-13b.  The two FR-96 rows are collapsed by design and
+-- FR-91 *(rev. T19: both landed, see below)*, T20 for FR-98a, T21 for FR-12,
+-- FR-20, FR-21, FR-46, FR-93, FR-97, FR-98d, FR-99 and FR-13b.  The two FR-96 rows are collapsed by design and
 -- will stay vacuous here for good; their real coverage is the test module.
 --
 -- T16 converted two more *(rev. T16)*, which are the two this file holds for
@@ -982,6 +993,33 @@ SELECT f.fr,
 --
 -- The sweep is 30 rows now, and the count of inverted rows in this file that
 -- carry real signal is 16 of 35.
+--
+-- T19 converted two and added none *(rev. T19)*:
+--
+--   FR-90 Subplan Name carries CTE name -> Subplan Name
+--   FR-91 window name                   -> Window
+--
+-- Both existing rows were promoted rather than replaced, because both reach
+-- their marker through a property T19 itself changed -- which is the test the
+-- T17 and T18 notes above set, and the reason T17 had to add a row instead of
+-- promoting one.  The FR-90 row's marker reaches "Subplan Name", built at its
+-- one construction point in ExplainSubPlans(); the FR-91 row's reaches "Window",
+-- which T04 suppressed in its entirety and which now prints a pseudonym.
+--
+-- The sweep is still 30 rows, and the count of inverted rows in this file that
+-- carry real signal is 18 of 35.
+--
+-- ONE CORRECTION TO THE T17 PARAGRAPH ABOVE, found while doing this accounting.
+-- The FR-90 row stopped being *entirely* vacuous at T17, not at T19: its fixture
+-- is a CTE, so from T17 onward its marker also had a live "CTE Name" property to
+-- leak through, and T17's count of 15 should have been 16.  The row is counted
+-- here rather than there because this file's convention throughout is
+-- OWN-SURFACE accounting -- the same convention that keeps the older FR-18 row
+-- vacuous even though a pseudonym is printed elsewhere in its record.  Recorded
+-- so the arithmetic is reproducible and not just asserted: by own-surface
+-- accounting the sequence is 15 (T17), 16 (T18), 18 (T19); by any-surface
+-- accounting it would be 16, 17, 18.  The two agree from here on, because FR-90
+-- was the only row the distinction applied to.
 --
 -- The FR-18 row is new because the existing one could not be promoted.  "FR-18
 -- user function name" puts the name in a Filter, and an expression property is
@@ -1370,8 +1408,11 @@ SELECT v.kind,
 -- "CTE Scan on a1" -- one pseudonym, the alias, with the object name simply
 -- absent -- and now read "on f1 a1" and "on cte1 a1".  Two tokens where plain
 -- mode prints one; that shape is not a bug and is pinned in the T17 section
--- below.  The Subplan Name still reads "CTE" with nothing after it: FR-90 is
--- T19's and has not landed.)*
+-- below.  The Subplan Name used to read "CTE" with nothing after it.)*
+-- *(rev. T19: it now reads "CTE cte1", the same cte1 as the scan target one line
+-- above it.  That agreement is FR-90 and is asserted in the T19 section, not
+-- here; this dump just stopped being a record that names one CTE and then
+-- refuses to name it again.)*
 SELECT * FROM zsec_plan('SELECT * FROM zsec_func(''x'') AS zsec_fsalias',
                         'COSTS OFF, REDACT');
        zsec_plan        
@@ -1384,7 +1425,7 @@ SELECT * FROM zsec_plan('WITH zsec_cte15 AS MATERIALIZED (SELECT zsec_ssn FROM z
        zsec_plan        
 ------------------------
  CTE Scan on cte1 a1
-   CTE
+   CTE cte1
      ->  Seq Scan on t1
 (3 rows)
 
@@ -1393,7 +1434,7 @@ SELECT * FROM zsec_plan('WITH RECURSIVE zsec_rec15(zsec_n) AS (SELECT 1 UNION AL
                 zsec_plan                
 -----------------------------------------
  CTE Scan on cte1 a1
-   CTE
+   CTE cte1
      ->  Recursive Union
            ->  Result
            ->  WorkTable Scan on cte1 a3
@@ -2164,17 +2205,19 @@ SELECT fmt.name AS format,
 -- reader no way to tell they are the same thing.  No marker, no leak, so the
 -- sweep would stay clean and only this assertion would notice.
 --
--- This is also the property T19 inherits.  It cannot be tested from the subplan
--- label yet, because that label is still bare; what can be tested is that the
--- key works at all across two independent printers, which is what the two
--- targets here are.
+-- This is also the property T19 inherits.  *(rev. T19: the subplan label is no
+-- longer bare, so the same key can now be tested across a THIRD printer -- the
+-- "Subplan Name" label -- and it is, in the T19 section below.  What this
+-- rehearsal still covers that the T19 fixture does not is the recursive case:
+-- a WorkTable Scan has no plan id, which is the whole reason T17 chose a string
+-- key and therefore the reason FR-90 can be met at all.)*
 --
 SELECT * FROM zsec_plan('WITH RECURSIVE zsec_rec17(zsec_n) AS (SELECT 1 UNION ALL SELECT zsec_n + 1 FROM zsec_rec17 WHERE zsec_n < 5) SELECT * FROM zsec_rec17',
                         'COSTS OFF, REDACT');
                 zsec_plan                
 -----------------------------------------
  CTE Scan on cte1 a1
-   CTE
+   CTE cte1
      ->  Recursive Union
            ->  Result
            ->  WorkTable Scan on cte1 a3
@@ -3115,6 +3158,357 @@ SELECT jsonb_typeof(zsec_explain_blob('INSERT INTO zsec_t18_tab VALUES (1, ''zse
 -- Recorded rather than faked: a fixture asserting "no pg_catalog trigger was
 -- pseudonymized" would be asserting the absence of a string from output that was
 -- never going to contain it, which is the vacuity this file is organised against.
+-- ===========================================================================
+-- T19: sub-plan labels and window names (FR-90, FR-91).
+--
+-- TWO PROPERTIES, AND THE POINT OF THE FIRST IS AN AGREEMENT RATHER THAN AN
+-- ABSENCE.
+--
+--   Subplan Name (FR-90) -> "CTE cteN" / "InitPlan spN" / "SubPlan spN".  The
+--     CTE/InitPlan/SubPlan prefix is kept, because it tells a reader which of the
+--     three they are looking at and that describes the plan, not the data.  Only
+--     the name is replaced.  For a CTE sub-plan the cteN must be the SAME cteN
+--     that ExplainTargetRel() prints as the "CTE Name" of the CTE Scan below it,
+--     or one record names one CTE twice and gives the reader no way to tell the
+--     two lines are about the same thing.  THAT is the assertion; "no marker" is
+--     the easy half and would pass just as well if the label were blank.
+--
+--   Window (FR-91) -> "wN", with nothing after it.
+--
+-- WHY THE TWO HALVES ARE KEYED DIFFERENTLY, since the code reads inconsistently
+-- and a later reader will want to know it was deliberate.  The CTE half hashes
+-- the name string, because it has to arrive at the map T17 built and a SubPlan
+-- carries plan_name and no range-table index -- a string is the only key all
+-- three printers of a CTE name can compute.  Everything else is keyed on an
+-- exact integer the printers share: plan_id for a non-CTE sub-plan (the index
+-- into PlannedStmt.subplans, unique within the statement) and winref for a
+-- window.  Those agree by construction and cannot collide, so they are not
+-- hashed.  Hash the window name only if some future printer of it turns up
+-- holding the string alone.
+--
+-- WHAT "Window: wN" DOES NOT SAY, AND MUST NOT BE MADE TO SAY.  The PARTITION BY
+-- and ORDER BY keys and the frame offsets are deparsed expressions --
+-- show_window_keys() and get_window_frame_options_for_explain() both call plain
+-- deparse_expression() -- so they stay suppressed with the rest of T21's surface.
+-- A redacted line therefore reads "Window: w1" and NOT "Window: w1 AS ()".
+-- Empty parentheses are a valid window definition meaning no partition, no
+-- ordering and the default frame, so printing them would assert something false
+-- about the plan.  Same reasoning T17 wrote for dropping "Sampling: f1 ()".
+-- FR-91's stated assertion, ^w[0-9]+ AS \(, describes the POST-T21 shape and
+-- cannot hold between T19 and T21; the requirement now carries a phased note
+-- saying so, and the code was not bent to match the old regex.
+--
+-- WHY THE ABSENCE HALF NEEDS MORE THAN THE SWEEP.  The window fixture's frame
+-- carries two literal offsets, 424242 and 515151.  They are values, not
+-- identifiers, so they cannot carry a zsec_ marker and the leak sweep is
+-- structurally blind to them.  They are asserted absent by value, against the
+-- raw blob rather than through zsec_plan() -- which rewrites every digit to N and
+-- would make the assertion vacuous in the most literal way available.
+-- ===========================================================================
+--
+-- FR-90, all four formats, and the assertion is the AGREEMENT.
+--
+-- The CTE name is unique within the statement on purpose.  choose_plan_name()
+-- uniquifies a second CTE of the same name to "name_1", which hashes differently
+-- from the ctename the scan target still carries, so a duplicate name makes the
+-- two lines disagree by design.  That is a readability limit inherited from
+-- T17's string key, recorded and not to be "fixed"; it is demonstrated
+-- immediately below, which is also what shows this comparison is capable of
+-- returning something other than "ok".
+--
+-- Each format gets its own pair of patterns rather than one format-agnostic
+-- pair.  In text the two values are the same string in two places ("CTE cte1"
+-- over "CTE Scan on cte1"); in the structured formats they are two separate
+-- properties, "Subplan Name" and "CTE Name".  A pattern loose enough to match
+-- all four would match the label twice in text and compare a value with itself.
+--
+SELECT * FROM zsec_plan('WITH zsec_cte19 AS MATERIALIZED (SELECT zsec_ssn FROM zsec_customers) SELECT * FROM zsec_cte19', 'COSTS OFF, REDACT');
+       zsec_plan        
+------------------------
+ CTE Scan on cte1 a1
+   CTE cte1
+     ->  Seq Scan on t1
+(3 rows)
+
+SELECT v.fmt AS format,
+       CASE
+         WHEN s.b LIKE '%zsec_cte19%' THEN 'FAIL: real CTE name present'
+         WHEN s.b LIKE '%zsec_%'      THEN 'FAIL: marker present'
+         WHEN l.lbl IS NULL
+           THEN 'FAIL: no Subplan Name pseudonym -- assertion is vacuous'
+         WHEN c.scn IS NULL
+           THEN 'FAIL: no CTE Name pseudonym -- assertion is vacuous'
+         WHEN l.lbl = c.scn
+           THEN 'ok: Subplan Name "CTE ' || l.lbl || '" agrees with CTE Name ' || c.scn
+         ELSE 'FAIL: Subplan Name says ' || l.lbl || ' but CTE Name says ' || c.scn
+       END AS fr90_label_agrees_with_scan_target
+  FROM (VALUES
+        ('json', '"Subplan Name": "CTE (cte[0-9]+)"',
+                 '"CTE Name": "(cte[0-9]+)"'),
+        ('text', '\mCTE (cte[0-9]+)',
+                 'CTE Scan on (cte[0-9]+)'),
+        ('xml',  '<Subplan-Name>CTE (cte[0-9]+)</Subplan-Name>',
+                 '<CTE-Name>(cte[0-9]+)</CTE-Name>'),
+        ('yaml', 'Subplan Name: "CTE (cte[0-9]+)"',
+                 'CTE Name: "(cte[0-9]+)"')
+       ) AS v(fmt, lblpat, scnpat),
+       LATERAL (SELECT zsec_explain_blob('WITH zsec_cte19 AS MATERIALIZED (SELECT zsec_ssn FROM zsec_customers) SELECT * FROM zsec_cte19',
+                                         'COSTS OFF, REDACT, FORMAT ' || v.fmt)) AS s(b),
+       LATERAL (SELECT (regexp_match(s.b, v.lblpat))[1]) AS l(lbl),
+       LATERAL (SELECT (regexp_match(s.b, v.scnpat))[1]) AS c(scn)
+ ORDER BY v.fmt COLLATE "C";
+ format |          fr90_label_agrees_with_scan_target           
+--------+-------------------------------------------------------
+ json   | ok: Subplan Name "CTE cte1" agrees with CTE Name cte1
+ text   | ok: Subplan Name "CTE cte1" agrees with CTE Name cte1
+ xml    | ok: Subplan Name "CTE cte1" agrees with CTE Name cte1
+ yaml   | ok: Subplan Name "CTE cte1" agrees with CTE Name cte1
+(4 rows)
+
+-- The negative control for the agreement: both names are the real one in the
+-- unredacted record, so the comparison above is standing in for something that
+-- was there to leak, and it is the SAME string in both places -- which is what
+-- makes "the same pseudonym" the right thing to demand.
+--
+-- The label pattern is line-anchored with the 'n' flag, which the redacted
+-- patterns above do not need.  Unredacted, "CTE Scan on zsec_cte19" comes FIRST
+-- in the record and a bare \mCTE (\w+) matches the word "Scan" out of it -- which
+-- is how this control read "Scan" the first time it ran.  The redacted patterns
+-- are safe from that only because "cte[0-9]+" cannot match "Scan"; a control that
+-- has to accept any name does not have that luxury.
+SELECT (regexp_match(b, '^\s*CTE (\w+)$', 'n'))[1] AS unredacted_subplan_name,
+       (regexp_match(b, 'CTE Scan on (\w+)'))[1]    AS unredacted_scan_target
+  FROM (SELECT zsec_explain_blob('WITH zsec_cte19 AS MATERIALIZED (SELECT zsec_ssn FROM zsec_customers) SELECT * FROM zsec_cte19', 'COSTS OFF')) AS s(b);
+ unredacted_subplan_name | unredacted_scan_target 
+-------------------------+------------------------
+ zsec_cte19              | zsec_cte19
+(1 row)
+
+--
+-- AND THE PROOF THAT THE COMPARISON CAN COME BACK RED.
+--
+-- This file has shipped fixtures that passed while asserting nothing, so an
+-- agreement assertion is worth only as much as the counter-case beside it.  Two
+-- CTEs named the same thing in one statement is that counter-case, and it needs
+-- no perturbed build: the inner one's plan_name is uniquified to "zsec_dup19_1"
+-- and hashes elsewhere, while both scan targets still carry the bare ctename.
+-- So the label set and the scan-target set differ, and the equality above would
+-- have failed on this query.
+--
+-- Read the output as "the recorded limit, still there", not as a bug.  The cost
+-- is that one record uses one cteN for two CTEs and shows a third cteN that no
+-- scan target mentions -- confusing to read, and disclosing nothing: no marker,
+-- no real name, and the sweep stays clean either way, which is exactly why this
+-- had to be pinned rather than left to the sweep.
+--
+SELECT * FROM zsec_plan('WITH zsec_dup19 AS MATERIALIZED (SELECT zsec_ssn FROM zsec_customers) SELECT * FROM (WITH zsec_dup19 AS MATERIALIZED (SELECT zsec_bal::text AS zsec_ssn FROM zsec_customers) SELECT * FROM zsec_dup19) zsec_dupsub UNION ALL SELECT * FROM zsec_dup19', 'COSTS OFF, REDACT');
+             zsec_plan             
+-----------------------------------
+ Append
+   CTE cte1
+     ->  Seq Scan on t1
+   ->  CTE Scan on cte1 a3
+         CTE cte2
+           ->  Seq Scan on t1 t1_1
+   ->  CTE Scan on cte1 a2
+(7 rows)
+
+SELECT lbls AS subplan_name_pseudonyms,
+       scns AS cte_name_pseudonyms,
+       (lbls = scns) AS sets_agree
+  FROM (SELECT
+          (SELECT array_agg(DISTINCT m[1] ORDER BY m[1])
+             FROM zsec_plan(q.qry, 'COSTS OFF, REDACT') l,
+                  LATERAL regexp_matches(l, '\mCTE (cte[0-9]+)') m) AS lbls,
+          (SELECT array_agg(DISTINCT m[1] ORDER BY m[1])
+             FROM zsec_plan(q.qry, 'COSTS OFF, REDACT') l,
+                  LATERAL regexp_matches(l, 'CTE Scan on (cte[0-9]+)') m) AS scns
+          FROM (VALUES ('WITH zsec_dup19 AS MATERIALIZED (SELECT zsec_ssn FROM zsec_customers) SELECT * FROM (WITH zsec_dup19 AS MATERIALIZED (SELECT zsec_bal::text AS zsec_ssn FROM zsec_customers) SELECT * FROM zsec_dup19) zsec_dupsub UNION ALL SELECT * FROM zsec_dup19')) AS q(qry)) AS s;
+ subplan_name_pseudonyms | cte_name_pseudonyms | sets_agree 
+-------------------------+---------------------+------------
+ {cte1,cte2}             | {cte1}              | f
+(1 row)
+
+--
+-- Non-CTE sub-plans: "InitPlan spN" and "SubPlan spN", keyed on plan_id.
+--
+-- One statement with two sub-plans, so the numbering is shown to discriminate
+-- rather than being a constant that happens to read right.  The uncorrelated one
+-- becomes an InitPlan, the correlated one a SubPlan, and they take different
+-- plan_ids and therefore different spN.
+--
+-- WHAT IS NOT OBSERVABLE HERE, stated rather than quietly skipped.  The other
+-- printer of a non-CTE sub-plan's name is ruleutils.c, inside a deparsed
+-- expression -- "(InitPlan sp1).col1" in a Filter -- and every expression
+-- property is still suppressed, so the label and the reference cannot appear in
+-- one record until T21.  The agreement is covered where it can be covered today:
+-- src/test/modules/test_explain_redact deparses the expression directly and sees
+-- the reference.  What this fixture covers is the label, and that two sub-plans
+-- do not collide.
+--
+SELECT * FROM zsec_plan('SELECT zsec_id FROM zsec_customers zsec_c WHERE zsec_bal > (SELECT max(zsec_amt) FROM zsec_orders) AND zsec_bal > (SELECT max(zsec_amt) FROM zsec_orders zsec_o WHERE zsec_o.zsec_id = zsec_c.zsec_id)', 'COSTS OFF, REDACT');
+            zsec_plan            
+---------------------------------
+ Index Scan using i1 on t2 a1
+   InitPlan sp1
+     ->  Aggregate
+           ->  Seq Scan on t1
+   SubPlan sp2
+     ->  Aggregate
+           ->  Seq Scan on t1 a2
+(7 rows)
+
+SELECT CASE
+         WHEN b LIKE '%zsec_%'            THEN 'FAIL: marker present'
+         WHEN b !~ 'InitPlan sp[0-9]+'      THEN 'FAIL: no InitPlan pseudonym -- assertion is vacuous'
+         WHEN b !~ 'SubPlan sp[0-9]+'       THEN 'FAIL: no SubPlan pseudonym -- assertion is vacuous'
+         WHEN (regexp_match(b, 'InitPlan (sp[0-9]+)'))[1]
+              = (regexp_match(b, 'SubPlan (sp[0-9]+)'))[1]
+           THEN 'FAIL: two sub-plans share one pseudonym'
+         ELSE 'ok: InitPlan ' || (regexp_match(b, 'InitPlan (sp[0-9]+)'))[1]
+              || ' and SubPlan ' || (regexp_match(b, 'SubPlan (sp[0-9]+)'))[1]
+              || ' are distinct'
+       END AS fr90_non_cte_labels
+  FROM (SELECT zsec_explain_blob('SELECT zsec_id FROM zsec_customers zsec_c WHERE zsec_bal > (SELECT max(zsec_amt) FROM zsec_orders) AND zsec_bal > (SELECT max(zsec_amt) FROM zsec_orders zsec_o WHERE zsec_o.zsec_id = zsec_c.zsec_id)', 'COSTS OFF, REDACT')) AS s(b);
+              fr90_non_cte_labels              
+-----------------------------------------------
+ ok: InitPlan sp1 and SubPlan sp2 are distinct
+(1 row)
+
+-- Negative control: the planner-made names are in the unredacted record, so each
+-- absence above has something to be absent.  They are not user identifiers and
+-- carry no marker -- "expr_1", "exists_1" -- which is precisely why the sweep
+-- cannot see this surface and this assertion has to name the shape instead.
+SELECT (regexp_match(b, 'InitPlan (\w+)'))[1] AS unredacted_initplan_name,
+       (regexp_match(b, 'SubPlan (\w+)'))[1]  AS unredacted_subplan_name
+  FROM (SELECT zsec_explain_blob('SELECT zsec_id FROM zsec_customers zsec_c WHERE zsec_bal > (SELECT max(zsec_amt) FROM zsec_orders) AND zsec_bal > (SELECT max(zsec_amt) FROM zsec_orders zsec_o WHERE zsec_o.zsec_id = zsec_c.zsec_id)', 'COSTS OFF')) AS s(b);
+ unredacted_initplan_name | unredacted_subplan_name 
+--------------------------+-------------------------
+ expr_1                   | expr_2
+(1 row)
+
+--
+-- FR-91: the Window property, all four formats.
+--
+-- Eight clauses, and the last five are the ones that matter.  A pseudonymized
+-- name with the body still attached would satisfy "no marker" and leak every
+-- column in the window definition, so the body is asserted absent four ways --
+-- the " AS (" that would introduce it, the two key introducers, the frame
+-- keywords, and the two frame offsets by value.
+--
+-- count(*) rather than rank() on purpose: rank() is frame-insensitive and the
+-- planner rewrites its frame to a default, so an unredacted rank() record does
+-- not contain the offsets and the "absent" clauses below would have nothing to
+-- be absent.  Measured, not assumed -- see the negative control.
+--
+SELECT * FROM zsec_plan('SELECT zsec_ssn, count(*) OVER zsec_wina FROM zsec_customers WINDOW zsec_wina AS (PARTITION BY zsec_ssn ORDER BY zsec_bal ROWS BETWEEN 424242 PRECEDING AND 515151 FOLLOWING)', 'COSTS OFF, REDACT');
+         zsec_plan          
+----------------------------
+ WindowAgg
+   Window: w1
+   ->  Sort
+         ->  Seq Scan on t1
+(4 rows)
+
+SELECT fmt.name AS format,
+       CASE
+         WHEN s.b LIKE '%zsec_wina%'   THEN 'FAIL: real window name present'
+         WHEN s.b LIKE '%zsec_%'       THEN 'FAIL: marker present'
+         WHEN s.b !~ '\mw1\M'           THEN 'FAIL: no window pseudonym -- assertion is vacuous'
+         WHEN s.b ~ 'w1 AS'             THEN 'FAIL: window body introduced'
+         WHEN s.b LIKE '%PARTITION BY%' THEN 'FAIL: partition key printed'
+         WHEN s.b LIKE '%ORDER BY%'     THEN 'FAIL: ordering key printed'
+         WHEN s.b ~ 'PRECEDING|FOLLOWING|UNBOUNDED|CURRENT ROW'
+           THEN 'FAIL: frame printed'
+         WHEN s.b LIKE '%424242%' OR s.b LIKE '%515151%'
+           THEN 'FAIL: frame offset value printed'
+         ELSE 'ok: Window is w1, body absent'
+       END AS fr91_verdict
+  FROM (VALUES ('json'), ('text'), ('xml'), ('yaml')) AS fmt(name),
+       LATERAL (SELECT zsec_explain_blob('SELECT zsec_ssn, count(*) OVER zsec_wina FROM zsec_customers WINDOW zsec_wina AS (PARTITION BY zsec_ssn ORDER BY zsec_bal ROWS BETWEEN 424242 PRECEDING AND 515151 FOLLOWING)',
+                                         'COSTS OFF, REDACT, FORMAT ' || fmt.name)) AS s(b)
+ ORDER BY fmt.name COLLATE "C";
+ format |         fr91_verdict          
+--------+-------------------------------
+ json   | ok: Window is w1, body absent
+ text   | ok: Window is w1, body absent
+ xml    | ok: Window is w1, body absent
+ yaml   | ok: Window is w1, body absent
+(4 rows)
+
+-- The negative control, one boolean per absence clause above.  All five must be
+-- true or the corresponding clause is asserting the absence of something that
+-- was never going to be there.
+SELECT b LIKE '%zsec_wina%'   AS name_leaks_unredacted,
+       b ~ 'zsec_wina AS'      AS body_introduced_unredacted,
+       b LIKE '%PARTITION BY%' AS partition_key_present_unredacted,
+       b LIKE '%424242%'       AS start_offset_present_unredacted,
+       b LIKE '%515151%'       AS end_offset_present_unredacted
+  FROM (SELECT zsec_explain_blob('SELECT zsec_ssn, count(*) OVER zsec_wina FROM zsec_customers WINDOW zsec_wina AS (PARTITION BY zsec_ssn ORDER BY zsec_bal ROWS BETWEEN 424242 PRECEDING AND 515151 FOLLOWING)', 'COSTS OFF')) AS s(b);
+ name_leaks_unredacted | body_introduced_unredacted | partition_key_present_unredacted | start_offset_present_unredacted | end_offset_present_unredacted 
+-----------------------+----------------------------+----------------------------------+---------------------------------+-------------------------------
+ t                     | t                          | t                                | t                               | t
+(1 row)
+
+-- Two windows in one statement take two pseudonyms.  A constant would satisfy
+-- every clause above.
+SELECT * FROM zsec_plan('SELECT count(*) OVER zsec_winb, rank() OVER zsec_winc FROM zsec_customers WINDOW zsec_winb AS (PARTITION BY zsec_ssn), zsec_winc AS (ORDER BY zsec_bal)', 'COSTS OFF, REDACT');
+               zsec_plan                
+----------------------------------------
+ WindowAgg
+   Window: w1
+   ->  Sort
+         ->  WindowAgg
+               Window: w2
+               ->  Sort
+                     ->  Seq Scan on t1
+(7 rows)
+
+--
+-- A CAUTION, PINNED AND DELIBERATELY NOT ASSERTED.
+--
+-- name_active_windows() in the planner invents names "w1", "w2", ... for UNNAMED
+-- window clauses, "for the benefit of EXPLAIN", so plain EXPLAIN already prints
+-- wN for a window the user never named.  The pseudonym namespace here uses the
+-- same letter, and the two counters are entirely independent: REDACT_WINDOW
+-- numbers windows in the order the record first prints them, while the planner
+-- numbers unnamed clauses as it finds them.
+--
+-- The pair of dumps below is chosen to make that visible instead of leaving it
+-- as a warning.  One unnamed window and one named one: plain output calls the
+-- BOTTOM WindowAgg's window w1, and the redacted output calls the TOP one w1.
+-- Same string, different window.  So a redacted wN must never be read as
+-- agreeing with an unredacted wN, in this record or any other -- and, for the
+-- same reason, a redacted wN in one record must not be compared with a redacted
+-- wN in another.  Nothing is disclosed either way; what would be wrong is a
+-- later test that read the coincidence as evidence.
+--
+SELECT * FROM zsec_plan('SELECT count(*) OVER (PARTITION BY zsec_ssn), rank() OVER zsec_wind FROM zsec_customers WINDOW zsec_wind AS (ORDER BY zsec_bal)', 'COSTS OFF');
+                              zsec_plan                              
+---------------------------------------------------------------------
+ WindowAgg
+   Window: zsec_wind AS (ORDER BY zsec_bal ROWS UNBOUNDED PRECEDING)
+   ->  Sort
+         Sort Key: zsec_bal
+         ->  WindowAgg
+               Window: w1 AS (PARTITION BY zsec_ssn)
+               ->  Sort
+                     Sort Key: zsec_ssn
+                     ->  Seq Scan on zsec_customers
+(9 rows)
+
+SELECT * FROM zsec_plan('SELECT count(*) OVER (PARTITION BY zsec_ssn), rank() OVER zsec_wind FROM zsec_customers WINDOW zsec_wind AS (ORDER BY zsec_bal)', 'COSTS OFF, REDACT');
+               zsec_plan                
+----------------------------------------
+ WindowAgg
+   Window: w1
+   ->  Sort
+         ->  WindowAgg
+               Window: w2
+               ->  Sort
+                     ->  Seq Scan on t1
+(7 rows)
+
 --
 -- The marking-discipline query, re-run.  *(rev. T18.)*
 --

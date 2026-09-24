@@ -238,7 +238,7 @@ In every redacted record, the following must not appear in **any** field, in
 | FR-11 | Schema/namespace names of redacted objects | omitted *(rev. T15: landed and verified in all four formats — text qualifies the object name as `schema.table` while json/xml/yaml emit a separate `Schema` property, so the two are separate assertions. Note what is **not** omitted: an exempt relation keeps its schema, and keeps it `VERBOSE`-gated exactly as without redaction, because exemption restores the original code path rather than adding a new one.)* |
 | FR-12 | Column names — of **every** range-table-entry kind, not only base relations: subquery output names, join output names, function-scan and `ROWS FROM` column aliases, `VALUES` column names, CTE and ENR column names, tablefunc column names *(rev. code audit: for these RTE kinds the printed name comes from `rte->eref->colnames` / `expandRTE()` and there is **no** relid and no catalog attno to key a pseudonym on — see FR-46)* | pseudonym `t1_c3`, where the numeric part is an **opaque sequential per-RTE counter** *(rev. security review: must never be the physical attno, which leaks ordinal position and column count; see FR-43)* |
 | FR-13 | User-visible relation aliases / refnames, including (a) the value used when no alias was assigned because the RTE is absent from the EXPLAIN `rels_used` set, and (b) `RETURNING WITH (OLD AS …, NEW AS …)` aliases *(rev. code audit: both bypass the alias list produced for EXPLAIN)* *(rev. T15: (a) landed and covered. (b) is **not** covered yet and its §10.2 assertion is still vacuous — the `OLD`/`NEW` alias reaches output only as a `Var` prefix inside the `Output` list, which stays suppressed until T21, so there is nothing for the fixture to grep either way. "Derived from the relation pseudonym" is exact and load-bearing: an unaliased relation's reference name is keyed by **OID**, so it equals the object name and EXPLAIN prints one identifier, not two; keying it by range-table index would turn every unaliased scan line into `Seq Scan on t1 a1` and change the shape of the output rather than its content. One exception, measured: two unaliased RTEs of the *same* relation both derive `t1`, collide, and the second takes a `_1` suffix — `Seq Scan on t1 t1_1`. Identical in shape to the unredacted `zsec_customers zsec_customers_1`, so nothing extra is disclosed, but it contradicts FR-47's claim that pseudonyms make the uniquifier a no-op.)* | derived from the relation pseudonym, or `a1`, `a2`, … when a distinct alias must be shown |
-| FR-14 | CTE names, in **every** property that can carry one — the scan target, the sub-plan label, and any deparsed sub-plan reference *(rev. code audit: see FR-90)* *(rev. T17: landed for the **scan target** — `CTE Name` and the text tail on both `CTE Scan` and `WorkTable Scan`, verified in all four formats. The sub-plan label is T19's and the deparsed reference is T21's, so this requirement is one of three landed and two outstanding. §10.2's `FR-14` row stopped being vacuous here: T04 suppressed the whole scan target, so its "clean" verdict meant an absent property, and it now means a real CTE name absent from a record that does name a CTE. The keying decision is the part worth carrying forward: the pseudonym is keyed on `hash_bytes(ctename)`, **not** on the range-table index, because a `SubPlan` carries only `plan_name` and no range-table index — so a string key is the only key FR-90's printer can also compute. It also makes a recursive CTE agree with itself for free, since the self-reference RTE carries the same `ctename`; measured, one `cte1` on both the `CTE Scan` and the `WorkTable Scan` of one recursive CTE. Two costs, both readability and neither disclosure: two CTEs in one statement that share a name share a pseudonym, and — see FR-90 — where `choose_plan_name()` uniquifies the second to `name_1`, the sub-plan label will hash differently from the scan target.)* | `cte1`, `cte2`, … |
+| FR-14 | CTE names, in **every** property that can carry one — the scan target, the sub-plan label, and any deparsed sub-plan reference *(rev. code audit: see FR-90)* *(rev. T17: landed for the **scan target** — `CTE Name` and the text tail on both `CTE Scan` and `WorkTable Scan`, verified in all four formats. The sub-plan label is T19's and the deparsed reference is T21's, so this requirement is one of three landed and two outstanding. *(rev. T19: the sub-plan label has landed too — two of three, with only the deparsed reference outstanding — and it reaches this requirement's own `cteN` map through `explain_redact_by_name()`, which is what makes `Subplan Name: CTE cte1` sit over `CTE Name: cte1`. The string key this row chose is what made that possible, and the uniquifier cost it predicted is now a pinned fixture rather than a prediction.)* §10.2's `FR-14` row stopped being vacuous here: T04 suppressed the whole scan target, so its "clean" verdict meant an absent property, and it now means a real CTE name absent from a record that does name a CTE. The keying decision is the part worth carrying forward: the pseudonym is keyed on `hash_bytes(ctename)`, **not** on the range-table index, because a `SubPlan` carries only `plan_name` and no range-table index — so a string key is the only key FR-90's printer can also compute. It also makes a recursive CTE agree with itself for free, since the self-reference RTE carries the same `ctename`; measured, one `cte1` on both the `CTE Scan` and the `WorkTable Scan` of one recursive CTE. Two costs, both readability and neither disclosure: two CTEs in one statement that share a name share a pseudonym, and — see FR-90 — where `choose_plan_name()` uniquifies the second to `name_1`, the sub-plan label will hash differently from the scan target.)* | `cte1`, `cte2`, … |
 | FR-15 | Ephemeral named tuplestore (ENR) names | `enr1`, … *(rev. T15: **not reachable from EXPLAIN.** `ExplainNode()` omits `T_NamedTuplestoreScan` from the node list that calls `ExplainScanTarget()`, so a named tuplestore scan prints no `Tuplestore Name` and no `Alias` in any format, redacted or not — measured from inside a trigger with a `REFERENCING NEW TABLE` transition table, which is the only way to get an ENR into a plan. The `T_NamedTuplestoreScan` case in `ExplainTargetRel()` has no caller. FR-15 therefore joins FR-94 and FR-98c as a **guard** for a printer path EXPLAIN cannot reach, and T17 has nothing to pseudonymize here unless upstream adds the missing case. A negative control is pinned in the regression file so that if it ever does, the change is reported rather than shipped silently.)* *(rev. T17: **re-verified and closed as a guard.** T17 owned this requirement and deliberately implemented nothing: the `ExplainNode()` switch still has no `T_NamedTuplestoreScan` case, so FR-15 is unreachable **from EXPLAIN entirely** — not "suppressed pending a task" — and `REDACT_ENR` stays declared and unassigned rather than spending a pseudonym namespace on a path with no caller. The `es->redact` check in `ExplainTargetRel()`'s ENR branch ships as-is, on the same footing as the FR-94 and FR-98c guards. Coverage was strengthened instead of added: the regression file now pins the **property tag** `Tuplestore Name` as absent in all four formats and in both modes, which is the string that would appear if the missing case were ever added, so the tripwire no longer depends on the fixture name alone.)* |
 | FR-16 | Index names in **any** property: index scans (`Index Name`), and non-scan sites such as `Conflict Arbiter Indexes` *(rev. security review)* *(rev. T16: landed, and this is the first entry in the table with coverage on every surface it claims. All four are asserted, separately, because three different code paths feed them: `Index Scan` and `Index Only Scan` share `ExplainIndexScanDetails()`, `Bitmap Index Scan` has its own inline emission in `ExplainNode()`, and `Conflict Arbiter Indexes` is assembled in `show_modifytable_info()` and never went through the shared function. Until T16 the two rows §10.2 holds for this requirement were vacuous — T04 suppressed the name and skipped the arbiter gather entirely, so “clean” meant an absent property rather than a pseudonymized one. Also verified: the arbiter list and an index scan on the same index print the **same** `iN` (see FR-40), and a `pg_catalog` index keeps its real name.)* | `i1`, `i2`, … |
 | FR-17 | Trigger names and constraint names (trigger section, `Trigger Name` property) | `trg1`, … / `con1`, … |
@@ -269,8 +269,8 @@ has a test in §10.
 
 | ID | Item | Required treatment |
 |---|---|---|
-| FR-90 | Sub-plan labels. The `Subplan Name` property (and its text-mode equivalent) is built by prefixing a planner-assigned plan name with `CTE `/`InitPlan `/`SubPlan `, and that plan name is seeded **verbatim from the CTE name** for CTE sub-plans and **from the subquery's alias** for sub-query sub-plans. The same string is re-emitted inside deparsed expressions as `(hashed SubPlan <name>).colN`. Without this requirement a record reads `CTE Name: cte1` on one line and `Subplan Name: CTE secret_customers_cte` on the line above it. | the label keeps its `CTE `/`InitPlan `/`SubPlan ` prefix; the name part becomes `sp1`, `sp2`, … (and, where the sub-plan corresponds to a CTE, the *same* pseudonym as FR-14 assigns to that CTE, so the two lines remain relatable) |
-| FR-91 | Window names. The `Window` property prints the user's `WINDOW w AS (…)` name, and deparsed `Output` prints `OVER <name>` for every window function. Neither is `VERBOSE`-gated. | `w1`, `w2`, …; the same pseudonym in both places |
+| FR-90 | Sub-plan labels. The `Subplan Name` property (and its text-mode equivalent) is built by prefixing a planner-assigned plan name with `CTE `/`InitPlan `/`SubPlan `, and that plan name is seeded **verbatim from the CTE name** for CTE sub-plans and **from the subquery's alias** for sub-query sub-plans. The same string is re-emitted inside deparsed expressions as `(hashed SubPlan <name>).colN`. Without this requirement a record reads `CTE Name: cte1` on one line and `Subplan Name: CTE secret_customers_cte` on the line above it. *(rev. T19: landed. The label is redacted at its ONE construction point in `ExplainSubPlans()`, which covers all four formats — `Subplan Name` and its text-mode equivalent both print whatever `cooked_plan_name` holds. Three findings worth carrying forward. **(a)** The requirement's phrase "prefixing a planner-assigned plan name" is right and its implication is not: nothing has to be stripped. The `CTE `/`InitPlan `/`SubPlan ` prefix is built by `psprintf()` in `ExplainSubPlans()` and never enters `plan_name`, so `sp->plan_name` is the bare CTE name and is byte-identical to the `rte->ctename` FR-14 hashes. Hashing the prefixed string instead is a real and tested failure mode — it produces `Subplan Name: CTE cte2` over `CTE Name: cte1`. **(b)** The subquery-alias seed in the requirement text was refuted at T01 and remains refuted; the CTE seed is the only one that reaches this property. **(c)** The CTE half is the only half that hashes. Non-CTE sub-plans are keyed on `plan_id`, an exact integer both printers hold. §10.2's `FR-90` row in the sweep is now genuine on its own surface: it read "clean" from T04 to T18 against a label that said `CTE` with nothing after it.)* | the label keeps its `CTE `/`InitPlan `/`SubPlan ` prefix; the name part becomes `sp1`, `sp2`, … (and, where the sub-plan corresponds to a CTE, the *same* pseudonym as FR-14 assigns to that CTE, so the two lines remain relatable) |
+| FR-91 | Window names. The `Window` property prints the user's `WINDOW w AS (…)` name, and deparsed `Output` prints `OVER <name>` for every window function. Neither is `VERBOSE`-gated. *(rev. T19: landed for the `Window` property, in all four formats, **name only** — the keys and the frame are deparsed expressions and stay with T21. Two consequences the requirement did not anticipate. **(a)** The assertion `^w[0-9]+ AS \(` recorded in §10.2 cannot hold between T19 and T21 and is now phased there; a redacted line reads `Window: w1`, not `Window: w1 AS ()`, because empty parentheses are a valid window definition and would describe the plan falsely. **(b)** "the same pseudonym in both places" is met by construction — both sites key on `winref`, the integer `get_windowfunc_expr_helper()` already matches to find the name, so no hash is needed and the two cannot diverge within one `RedactCtx` — but it is **not observable** in one record yet, because `Output` is suppressed. The `OVER wN` side is covered in the test module. Read §10.2 for the two measured cautions against comparing `wN` across records or against plain output; `name_active_windows()` already invents `w1` for unnamed windows.)* | `w1`, `w2`, …; the same pseudonym in both places |
 | FR-92 | The relation reference names listed by the `Replaces` property (emitted when a scan/join/aggregate was replaced by a `Result` node). | per FR-13 *(rev. T15: landed. All three forms T01 found are now pinned in their redacted rendering — `Replaces: Scan on t1`, `Replaces: Join on a1, a2`, and `Replaces: MinMaxAggregate` with no name. The counting loop always ran under T04's suppression because it decides whether the line appears at all; T15 restored the names it was building and withholding.)* |
 | FR-93 | Composite-type field names: the field name printed for a field selection (`(col).field`), and the field name printed for composite/array assignment in an `INSERT`/`UPDATE` target list that EXPLAIN displays. These are resolved from the composite type's tuple descriptor, from a row expression's column-name list, or from the RTE's column list — **never** through the ordinary column-name path, so FR-12's treatment does not reach them. | `fld1`, `fld2`, … per record; a field of a redacted composite type is never printed in full |
 | FR-94 | Named-argument labels in a function call (`f(argname => …)`). *(Corrected by T01: **not reachable from EXPLAIN.** The parser resolves named notation to positional order and discards the `NamedArgExpr` wrapper, so `f(argname => x)` deparses as `f(x)` — verified with arguments given out of order, the case that forces reordering and so had the best chance of preserving the labels. ruleutils' `T_NamedArgExpr` branch therefore serves raw parse trees, such as a stored default printed by `pg_get_expr()`, not plan trees. Implement as a **guard**, like FR-98c, and keep the negative control pinned so that if labels ever start surviving into plans it fails rather than shipping silently.)* | `arg1`, `arg2`, … — or the `name =>` decoration omitted entirely (positional rendering), which is also acceptable since redacted output need not re-parse (§3) |
@@ -515,6 +515,51 @@ Assert: no `zcte_secret`; the `Subplan Name` value matches
 name inside `Subplan Name` resolve to the **same** pseudonym (FR-90 requires
 the two lines stay relatable).
 
+*(rev. T19: landed and covered, and the agreement is the part that is now
+asserted rather than argued. The label is built at its one construction point in
+`ExplainSubPlans()`, so all four formats are covered by one edit, and all four
+are checked: `Subplan Name: "CTE cte1"` over `CTE Name: "cte1"`, per format,
+with its own pair of extraction patterns because in text the two values are one
+string in two places and in the structured formats they are two properties.*
+
+*The agreement assertion is **demonstrated capable of failing**, twice, because
+this file's own §10.1 warns that a fixture can go green while asserting nothing.
+First in-tree, with no perturbed build: two CTEs of the same name in one
+statement produce label set `{cte1,cte2}` against scan-target set `{cte1}` and
+the comparison returns false — that is the `choose_plan_name()` uniquifier limit
+below, pinned as a fixture rather than left as prose. Second out-of-tree, by
+hashing `"CTE " || plan_name` instead of `plan_name` — the exact mistake the code
+comment at the site warns against — which turned all four format rows into
+`FAIL: Subplan Name says cte2 but CTE Name says cte1`. Build restored.*
+
+***The recorded limit.*** *`choose_plan_name()` uniquifies a second CTE of the
+same name to `name_1`, which hashes differently from the `ctename` the scan
+target still carries. Where two CTEs in one statement share a name, the
+`Subplan Name` label and the `CTE Name` below it therefore get different `cteN`,
+and one record can show a `cteN` that no scan target mentions. Readability cost
+inside one record, **no disclosure** — no marker and no real name, which is
+exactly why it had to be pinned as a fixture: the leak sweep is blind to it. The
+FR-90 fixture uses a unique CTE name for that reason; do not "fix" the limit.*
+
+***Non-CTE sub-plans, keyed differently on purpose.*** *`InitPlan spN` and
+`SubPlan spN` are keyed on `plan_id` — the index into `PlannedStmt.subplans`,
+unique within the statement — not on a hash. Both printers hold the `SubPlan`
+node, so an exact integer is available and there is no collision risk. Only the
+CTE half hashes, and only because it has to meet the string-keyed map FR-14
+describes. Covered: one statement with one uncorrelated and one correlated
+sub-plan yields `InitPlan sp1` and `SubPlan sp2`, asserted distinct.*
+
+***What is NOT covered, stated rather than skipped.*** *The other printer of a
+non-CTE sub-plan's name is `ruleutils.c`, inside a deparsed expression
+(`(InitPlan sp1).col1`), and expression properties are still suppressed — so the
+label and the reference cannot appear in one record until T21. The reference side
+is covered in `src/test/modules/test_explain_redact`, which deparses directly.
+And the FR-40 half — one sub-plan referenced twice keeping one pseudonym — could
+not be produced at all: PostgreSQL does not CSE scalar subqueries, so two
+occurrences are always two `plan_id`s, even when the planner itself duplicates a
+subquery written once. That property rests on the map key being an identity;
+argued from the code, measured only for CTEs.)*
+
 Companion, same requirement, second seed — **refuted by T01**: the
 subquery-alias seed at allpaths.c:2828 sets `subroot->plan_name` from
 `rte->eref->aliasname`, but that name does **not** reach `Subplan Name`. When
@@ -545,6 +590,55 @@ WINDOW zwin_secret AS (PARTITION BY zcol_ssn ORDER BY zcol_bal);
 ```
 Assert: no `zwin_secret`; `Window` matches `^w[0-9]+ AS \(`; under `VERBOSE`
 the `Output` list contains `OVER w1` with the same number.
+
+*(rev. T19: **this assertion is PHASED, and the regex above is the post-T21
+form.** Between T19 and T21 the correct assertion is `^w[0-9]+$` — no ` AS (`
+and no body at all — and after T21 it becomes `^w[0-9]+ AS \(`. The reason is
+not an incomplete implementation: `show_window_keys()` and
+`get_window_frame_options_for_explain()` both call plain `deparse_expression()`,
+so the `PARTITION BY`/`ORDER BY` keys and the frame offsets are T21's surface and
+stay suppressed. T19 re-enabled the **name only**, exactly as T17 did for
+`Sampling:`.*
+
+*Printing `Window: w1 AS ()` to satisfy the old regex would have been worse than
+failing it: empty parentheses are a **valid** window definition meaning no
+partition, no ordering and the default frame, so the record would assert
+something false about the plan. The requirement was phased rather than the code
+bent — same call T17 recorded for dropping `Sampling: f1 ()`.*
+
+*Landed shape, measured: `Window: w1`, identical in all four formats, with the
+partition key, the ordering key, the frame keywords and both frame offset values
+asserted absent. The offsets are asserted **by value** (424242, 515151) against
+raw output, because they are values rather than identifiers, carry no `zsec_`
+marker, and the leak sweep is structurally blind to them. `count(*)` is used
+rather than `rank()`: `rank()` is frame-insensitive and the planner rewrites its
+frame to a default, so an unredacted `rank()` record does not contain the offsets
+and the absence clauses would have had nothing to be absent.*
+
+***The `OVER wN` half cannot be observed agreeing with `Window: wN` today, and
+the requirement should not be read as if it could.*** *Both sites pass the
+identical `winref` to the identical
+`explain_redact_local(ctx, REDACT_WINDOW, winref, 0)`, so within one `RedactCtx`
+they are one map entry and agree by construction — that is why `winref` was
+chosen over a hash. But `Output` is a deparsed expression and is still
+suppressed, and would print the real name even if it were not, because
+`ExplainPrintPlan()` (explain.c:917) builds its deparse context with
+`deparse_context_for_plan_tree()` rather than the `_redacted()` variant, leaving
+`context->redact` NULL on every EXPLAIN path. `OVER wN` is covered where it can
+be: the test module deparses directly and prints `rank() OVER w1`.*
+
+***Two cautions against reading agreement into a coincidence, both measured.***
+*(1) `name_active_windows()` in the planner already invents `w1`, `w2`, … for
+**unnamed** window clauses "for the benefit of EXPLAIN", so plain EXPLAIN prints
+`wN` for windows the user never named; the pseudonym namespace uses the same
+letter. Pinned: one unnamed and one named window in one statement, where plain
+output calls the bottom `WindowAgg`'s window `w1` and redacted output calls the
+**top** one `w1`. (2) Pseudonyms are numbered in **first-use order** within a
+record, so two redacted records cannot be compared either: a two-window query
+whose target list mentions the bottom window first has the deparse side calling
+it `w1` while EXPLAIN, walking top down, calls the other one `w1`. Independent
+counters, nothing disclosed — but a later test that compared `wN` across records
+would be asserting a coincidence.)*
 
 **FR-92 — `Replaces` prints relation reference names.** [V — resolved by T01]
 Site: explain.c:5036-5069. Requires a `Result` node with `relids` and **no**

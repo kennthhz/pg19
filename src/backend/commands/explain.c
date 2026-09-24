@@ -3247,60 +3247,100 @@ show_window_def(WindowAggState *planstate, List *ancestors, ExplainState *es)
 	bool		needspace = false;
 
 	/*
-	 * As well as the key expressions, this prints the window's name, which
-	 * the user wrote -- and prints it whether or not VERBOSE was asked for.
-	 * show_window_keys() is reached only from the two calls below, so it is
-	 * covered here too.
+	 * This property is two different things joined by " AS ", and redaction
+	 * treats them differently, so the split is worth stating.
+	 *
+	 * The window's name is the user's, and is printed whether or not VERBOSE
+	 * was asked for.  It becomes "wN" here (FR-91).
+	 *
+	 * The PARTITION BY / ORDER BY keys and the frame offsets are deparsed
+	 * expressions -- show_window_keys() and
+	 * get_window_frame_options_for_explain() both call plain
+	 * deparse_expression() -- which makes them T21's surface, not this
+	 * task's. They stay suppressed until then.  Do not "finish the job" by
+	 * re-enabling them alongside the name: there is nothing to print in their
+	 * place today but the user's real column names and literals.
+	 *
+	 * KEYED ON winref, AND DELIBERATELY NOT HASHED.  The other printer of
+	 * this name is get_windowfunc_expr_helper() in ruleutils.c, which emits
+	 * "OVER <winname>" and which finds the name in the first place by
+	 * matching WindowFunc->winref against this same wagg->winref.  An integer
+	 * identity is therefore shared by both printers, so the exact key is
+	 * available and the two agree with no collision risk.
+	 *
+	 * That differs from how T17 keyed the CTE name one screen away
+	 * (explain_redact_by_name(), a hash of the name string), and the
+	 * difference is not an oversight in either place: a CTE is printed by
+	 * three sites of which one, the "Subplan Name" label, holds only a string
+	 * and no integer, so a string key was the only key all three could
+	 * compute.  A window has no such site.  Hash here only if some future
+	 * printer of a window name turns up holding the string alone.
+	 *
+	 * Also worth knowing before reading a redacted record: unnamed windows
+	 * already print as "w1", "w2", ... in plain EXPLAIN, because
+	 * name_active_windows() (planner.c) makes those names up for EXPLAIN's
+	 * benefit.  The pseudonym namespace here happens to use the same letter,
+	 * so a redacted "w1" and an unredacted "w1" need not be the same window.
+	 * The counters are independent; nothing is disclosed either way.
 	 */
-	if (es->redact)
-		return;
-
 	initStringInfo(&wbuf);
-	appendStringInfo(&wbuf, "%s AS (", quote_identifier(wagg->winname));
 
-	/* The key columns refer to the tlist of the child plan */
-	ancestors = lcons(wagg, ancestors);
-	if (wagg->partNumCols > 0)
-	{
-		appendStringInfoString(&wbuf, "PARTITION BY ");
-		show_window_keys(&wbuf, outerPlanState(planstate),
-						 wagg->partNumCols, wagg->partColIdx,
-						 ancestors, es);
-		needspace = true;
-	}
-	if (wagg->ordNumCols > 0)
-	{
-		if (needspace)
-			appendStringInfoChar(&wbuf, ' ');
-		appendStringInfoString(&wbuf, "ORDER BY ");
-		show_window_keys(&wbuf, outerPlanState(planstate),
-						 wagg->ordNumCols, wagg->ordColIdx,
-						 ancestors, es);
-		needspace = true;
-	}
-	ancestors = list_delete_first(ancestors);
-	if (wagg->frameOptions & FRAMEOPTION_NONDEFAULT)
-	{
-		List	   *context;
-		bool		useprefix;
-		char	   *framestr;
+	if (es->redact)
+		appendStringInfoString(&wbuf, explain_redact_local(explain_redact_context(es),
+														   REDACT_WINDOW,
+														   wagg->winref, 0));
+	else
+		appendStringInfoString(&wbuf, quote_identifier(wagg->winname));
 
-		/* Set up deparsing context for possible frame expressions */
-		context = set_deparse_context_plan(es->deparse_cxt,
-										   (Plan *) wagg,
-										   ancestors);
-		useprefix = (es->rtable_size > 1 || es->verbose);
-		framestr = get_window_frame_options_for_explain(wagg->frameOptions,
-														wagg->startOffset,
-														wagg->endOffset,
-														context,
-														useprefix);
-		if (needspace)
-			appendStringInfoChar(&wbuf, ' ');
-		appendStringInfoString(&wbuf, framestr);
-		pfree(framestr);
+	if (!es->redact)
+	{
+		appendStringInfoString(&wbuf, " AS (");
+
+		/* The key columns refer to the tlist of the child plan */
+		ancestors = lcons(wagg, ancestors);
+		if (wagg->partNumCols > 0)
+		{
+			appendStringInfoString(&wbuf, "PARTITION BY ");
+			show_window_keys(&wbuf, outerPlanState(planstate),
+							 wagg->partNumCols, wagg->partColIdx,
+							 ancestors, es);
+			needspace = true;
+		}
+		if (wagg->ordNumCols > 0)
+		{
+			if (needspace)
+				appendStringInfoChar(&wbuf, ' ');
+			appendStringInfoString(&wbuf, "ORDER BY ");
+			show_window_keys(&wbuf, outerPlanState(planstate),
+							 wagg->ordNumCols, wagg->ordColIdx,
+							 ancestors, es);
+			needspace = true;
+		}
+		ancestors = list_delete_first(ancestors);
+		if (wagg->frameOptions & FRAMEOPTION_NONDEFAULT)
+		{
+			List	   *context;
+			bool		useprefix;
+			char	   *framestr;
+
+			/* Set up deparsing context for possible frame expressions */
+			context = set_deparse_context_plan(es->deparse_cxt,
+											   (Plan *) wagg,
+											   ancestors);
+			useprefix = (es->rtable_size > 1 || es->verbose);
+			framestr = get_window_frame_options_for_explain(wagg->frameOptions,
+															wagg->startOffset,
+															wagg->endOffset,
+															context,
+															useprefix);
+			if (needspace)
+				appendStringInfoChar(&wbuf, ' ');
+			appendStringInfoString(&wbuf, framestr);
+			pfree(framestr);
+		}
+		appendStringInfoChar(&wbuf, ')');
 	}
-	appendStringInfoChar(&wbuf, ')');
+
 	ExplainPropertyText("Window", wbuf.data, es);
 	pfree(wbuf.data);
 }
@@ -5738,20 +5778,57 @@ ExplainSubPlans(List *plans, List *ancestors,
 		if (es->redact)
 		{
 			/*
-			 * sp->plan_name comes from either the CTE's name or a subquery's
-			 * alias, both of which the user wrote, so only the prefix in
-			 * front of it can be kept.
+			 * sp->plan_name is a name the user wrote -- the CTE's name for a
+			 * CTE sub-plan -- so it is replaced by a pseudonym.  The
+			 * CTE/InitPlan/SubPlan prefix is kept: it tells a reader which of
+			 * the three they are looking at, which describes the plan and not
+			 * the data.
 			 *
-			 * Keeping that prefix is worth the trouble: it still tells a
-			 * reader whether they are looking at a CTE, an InitPlan or a
-			 * SubPlan, which describes the plan and not the data.
+			 * A CTE sub-plan must arrive at the SAME pseudonym that
+			 * ExplainTargetRel() prints as the "CTE Name" of the CTE Scan
+			 * below it, or the record contradicts itself -- "Subplan Name:
+			 * CTE cte2" over "CTE Name: cte1" (FR-90).  So it goes through
+			 * explain_redact_by_name(), which is T17's entry point into the
+			 * REDACT_CTE map and is keyed on a hash of the name string for
+			 * exactly this reason.  See that function for why the key is the
+			 * string and not a range-table index.
+			 *
+			 * Note there is nothing to strip off sp->plan_name first.  The
+			 * prefix is added here, by the psprintf() calls below; plan_name
+			 * itself is the bare name choose_plan_name() derived from
+			 * cte->ctename (subselect.c), which is the same string T17 hashes
+			 * from rte->ctename.  Hashing "CTE foo" instead of "foo" would
+			 * produce a different pseudonym and reintroduce the very
+			 * contradiction above.
+			 *
+			 * One case where the two cannot agree, inherited from T17 and not
+			 * this task's to fix: choose_plan_name() uniquifies a second CTE
+			 * of the same name to "name_1", which hashes differently from the
+			 * ctename on the scan target.  Readability cost inside one
+			 * record, no disclosure.
+			 *
+			 * Non-CTE sub-plans get their own namespace, REDACT_SUBPLAN,
+			 * keyed on plan_id.  That is an exact key rather than a hash:
+			 * plan_id is the index into PlannedStmt.subplans, unique within
+			 * the statement, and ruleutils.c holds the same SubPlan node when
+			 * it prints "(SubPlan spN).colN" inside an expression, so the two
+			 * agree with no collision risk.  Only the CTE half has to hash,
+			 * because only it has to meet a map keyed on a string.
+			 *
+			 * The plan_name NULL test is belt and braces -- every SubPlan
+			 * reaching here has a name -- and fails closed, to spN.
 			 */
-			if (sp->subLinkType == CTE_SUBLINK)
-				cooked_plan_name = "CTE";
-			else if (sp->isInitPlan)
-				cooked_plan_name = "InitPlan";
+			if (sp->subLinkType == CTE_SUBLINK && sp->plan_name != NULL)
+				cooked_plan_name = psprintf("CTE %s",
+											explain_redact_by_name(es,
+																   REDACT_CTE,
+																   sp->plan_name));
 			else
-				cooked_plan_name = "SubPlan";
+				cooked_plan_name = psprintf("%s %s",
+											sp->isInitPlan ? "InitPlan" : "SubPlan",
+											explain_redact_local(explain_redact_context(es),
+																 REDACT_SUBPLAN,
+																 sp->plan_id, 0));
 		}
 		else if (sp->subLinkType == CTE_SUBLINK)
 			cooked_plan_name = psprintf("CTE %s", sp->plan_name);

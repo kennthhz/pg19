@@ -583,6 +583,9 @@ static char *generate_operator_name(Oid operid, Oid arg1, Oid arg2,
 static char *redact_format_type(Oid typid, int32 typmod,
 								struct RedactCtx *redact);
 static char *redact_collation_name(Oid collid, struct RedactCtx *redact);
+static const char *redact_subplan_name(SubPlan *subplan,
+									   struct RedactCtx *redact);
+static const char *redact_window_name(Index winref, struct RedactCtx *redact);
 static void add_cast_to(StringInfo buf, Oid typid);
 static char *generate_qualified_type_name(Oid typid);
 static text *string_to_text(char *str);
@@ -9087,16 +9090,29 @@ get_parameter(Param *param, deparse_context *context)
 	if (subplan)
 	{
 		const char *nameprefix;
+		const char *planname;
 
 		if (subplan->isInitPlan)
 			nameprefix = "InitPlan ";
 		else
 			nameprefix = "SubPlan ";
 
+		/*
+		 * The name is the user's for a CTE sub-plan and a planner-made string
+		 * such as "exists_1" otherwise; both become a pseudonym, so that this
+		 * reference agrees with the "Subplan Name" label explain.c prints
+		 * above the sub-plan (FR-90).  The prefix, the "hashed" marker and
+		 * the column number all describe the plan and are kept.
+		 */
+		if (context->redact != NULL)
+			planname = redact_subplan_name(subplan, context->redact);
+		else
+			planname = subplan->plan_name;
+
 		appendStringInfo(context->buf, "(%s%s%s).col%d",
 						 subplan->useHashTable ? "hashed " : "",
 						 nameprefix,
-						 subplan->plan_name, column + 1);
+						 planname, column + 1);
 
 		return;
 	}
@@ -9974,18 +9990,34 @@ get_rule_expr(Node *node, deparse_context *context,
 				else
 				{
 					const char *nameprefix;
+					const char *planname;
 
 					/* No referencing Params, so show the SubPlan's name */
 					if (subplan->isInitPlan)
 						nameprefix = "InitPlan ";
 					else
 						nameprefix = "SubPlan ";
+
+					/*
+					 * Same pseudonym as the "Subplan Name" label and as
+					 * get_parameter()'s reference to this sub-plan (FR-90).
+					 * This site prints plan_name too, so leaving it out would
+					 * leave a live leak for T21 to walk into: a testexpr-less
+					 * SubPlan in a target list arrives here, not at
+					 * get_parameter().
+					 */
+					if (context->redact != NULL)
+						planname = redact_subplan_name(subplan,
+													   context->redact);
+					else
+						planname = subplan->plan_name;
+
 					if (subplan->useHashTable)
 						appendStringInfo(buf, "hashed %s%s)",
-										 nameprefix, subplan->plan_name);
+										 nameprefix, planname);
 					else
 						appendStringInfo(buf, "%s%s)",
-										 nameprefix, subplan->plan_name);
+										 nameprefix, planname);
 				}
 			}
 			break;
@@ -10006,17 +10038,33 @@ get_rule_expr(Node *node, deparse_context *context,
 				{
 					SubPlan    *splan = lfirst_node(SubPlan, lc);
 					const char *nameprefix;
+					const char *planname;
 
 					if (splan->isInitPlan)
 						nameprefix = "InitPlan ";
 					else
 						nameprefix = "SubPlan ";
+
+					/*
+					 * Guarded for the same reason the case above is, though
+					 * as its own comment says this node never appears in a
+					 * finished plan, so nothing reaches here from EXPLAIN in
+					 * any mode.  Cheaper to redact it than to leave the one
+					 * unguarded plan_name print in the file for a reader to
+					 * re-adjudicate later.
+					 */
+					if (context->redact != NULL)
+						planname = redact_subplan_name(splan,
+													   context->redact);
+					else
+						planname = splan->plan_name;
+
 					if (splan->useHashTable)
 						appendStringInfo(buf, "hashed %s%s", nameprefix,
-										 splan->plan_name);
+										 planname);
 					else
 						appendStringInfo(buf, "%s%s", nameprefix,
-										 splan->plan_name);
+										 planname);
 					if (lnext(asplan->subplans, lc))
 						appendStringInfoString(buf, " or ");
 				}
@@ -11654,7 +11702,19 @@ get_windowfunc_expr_helper(WindowFunc *wfunc, deparse_context *context,
 
 			if (wc->winref == wfunc->winref)
 			{
-				if (wc->name)
+				/*
+				 * Guard only.  This is the query-decompilation branch --
+				 * pg_get_viewdef() and friends -- which EXPLAIN never takes,
+				 * since EXPLAIN leaves context->windowClause NULL and lands
+				 * in the else arm below.  No redacting caller reaches it
+				 * today; the pseudonym is here so that one added later cannot
+				 * print the name the user wrote.
+				 */
+				if (wc->name && context->redact != NULL)
+					appendStringInfoString(buf,
+										   redact_window_name(wc->winref,
+															  context->redact));
+				else if (wc->name)
 					appendStringInfoString(buf, quote_identifier(wc->name));
 				else
 					get_rule_windowspec(wc, context->targetList, context);
@@ -11681,7 +11741,25 @@ get_windowfunc_expr_helper(WindowFunc *wfunc, deparse_context *context,
 
 				if (wagg->winref == wfunc->winref)
 				{
-					appendStringInfoString(buf, quote_identifier(wagg->winname));
+					/*
+					 * The window name the user wrote, printed whether or not
+					 * VERBOSE was asked for, so it becomes "wN" (FR-91).
+					 *
+					 * The winref just matched is the key, which is what makes
+					 * this "OVER wN" and show_window_def()'s "Window: wN" the
+					 * same number for the same window.  See
+					 * redact_window_name().
+					 *
+					 * Dormant until T21: an "Output" list is a deparsed
+					 * expression and is still suppressed, so nothing prints
+					 * here in a redacted EXPLAIN yet.
+					 */
+					if (context->redact != NULL)
+						appendStringInfoString(buf,
+											   redact_window_name(wagg->winref,
+																  context->redact));
+					else
+						appendStringInfoString(buf, quote_identifier(wagg->winname));
 					break;
 				}
 			}
@@ -12092,6 +12170,76 @@ redact_collation_name(Oid collid, struct RedactCtx *redact)
 		return pstrdup(explain_redact_name(redact, REDACT_COLLATION, collid));
 
 	return generate_collation_name(collid);
+}
+
+/*
+ * redact_subplan_name
+ *		Pseudonym for the name printed inside "(SubPlan <name>).colN" and
+ *		friends.
+ *
+ * Three places in this file print SubPlan->plan_name, and all three must agree
+ * with the "Subplan Name" label explain.c puts above the sub-plan (FR-90), so
+ * the rule lives here once rather than three times.
+ *
+ * The rule is the same one ExplainSubPlans() applies, and the two copies have to
+ * stay in step -- there is no shared helper because that function is static in
+ * explain.c and this one is on the deparse side.  Both branches are worth
+ * spelling out:
+ *
+ * A CTE sub-plan goes into T17's REDACT_CTE map, keyed on a hash of the name
+ * string, which is what makes the deparsed reference, the "Subplan Name" label
+ * and the "CTE Name" on the CTE Scan all read the same "cteN".  plan_name is the
+ * bare CTE name here -- the CTE/InitPlan/SubPlan prefix is added by the callers
+ * below and by explain.c, never stored in plan_name -- so the string hashed is
+ * the same one explain.c hashes.
+ *
+ * Everything else is keyed on plan_id, which is exact: it is the index into
+ * PlannedStmt.subplans, unique within the statement, and explain.c holds the
+ * same SubPlan node.  No hash, so no chance of two sub-plans colliding.
+ *
+ * Nothing here is reachable from EXPLAIN yet: T04 still suppresses every
+ * property that carries a deparsed expression, so these prints go nowhere until
+ * T21 turns expression output back on.  The guard lands now so that T21 is a
+ * flip and not a hunt.
+ */
+static const char *
+redact_subplan_name(SubPlan *subplan, struct RedactCtx *redact)
+{
+	Assert(redact != NULL);
+
+	/* Fails closed to the plan_id key if there is no name to hash */
+	if (subplan->subLinkType == CTE_SUBLINK && subplan->plan_name != NULL)
+	{
+		const char *name = subplan->plan_name;
+		int			key = (int) hash_bytes((const unsigned char *) name,
+										   strlen(name));
+
+		return explain_redact_local(redact, REDACT_CTE, key, 0);
+	}
+
+	return explain_redact_local(redact, REDACT_SUBPLAN, subplan->plan_id, 0);
+}
+
+/*
+ * redact_window_name
+ *		Pseudonym for a window name printed as "OVER <name>".
+ *
+ * Keyed on winref, the WindowClause's index within the query level.  That is an
+ * exact shared key rather than a hash: show_window_def() in explain.c prints the
+ * "Window" property from WindowAgg->winref, and the EXPLAIN caller below already
+ * matches WindowFunc->winref against WindowAgg->winref to find the name it is
+ * about to print.  So "OVER wN" and "Window: wN" agree by construction (FR-91).
+ *
+ * Contrast redact_subplan_name() just above, which hashes in its CTE branch.
+ * The difference is in what the printers share, not in taste: a CTE's three
+ * printers do not all have an integer, and a window's both do.
+ */
+static const char *
+redact_window_name(Index winref, struct RedactCtx *redact)
+{
+	Assert(redact != NULL);
+
+	return explain_redact_local(redact, REDACT_WINDOW, (int) winref, 0);
 }
 
 /* ----------
