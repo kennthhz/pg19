@@ -24,6 +24,7 @@
 #include "nodes/makefuncs.h"
 #include "nodes/value.h"
 #include "parser/scansup.h"
+#include "tcop/tcopprot.h"
 #include "utils/guc.h"
 #include "utils/varlena.h"
 
@@ -43,6 +44,7 @@ static bool auto_explain_log_wal = false;
 static bool auto_explain_log_triggers = false;
 static bool auto_explain_log_timing = true;
 static bool auto_explain_log_settings = false;
+static bool auto_explain_log_redact = false;
 static int	auto_explain_log_format = EXPLAIN_FORMAT_TEXT;
 static int	auto_explain_log_level = LOG;
 static bool auto_explain_log_nested_statements = false;
@@ -122,6 +124,10 @@ static void explain_ExecutorEnd(QueryDesc *queryDesc);
 static bool check_log_extension_options(char **newval, void **extra,
 										GucSource source);
 static void assign_log_extension_options(const char *newval, void *extra);
+static char *make_reference_token(void);
+static void emit_reference_entry(const char *token, const char *query_text);
+static void warn_redaction_conflict(const char *setting, const char *why);
+static void check_logging_envelope(void);
 static void apply_extension_options(ExplainState *es,
 									auto_explain_extension_options *ext);
 static char *auto_explain_scan_literal(char **endp, char **nextp);
@@ -177,6 +183,28 @@ _PG_init(void)
 							 &auto_explain_log_settings,
 							 false,
 							 PGC_SUSET,
+							 0,
+							 NULL,
+							 NULL,
+							 NULL);
+
+	/*
+	 * PGC_SIGHUP rather than the PGC_SUSET used by every other auto_explain
+	 * GUC (D9).  This one is a data-protection control, not a logging
+	 * preference: at SUSET any superuser session could turn redaction off for
+	 * itself with a SET, which defeats the purpose of having switched it on.
+	 * Requiring a configuration change and a reload puts the decision where
+	 * the policy lives.
+	 */
+	DefineCustomBoolVariable("auto_explain.log_redact",
+							 "Withhold user data from logged plans.",
+							 "Object names, expressions, literal values, the "
+							 "query text and parameter values are omitted. "
+							 "Plan shape, costs, row counts and timings are "
+							 "kept.",
+							 &auto_explain_log_redact,
+							 false,
+							 PGC_SIGHUP,
 							 0,
 							 NULL,
 							 NULL,
@@ -415,6 +443,139 @@ explain_ExecutorFinish(QueryDesc *queryDesc)
 }
 
 /*
+ * Produce a reference token for one redacted record.
+ *
+ * A redacted record has no correlation handle of its own.  errhidestmt(true)
+ * suppresses the STATEMENT: line, and the comment further down notes that
+ * auto_explain otherwise leans on surrounding context to say which statement a
+ * record belongs to -- context that redaction removes.  With nothing to
+ * correlate on, the operator's obvious move is to switch on
+ * log_min_duration_statement, which puts every statement into the same log and
+ * gives back everything redaction withheld.  The token exists to make that
+ * unnecessary.
+ *
+ * Drawn from the global PRNG, and that choice is the requirement rather than a
+ * convenience.  The token must not be derived from the query text or from
+ * queryId: queryId is a hash that anyone can recompute, so a token derived from
+ * it would rebuild precisely the guessing attack that dropping Query Identifier
+ * was meant to remove.  A random value tells a reader nothing about the
+ * statement unless they also hold the companion entry.
+ *
+ * 64 bits in hex: wide enough that collisions within a log file are not a
+ * practical concern, short enough to read off a line and grep for.
+ */
+static char *
+make_reference_token(void)
+{
+	return psprintf("%016" PRIx64, pg_prng_uint64(&pg_global_prng_state));
+}
+
+/*
+ * Write the companion entry mapping a token to the statement it came from.
+ *
+ * This entry is the one part of the mechanism that contains user data, and it is
+ * kept separate from the record itself so that an operator can send it somewhere
+ * the plan log is not.  DEBUG1 is what makes that possible: it sits below the
+ * default log_min_messages, so by default this is never written at all, and
+ * anyone who wants correlation opts in knowingly.
+ *
+ * The trade is worth stating plainly.  A site that never enables it cannot tie
+ * records back to statements from the log alone -- that is the intent, not a
+ * shortcoming.  A site that does enable it has chosen to keep the statements and
+ * should route them accordingly, which is why check_logging_envelope() reports
+ * that they are being written.
+ */
+static void
+emit_reference_entry(const char *token, const char *query_text)
+{
+	if (query_text == NULL)
+		return;
+
+	ereport(DEBUG1,
+			(errmsg("auto_explain ref %s: %s", token, query_text),
+			 errhidestmt(true)));
+}
+
+/*
+ * Warn, once per session per topic, that something defeats redaction.
+ *
+ * Once per session rather than once per record because these are configuration
+ * facts, not properties of the statement: a per-record notice would multiply
+ * the log volume of the very log the operator is trying to keep clean, and
+ * would say nothing new each time.
+ */
+static void
+warn_redaction_conflict(const char *setting, const char *why)
+{
+	ereport(LOG,
+			(errmsg("auto_explain.log_redact is enabled, but %s is also active",
+					setting),
+			 errdetail("%s", why),
+			 errhidestmt(true)));
+}
+
+/*
+ * FR-75: report logging settings that place the unredacted statement in the
+ * same log stream as the redacted plan.
+ *
+ * Each topic is latched separately, so enabling a second one later in the
+ * session still reports it.
+ */
+static void
+check_logging_envelope(void)
+{
+	static bool warned_log_statement = false;
+	static bool warned_log_min_duration = false;
+	static bool warned_log_line_prefix = false;
+	static bool warned_reference_entries = false;
+
+	if (log_statement != LOGSTMT_NONE && !warned_log_statement)
+	{
+		warned_log_statement = true;
+		warn_redaction_conflict("log_statement",
+								"Statements are logged in full, including the text redacted from the plan.");
+	}
+
+	if (log_min_duration_statement >= 0 && !warned_log_min_duration)
+	{
+		warned_log_min_duration = true;
+		warn_redaction_conflict("log_min_duration_statement",
+								"Statements exceeding the threshold are logged in full, including the text redacted from the plan.");
+	}
+
+	/*
+	 * The reference entries this module writes itself.  Listed with the
+	 * others because the hazard is identical and the cause is easy to miss:
+	 * an operator who raised log_min_messages to debug1 for some unrelated
+	 * investigation is now collecting every statement in this log, without
+	 * having asked for correlation at all.
+	 *
+	 * Asked as "would a DEBUG1 message be emitted" rather than by comparing
+	 * log_min_messages directly.  The comparison is not portable across this
+	 * tree: log_min_messages is an array indexed by MyBackendType, not a
+	 * scalar, and the rule for whether a level is output lives in elog.c.
+	 */
+	if (message_level_is_interesting(DEBUG1) && !warned_reference_entries)
+	{
+		warned_reference_entries = true;
+		warn_redaction_conflict("a log level of debug1 or lower",
+								"The companion reference entries are being written to this log, so the statements redacted from the plans are present in it.");
+	}
+
+	/*
+	 * %q is the marker for the process-title portion of log_line_prefix,
+	 * which carries the current statement.
+	 */
+	if (Log_line_prefix != NULL && strstr(Log_line_prefix, "%q") != NULL &&
+		!warned_log_line_prefix)
+	{
+		warned_log_line_prefix = true;
+		warn_redaction_conflict("a log_line_prefix containing %q",
+								"The prefix carries the current statement, including the text redacted from the plan.");
+	}
+}
+
+/*
  * ExecutorEnd hook: log results if needed
  */
 static void
@@ -437,6 +598,7 @@ explain_ExecutorEnd(QueryDesc *queryDesc)
 		{
 			ExplainState *es = NewExplainState();
 
+			es->redact = auto_explain_log_redact;
 			es->analyze = (queryDesc->instrument_options && auto_explain_log_analyze);
 			es->verbose = auto_explain_log_verbose;
 			es->buffers = (es->analyze && auto_explain_log_buffers);
@@ -449,7 +611,23 @@ explain_ExecutorEnd(QueryDesc *queryDesc)
 			es->format = auto_explain_log_format;
 			es->settings = auto_explain_log_settings;
 
-			apply_extension_options(es, extension_options);
+			/*
+			 * FR-73.  Extension options are ignored rather than refused here,
+			 * unlike the interactive path which raises an error: a GUC
+			 * combination set by an administrator should not start failing
+			 * every query's logging.  But it is not ignored silently, because
+			 * output the operator configured would then simply stop
+			 * appearing.
+			 */
+			if (es->redact)
+			{
+				if (extension_options != NULL &&
+					extension_options->noptions > 0)
+					warn_redaction_conflict("auto_explain.log_extension_options",
+											"The requested extension output is omitted, because output produced by an extension cannot be redacted.");
+			}
+			else
+				apply_extension_options(es, extension_options);
 
 			ExplainBeginOutput(es);
 			ExplainQueryText(es, queryDesc);
@@ -459,7 +637,8 @@ explain_ExecutorEnd(QueryDesc *queryDesc)
 				ExplainPrintTriggers(es, queryDesc);
 			if (es->costs)
 				ExplainPrintJITSummary(es, queryDesc);
-			if (explain_per_plan_hook)
+			/* Plugins can bypass every redaction guard (FR-25/D4) */
+			if (explain_per_plan_hook && !es->redact)
 				(*explain_per_plan_hook) (queryDesc->plannedstmt,
 										  NULL, es,
 										  queryDesc->sourceText,
@@ -479,15 +658,46 @@ explain_ExecutorEnd(QueryDesc *queryDesc)
 			}
 
 			/*
+			 * FR-75.  Redaction only governs this record.  Three other
+			 * settings put the unredacted statement into the very same log,
+			 * where anything correlating by timestamp recovers what was
+			 * withheld here -- so the operator is told once per session
+			 * rather than left with a false sense of what the log contains.
+			 *
+			 * This cannot be enforced instead of warned about: refusing to
+			 * log would be a worse outcome than logging with a caveat, and
+			 * silently switching the other settings off is not auto_explain's
+			 * decision to make.
+			 */
+			if (es->redact)
+				check_logging_envelope();
+
+			/*
 			 * Note: we rely on the existing logging of context or
 			 * debug_query_string to identify just which statement is being
 			 * reported.  This isn't ideal but trying to do it here would
 			 * often result in duplication.
+			 *
+			 * That reliance is exactly what breaks down under redaction,
+			 * which is why a redacted record carries a reference token
+			 * instead.  See emit_reference_entry() above.
 			 */
-			ereport(auto_explain_log_level,
-					(errmsg("duration: %.3f ms  plan:\n%s",
-							msec, es->str->data),
-					 errhidestmt(true)));
+			if (es->redact)
+			{
+				char	   *token = make_reference_token();
+
+				emit_reference_entry(token, queryDesc->sourceText);
+
+				ereport(auto_explain_log_level,
+						(errmsg("duration: %.3f ms  ref: %s  plan:\n%s",
+								msec, token, es->str->data),
+						 errhidestmt(true)));
+			}
+			else
+				ereport(auto_explain_log_level,
+						(errmsg("duration: %.3f ms  plan:\n%s",
+								msec, es->str->data),
+						 errhidestmt(true)));
 		}
 
 		MemoryContextSwitchTo(oldcxt);

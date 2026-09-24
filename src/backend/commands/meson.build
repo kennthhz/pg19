@@ -23,6 +23,7 @@ backend_sources += files(
   'explain.c',
   'explain_dr.c',
   'explain_format.c',
+  'explain_redact.c',
   'explain_state.c',
   'extension.c',
   'foreigncmds.c',

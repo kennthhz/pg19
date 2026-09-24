@@ -57,8 +57,27 @@ typedef struct ExplainState
 	bool		settings;		/* print modified settings */
 	bool		io;				/* print info about IO (prefetch, ...) */
 	bool		generic;		/* generate a generic plan */
+	bool		redact;			/* withhold user-derived names and values */
 	ExplainSerializeOption serialize;	/* serialize the query's output? */
 	ExplainFormat format;		/* output format */
+
+	/*
+	 * Pseudonym map backing the "redact" option above.  Both start out zero
+	 * from the palloc0 in NewExplainState(), which every ExplainState in the
+	 * tree comes from, so redaction is off and unallocated unless something
+	 * asks for it; the map is built on first use.
+	 *
+	 * Its lifetime is the whole record rather than one plan tree, because a
+	 * pseudonym has to denote the same object everywhere it appears.  Do not
+	 * reset it alongside the per-tree fields below.
+	 *
+	 * Named by struct tag rather than by the RedactCtx typedef so that this
+	 * header -- which many extensions include -- needs no declaration from
+	 * commands/explain_redact.h.  The two spell the same type, and it is
+	 * opaque either way: struct RedactCtx is defined only in
+	 * explain_redact.c, so nothing outside that file can dereference this.
+	 */
+	struct RedactCtx *redact_ctx;
 	/* state for output formatting --- not reset for each new plan tree */
 	int			indent;			/* current indentation level */
 	List	   *grouping_stack; /* format-specific grouping state */

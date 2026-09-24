@@ -83,6 +83,7 @@ ParseExplainOptionList(ExplainState *es, List *options, ParseState *pstate)
 	bool		timing_set = false;
 	bool		buffers_set = false;
 	bool		summary_set = false;
+	DefElem    *extension_opt = NULL;
 
 	/* Parse options list. */
 	foreach(lc, options)
@@ -164,12 +165,23 @@ ParseExplainOptionList(ExplainState *es, List *options, ParseState *pstate)
 		}
 		else if (strcmp(opt->defname, "io") == 0)
 			es->io = defGetBoolean(opt);
+		else if (strcmp(opt->defname, "redact") == 0)
+			es->redact = defGetBoolean(opt);
 		else if (!ApplyExtensionExplainOption(es, opt, pstate))
 			ereport(ERROR,
 					(errcode(ERRCODE_SYNTAX_ERROR),
 					 errmsg("unrecognized %s option \"%s\"",
 							"EXPLAIN", opt->defname),
 					 parser_errposition(pstate, opt->location)));
+		else
+		{
+			/*
+			 * Remembered rather than rejected here: the options may be given
+			 * in either order, so whether REDACT is also present is not known
+			 * until the whole list has been read.
+			 */
+			extension_opt = opt;
+		}
 	}
 
 	/* check that WAL is used with EXPLAIN ANALYZE */
@@ -208,6 +220,39 @@ ParseExplainOptionList(ExplainState *es, List *options, ParseState *pstate)
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 				 errmsg("%s options %s and %s cannot be used together",
 						"EXPLAIN", "ANALYZE", "GENERIC_PLAN")));
+
+	/*
+	 * REDACT withholds user data, and both of the following would hand back
+	 * some of it anyway.  Neither is refused silently: a user who asked for
+	 * output that cannot be given safely should be told, not quietly given
+	 * less than they asked for.
+	 *
+	 * SERIALIZE (FR-72) runs the query and reports the size of the result set
+	 * it would have sent to the client.  That is a measurement of user data
+	 * rather than of the plan, and no amount of name substitution makes it
+	 * anything else.
+	 *
+	 * An extension option (FR-29) is refused because the extension decides
+	 * what to print and has no obligation to know about redaction.  Core
+	 * suppresses the hooks it can reach (see explain.c), but suppressing the
+	 * output of an option the user explicitly asked for would be worse than
+	 * refusing it: EXPLAIN (REDACT, RANGE_TABLE) would silently print no
+	 * range table at all.  pg_overexplain's RANGE_TABLE is the concrete case
+	 * -- it lists every column of every RTE.
+	 */
+	if (es->redact && es->serialize != EXPLAIN_SERIALIZE_NONE)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("%s options %s and %s cannot be used together",
+						"EXPLAIN", "REDACT", "SERIALIZE")));
+
+	if (es->redact && extension_opt != NULL)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("%s options %s and \"%s\" cannot be used together",
+						"EXPLAIN", "REDACT", extension_opt->defname),
+				 errdetail("Output produced by an extension cannot be redacted."),
+				 parser_errposition(pstate, extension_opt->location)));
 
 	/* if the summary was not set explicitly, set default value */
 	es->summary = (summary_set) ? es->summary : es->analyze;

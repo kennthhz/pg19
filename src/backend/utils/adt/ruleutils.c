@@ -38,7 +38,9 @@
 #include "catalog/pg_trigger.h"
 #include "catalog/pg_type.h"
 #include "commands/defrem.h"
+#include "commands/explain_redact.h"
 #include "commands/tablespace.h"
+#include "common/hashfn.h"
 #include "common/keywords.h"
 #include "executor/spi.h"
 #include "funcapi.h"
@@ -125,6 +127,23 @@ typedef struct
 	bool		varInOrderBy;	/* deparsing simple Var in ORDER BY? */
 	Bitmapset  *appendparents;	/* if not null, map child Vars of these relids
 								 * back to the parent rel */
+
+	/*
+	 * Pseudonym map for redacted EXPLAIN output, or NULL when not redacting
+	 * -- which is the case for every caller other than EXPLAIN, and is what
+	 * keeps pg_get_viewdef and friends unaffected.
+	 *
+	 * Carried as a field, and threaded explicitly through the static helpers
+	 * that build their own context, rather than held in a file-scope static.
+	 * The static would be a much smaller diff and would reach every context
+	 * automatically, including ones this file zeroes out.  It was rejected
+	 * because a missed site then fails silently in the unsafe direction,
+	 * whereas an explicit parameter makes the compiler point at every call
+	 * site that has to decide.  The cost is that a newly added context must
+	 * initialise this field; see the count assertion in the redaction test
+	 * module, which exists to force that decision to be made consciously.
+	 */
+	struct RedactCtx *redact;
 } deparse_context;
 
 /*
@@ -184,6 +203,21 @@ typedef struct
 	char	   *funcname;
 	int			numargs;
 	char	  **argnames;
+
+	/*
+	 * Pseudonym map for redacted EXPLAIN output, or NULL when not redacting.
+	 *
+	 * This is the copy that reaches the name-assignment functions -- the ones
+	 * that decide an RTE's alias and its column names -- because those are
+	 * handed a deparse_namespace and never see a deparse_context.  Assigning
+	 * names is a separate step from printing them, and it happens first, so
+	 * the handle has to be here as well as on the context.
+	 *
+	 * Unlike deparse_context, every site that builds one of these zeroes it
+	 * first -- by memset, by palloc0, or via set_deparse_for_query() -- so
+	 * this field defaults to NULL without each site having to say so.
+	 */
+	struct RedactCtx *redact;
 } deparse_namespace;
 
 /*
@@ -349,7 +383,8 @@ bool		quote_all_identifiers = false;
  */
 static char *deparse_expression_pretty(Node *expr, List *dpcontext,
 									   bool forceprefix, bool showimplicit,
-									   int prettyFlags, int startIndent);
+									   int prettyFlags, int startIndent,
+									   struct RedactCtx *redact);
 static char *pg_get_viewdef_worker(Oid viewoid,
 								   int prettyFlags, int wrapColumn);
 static char *pg_get_triggerdef_worker(Oid trigid, bool pretty);
@@ -383,7 +418,8 @@ static void set_using_names(deparse_namespace *dpns, Node *jtnode,
 							List *parentUsing);
 static void set_relation_column_names(deparse_namespace *dpns,
 									  RangeTblEntry *rte,
-									  deparse_columns *colinfo);
+									  deparse_columns *colinfo,
+									  int rtindex);
 static void set_join_column_names(deparse_namespace *dpns, RangeTblEntry *rte,
 								  deparse_columns *colinfo);
 static bool colname_is_unique(const char *colname, deparse_namespace *dpns,
@@ -414,7 +450,8 @@ static void make_viewdef(StringInfo buf, HeapTuple ruletup, TupleDesc rulettc,
 						 int prettyFlags, int wrapColumn);
 static void get_query_def(Query *query, StringInfo buf, List *parentnamespace,
 						  TupleDesc resultDesc, bool colNamesVisible,
-						  int prettyFlags, int wrapColumn, int startIndent);
+						  int prettyFlags, int wrapColumn, int startIndent,
+						  struct RedactCtx *redact);
 static void get_values_def(List *values_lists, deparse_context *context);
 static void get_with_clause(Query *query, deparse_context *context);
 static void get_select_query_def(Query *query, deparse_context *context);
@@ -495,11 +532,13 @@ static void get_const_expr(Const *constval, deparse_context *context,
 static void get_const_collation(Const *constval, deparse_context *context);
 static void get_json_format(JsonFormat *format, StringInfo buf);
 static void get_json_returning(JsonReturning *returning, StringInfo buf,
-							   bool json_format_by_default);
+							   bool json_format_by_default,
+							   struct RedactCtx *redact);
 static void get_json_constructor(JsonConstructorExpr *ctor,
 								 deparse_context *context, bool showimplicit);
 static void get_json_constructor_options(JsonConstructorExpr *ctor,
-										 StringInfo buf);
+										 StringInfo buf,
+										 struct RedactCtx *redact);
 static void get_json_agg_constructor(JsonConstructorExpr *ctor,
 									 deparse_context *context,
 									 const char *funcname,
@@ -531,13 +570,19 @@ static void get_opclass_name(Oid opclass, Oid actual_datatype,
 static Node *processIndirection(Node *node, deparse_context *context);
 static void printSubscripts(SubscriptingRef *sbsref, deparse_context *context);
 static char *get_relation_name(Oid relid);
-static char *generate_relation_name(Oid relid, List *namespaces);
+static char *generate_relation_name(Oid relid, List *namespaces,
+									struct RedactCtx *redact);
 static char *generate_qualified_relation_name(Oid relid);
 static char *generate_function_name(Oid funcid, int nargs,
 									List *argnames, Oid *argtypes,
 									bool has_variadic, bool *use_variadic_p,
-									bool inGroupBy);
-static char *generate_operator_name(Oid operid, Oid arg1, Oid arg2);
+									bool inGroupBy,
+									struct RedactCtx *redact);
+static char *generate_operator_name(Oid operid, Oid arg1, Oid arg2,
+									struct RedactCtx *redact);
+static char *redact_format_type(Oid typid, int32 typmod,
+								struct RedactCtx *redact);
+static char *redact_collation_name(Oid collid, struct RedactCtx *redact);
 static void add_cast_to(StringInfo buf, Oid typid);
 static char *generate_qualified_type_name(Oid typid);
 static text *string_to_text(char *str);
@@ -1015,14 +1060,14 @@ pg_get_triggerdef_worker(Oid trigid, bool pretty)
 	 */
 	appendStringInfo(&buf, " ON %s ",
 					 pretty ?
-					 generate_relation_name(trigrec->tgrelid, NIL) :
+					 generate_relation_name(trigrec->tgrelid, NIL, NULL) :
 					 generate_qualified_relation_name(trigrec->tgrelid));
 
 	if (OidIsValid(trigrec->tgconstraint))
 	{
 		if (OidIsValid(trigrec->tgconstrrelid))
 			appendStringInfo(&buf, "FROM %s ",
-							 generate_relation_name(trigrec->tgconstrrelid, NIL));
+							 generate_relation_name(trigrec->tgconstrrelid, NIL, NULL));
 		if (!trigrec->tgdeferrable)
 			appendStringInfoString(&buf, "NOT ");
 		appendStringInfoString(&buf, "DEFERRABLE INITIALLY ");
@@ -1124,6 +1169,7 @@ pg_get_triggerdef_worker(Oid trigid, bool pretty)
 		context.inGroupBy = false;
 		context.varInOrderBy = false;
 		context.appendparents = NULL;
+		context.redact = NULL;
 
 		get_rule_expr(qual, &context, false);
 
@@ -1133,7 +1179,7 @@ pg_get_triggerdef_worker(Oid trigid, bool pretty)
 	appendStringInfo(&buf, "EXECUTE FUNCTION %s(",
 					 generate_function_name(trigrec->tgfoid, 0,
 											NIL, NULL,
-											false, NULL, false));
+											false, NULL, false, NULL));
 
 	if (trigrec->tgnargs > 0)
 	{
@@ -1389,7 +1435,7 @@ pg_get_indexdef_worker(Oid indexrelid, int colno,
 							 idxrelrec->relkind == RELKIND_PARTITIONED_INDEX
 							 && !inherits ? "ONLY " : "",
 							 (prettyFlags & PRETTYFLAG_SCHEMA) ?
-							 generate_relation_name(indrelid, NIL) :
+							 generate_relation_name(indrelid, NIL, NULL) :
 							 generate_qualified_relation_name(indrelid),
 							 quote_identifier(NameStr(amrec->amname)));
 		else					/* currently, must be EXCLUDE constraint */
@@ -1448,7 +1494,7 @@ pg_get_indexdef_worker(Oid indexrelid, int colno,
 			indexpr_item = lnext(indexprs, indexpr_item);
 			/* Deparse */
 			str = deparse_expression_pretty(indexkey, context, false, false,
-											prettyFlags, 0);
+											prettyFlags, 0, NULL);
 			if (!colno || colno == keyno + 1)
 			{
 				/* Need parens if it's not a bare function call */
@@ -1509,7 +1555,7 @@ pg_get_indexdef_worker(Oid indexrelid, int colno,
 				appendStringInfo(&buf, " WITH %s",
 								 generate_operator_name(excludeOps[keyno],
 														keycoltype,
-														keycoltype));
+														keycoltype, NULL));
 		}
 	}
 
@@ -1565,7 +1611,7 @@ pg_get_indexdef_worker(Oid indexrelid, int colno,
 
 			/* Deparse */
 			str = deparse_expression_pretty(node, context, false, false,
-											prettyFlags, 0);
+											prettyFlags, 0, NULL);
 			if (isConstraint)
 				appendStringInfo(&buf, " WHERE (%s)", str);
 			else
@@ -1601,7 +1647,8 @@ pg_get_querydef(Query *query, bool pretty)
 	initStringInfo(&buf);
 
 	get_query_def(query, &buf, NIL, NULL, true,
-				  prettyFlags, WRAP_COLUMN_DEFAULT, 0);
+				  prettyFlags, WRAP_COLUMN_DEFAULT, 0,
+				  NULL);
 
 	return buf.data;
 }
@@ -1813,7 +1860,7 @@ pg_get_statisticsobj_worker(Oid statextid, bool columns_only, bool missing_ok)
 		int			prettyFlags = PRETTYFLAG_PAREN;
 
 		str = deparse_expression_pretty(expr, context, false, false,
-										prettyFlags, 0);
+										prettyFlags, 0, NULL);
 
 		if (colno > 0)
 			appendStringInfoString(&buf, ", ");
@@ -1829,7 +1876,7 @@ pg_get_statisticsobj_worker(Oid statextid, bool columns_only, bool missing_ok)
 
 	if (!columns_only)
 		appendStringInfo(&buf, " FROM %s",
-						 generate_relation_name(statextrec->stxrelid, NIL));
+						 generate_relation_name(statextrec->stxrelid, NIL, NULL));
 
 	ReleaseSysCache(statexttup);
 
@@ -1889,7 +1936,7 @@ pg_get_statisticsobjdef_expressions(PG_FUNCTION_ARGS)
 		int			prettyFlags = PRETTYFLAG_INDENT;
 
 		str = deparse_expression_pretty(expr, context, false, false,
-										prettyFlags, 0);
+										prettyFlags, 0, NULL);
 
 		astate = accumArrayResult(astate,
 								  PointerGetDatum(cstring_to_text(str)),
@@ -2061,7 +2108,7 @@ pg_get_partkeydef_worker(Oid relid, int prettyFlags,
 
 			/* Deparse */
 			str = deparse_expression_pretty(partkey, context, false, false,
-											prettyFlags, 0);
+											prettyFlags, 0, NULL);
 			/* Need parens if it's not a bare function call */
 			if (looks_like_function(partkey))
 				appendStringInfoString(&buf, str);
@@ -2118,7 +2165,7 @@ pg_get_partition_constraintdef(PG_FUNCTION_ARGS)
 	prettyFlags = PRETTYFLAG_INDENT;
 	context = deparse_context_for(get_relation_name(relationId), relationId);
 	consrc = deparse_expression_pretty((Node *) constr_expr, context, false,
-									   false, prettyFlags, 0);
+									   false, prettyFlags, 0, NULL);
 
 	PG_RETURN_TEXT_P(string_to_text(consrc));
 }
@@ -2287,7 +2334,7 @@ pg_get_constraintdef_worker(Oid constraintId, bool fullCommand,
 				/* add foreign relation name */
 				appendStringInfo(&buf, ") REFERENCES %s(",
 								 generate_relation_name(conForm->confrelid,
-														NIL));
+														NIL, NULL));
 
 				/* Fetch and build referenced-column list */
 				val = SysCacheGetAttrNotNull(CONSTROID, tup,
@@ -2508,7 +2555,7 @@ pg_get_constraintdef_worker(Oid constraintId, bool fullCommand,
 				}
 
 				consrc = deparse_expression_pretty(expr, context, false, false,
-												   prettyFlags, 0);
+												   prettyFlags, 0, NULL);
 
 				/*
 				 * Now emit the constraint definition, adding NO INHERIT if
@@ -2782,7 +2829,7 @@ pg_get_expr_worker(text *expr, Oid relid, int prettyFlags)
 
 	/* Deparse */
 	str = deparse_expression_pretty(node, context, false, false,
-									prettyFlags, 0);
+									prettyFlags, 0, NULL);
 
 	if (rel != NULL)
 		relation_close(rel, AccessShareLock);
@@ -3044,7 +3091,7 @@ pg_get_functiondef(PG_FUNCTION_ARGS)
 		appendStringInfo(&buf, " SUPPORT %s",
 						 generate_function_name(proc->prosupport, 1,
 												NIL, argtypes,
-												false, NULL, false));
+												false, NULL, false, NULL));
 	}
 
 	if (oldlen != buf.len)
@@ -3597,7 +3644,8 @@ print_function_sqlbody(StringInfo buf, HeapTuple proctup)
 			/* It seems advisable to get at least AccessShareLock on rels */
 			AcquireRewriteLocks(query, false, false);
 			get_query_def(query, buf, list_make1(&dpns), NULL, false,
-						  PRETTYFLAG_INDENT, WRAP_COLUMN_DEFAULT, 1);
+						  PRETTYFLAG_INDENT, WRAP_COLUMN_DEFAULT, 1,
+						  NULL);
 			appendStringInfoChar(buf, ';');
 			appendStringInfoChar(buf, '\n');
 		}
@@ -3611,7 +3659,8 @@ print_function_sqlbody(StringInfo buf, HeapTuple proctup)
 		/* It seems advisable to get at least AccessShareLock on rels */
 		AcquireRewriteLocks(query, false, false);
 		get_query_def(query, buf, list_make1(&dpns), NULL, false,
-					  0, WRAP_COLUMN_DEFAULT, 0);
+					  0, WRAP_COLUMN_DEFAULT, 0,
+					  NULL);
 	}
 }
 
@@ -3655,7 +3704,32 @@ deparse_expression(Node *expr, List *dpcontext,
 				   bool forceprefix, bool showimplicit)
 {
 	return deparse_expression_pretty(expr, dpcontext, forceprefix,
-									 showimplicit, 0, 0);
+									 showimplicit, 0, 0, NULL);
+}
+
+/*
+ * deparse_expression_redacted	- deparse an expression for a redacted EXPLAIN
+ *
+ * Identical to deparse_expression() except that it carries a RedactCtx down
+ * into the walk, so the leaf functions that print a name or a value can
+ * substitute a pseudonym for it.
+ *
+ * Passing NULL is well defined and means "do not redact", which makes this a
+ * safe drop-in wherever the caller may or may not be redacting.
+ *
+ * Nothing in the tree calls this yet.  The substitution the RedactCtx enables
+ * is added one emission site at a time in later work, and EXPLAIN goes on
+ * suppressing expressions outright until all of those sites are done -- so this
+ * entry point exists ahead of its callers deliberately, and adding it changes
+ * no output.
+ */
+char *
+deparse_expression_redacted(Node *expr, List *dpcontext,
+							bool forceprefix, bool showimplicit,
+							struct RedactCtx *redact)
+{
+	return deparse_expression_pretty(expr, dpcontext, forceprefix,
+									 showimplicit, 0, 0, redact);
 }
 
 /* ----------
@@ -3680,7 +3754,8 @@ deparse_expression(Node *expr, List *dpcontext,
 static char *
 deparse_expression_pretty(Node *expr, List *dpcontext,
 						  bool forceprefix, bool showimplicit,
-						  int prettyFlags, int startIndent)
+						  int prettyFlags, int startIndent,
+						  struct RedactCtx *redact)
 {
 	StringInfoData buf;
 	deparse_context context;
@@ -3699,6 +3774,7 @@ deparse_expression_pretty(Node *expr, List *dpcontext,
 	context.inGroupBy = false;
 	context.varInOrderBy = false;
 	context.appendparents = NULL;
+	context.redact = redact;
 
 	get_rule_expr(expr, &context, showimplicit);
 
@@ -3761,6 +3837,24 @@ deparse_context_for(const char *aliasname, Oid relid)
 List *
 deparse_context_for_plan_tree(PlannedStmt *pstmt, List *rtable_names)
 {
+	return deparse_context_for_plan_tree_redacted(pstmt, rtable_names, NULL);
+}
+
+/*
+ * deparse_context_for_plan_tree_redacted
+ *
+ * As deparse_context_for_plan_tree(), but with a RedactCtx available while the
+ * column names are assigned.
+ *
+ * A separate entry point is needed because column names are settled here, under
+ * set_simple_column_names() -> set_relation_column_names(), and not during the
+ * per-expression deparse.  Installing the handle only on the expression call
+ * would therefore be too late for every column name in the plan.
+ */
+List *
+deparse_context_for_plan_tree_redacted(PlannedStmt *pstmt, List *rtable_names,
+									   struct RedactCtx *redact)
+{
 	deparse_namespace *dpns;
 
 	dpns = palloc0_object(deparse_namespace);
@@ -3789,6 +3883,8 @@ deparse_context_for_plan_tree(PlannedStmt *pstmt, List *rtable_names)
 	}
 	else
 		dpns->appendrels = NULL;	/* don't need it */
+
+	dpns->redact = redact;
 
 	/*
 	 * Set up column name aliases, ignoring any join RTEs; they don't matter
@@ -3847,6 +3943,28 @@ set_deparse_context_plan(List *dpcontext, Plan *plan, List *ancestors)
 	{
 		dpns->ret_old_alias = ((ModifyTable *) plan)->returningOldAlias;
 		dpns->ret_new_alias = ((ModifyTable *) plan)->returningNewAlias;
+
+		/*
+		 * RETURNING WITH (OLD AS x, NEW AS y) names are the user's own words
+		 * and are printed as the qualifier on the columns they introduce
+		 * (FR-13b).
+		 *
+		 * Scope 0 keys them, which no range-table entry can collide with
+		 * because a range-table index starts at 1.  The two need separate
+		 * ordinals or they would share one pseudonym and a reader could not
+		 * tell the before-image of a row from the after-image.
+		 */
+		if (dpns->redact != NULL)
+		{
+			if (dpns->ret_old_alias != NULL)
+				dpns->ret_old_alias =
+					unconstify(char *, explain_redact_local(dpns->redact,
+															REDACT_ALIAS, 0, 1));
+			if (dpns->ret_new_alias != NULL)
+				dpns->ret_new_alias =
+					unconstify(char *, explain_redact_local(dpns->redact,
+															REDACT_ALIAS, 0, 2));
+		}
 	}
 
 	return dpcontext;
@@ -3862,6 +3980,26 @@ set_deparse_context_plan(List *dpcontext, Plan *plan, List *ancestors)
 List *
 select_rtable_names_for_explain(List *rtable, Bitmapset *rels_used)
 {
+	return select_rtable_names_for_explain_redacted(rtable, rels_used, NULL);
+}
+
+/*
+ * select_rtable_names_for_explain_redacted
+ *
+ * As select_rtable_names_for_explain(), but with a RedactCtx available while
+ * the alias for each range-table entry is chosen.
+ *
+ * The handle has to arrive here, rather than at deparse time, because this is
+ * where the names are decided.  set_rtable_names() also appends _1, _2 suffixes
+ * to break ties between colliding aliases, so a pseudonym substituted afterwards
+ * would either collide or acquire a meaningless suffix.  Substituting during
+ * assignment avoids both, and makes the tie-breaking a no-op, since generated
+ * names do not collide.
+ */
+List *
+select_rtable_names_for_explain_redacted(List *rtable, Bitmapset *rels_used,
+										 struct RedactCtx *redact)
+{
 	deparse_namespace dpns;
 
 	memset(&dpns, 0, sizeof(dpns));
@@ -3869,6 +4007,7 @@ select_rtable_names_for_explain(List *rtable, Bitmapset *rels_used)
 	dpns.subplans = NIL;
 	dpns.ctes = NIL;
 	dpns.appendrels = NULL;
+	dpns.redact = redact;
 	set_rtable_names(&dpns, NIL, rels_used);
 	/* We needn't bother computing column aliases yet */
 
@@ -3974,6 +4113,52 @@ set_rtable_names(deparse_namespace *dpns, List *parent_namespaces,
 		}
 
 		/*
+		 * Under redaction, replace whichever of the four names above was
+		 * chosen with a pseudonym.
+		 *
+		 * This has to happen here rather than after the loop, and the reason
+		 * is the uniquifier immediately below: it appends _1, _2 to break
+		 * ties between colliding names.  Substituting afterwards would either
+		 * collide with an already-assigned pseudonym or leave a name like
+		 * "t1_1", which carries a fragment of nothing and invites the reader
+		 * to think the suffix means something.  Substituting first makes the
+		 * uniquifier a no-op, because generated names cannot collide (FR-47).
+		 *
+		 * Two different pseudonym kinds, and the split is what keeps this
+		 * consistent with the relation name printed separately by
+		 * ExplainTargetRel:
+		 *
+		 * A relation with no alias is keyed by its OID, so it gets the same
+		 * "tN" that its object name will get.  EXPLAIN prints the reference
+		 * name only when it differs from the object name, so keying it any
+		 * other way would make "Seq Scan on customers" become "Seq Scan on t1
+		 * a1" -- a change in shape rather than in content.
+		 *
+		 * Everything else is keyed by range-table index, because there is
+		 * nothing else to key it by: a subquery, join, VALUES, function, CTE
+		 * or tuplestore RTE has no relid at all.  A user-written alias goes
+		 * here too even when the RTE is a relation, because the alias is the
+		 * user's own word and not the table's name.
+		 *
+		 * refname stays NULL where it is already NULL -- an unreferenced RTE
+		 * or an unnamed join -- since those print nothing and there is
+		 * nothing to disclose.
+		 */
+		if (dpns->redact != NULL && refname != NULL)
+		{
+			if (rte->alias == NULL && rte->rtekind == RTE_RELATION)
+				refname = unconstify(char *,
+									 explain_redact_name(dpns->redact,
+														 REDACT_RELATION,
+														 rte->relid));
+			else
+				refname = unconstify(char *,
+									 explain_redact_local(dpns->redact,
+														  REDACT_ALIAS,
+														  rtindex, 0));
+		}
+
+		/*
 		 * If the selected name isn't unique, append digits to make it so, and
 		 * make a new hash entry for it once we've got a unique name.  For a
 		 * very long input name, we might have to truncate to stay within
@@ -4039,8 +4224,25 @@ set_deparse_for_query(deparse_namespace *dpns, Query *query,
 {
 	ListCell   *lc;
 	ListCell   *lc2;
+	int			rtindex;
 
-	/* Initialize *dpns and fill rtable/ctes links */
+	/*
+	 * Initialize *dpns and fill rtable/ctes links
+	 *
+	 * Note for redaction: this memset clears dpns->redact, so a sub-query
+	 * deparsed through get_query_def() assigns real names even when the
+	 * enclosing deparse was redacting.  That is currently unreachable from
+	 * EXPLAIN -- the planner converts every SubLink into a SubPlan, so
+	 * get_sublink_expr() and the other in-deparse callers of get_query_def()
+	 * belong to query deparsing rather than plan deparsing.  Checked rather
+	 * than assumed: scalar, EXISTS, ANY, ARRAY and in-CASE sublinks all
+	 * deparse as "(InitPlan ...).colN" from get_parameter(), never through
+	 * here.
+	 *
+	 * It is a latent hazard nonetheless.  Anything that made a plan deparse
+	 * reach this function would silently print real column names, so
+	 * redaction has to be threaded in here before that can happen.
+	 */
 	memset(dpns, 0, sizeof(deparse_namespace));
 	dpns->rtable = query->rtable;
 	dpns->subplans = NIL;
@@ -4080,6 +4282,7 @@ set_deparse_for_query(deparse_namespace *dpns, Query *query,
 	 * okay because they appear later in the rtable list than their children
 	 * (cf Asserts in identify_join_columns()).
 	 */
+	rtindex = 1;
 	forboth(lc, dpns->rtable, lc2, dpns->rtable_columns)
 	{
 		RangeTblEntry *rte = (RangeTblEntry *) lfirst(lc);
@@ -4088,7 +4291,8 @@ set_deparse_for_query(deparse_namespace *dpns, Query *query,
 		if (rte->rtekind == RTE_JOIN)
 			set_join_column_names(dpns, rte, colinfo);
 		else
-			set_relation_column_names(dpns, rte, colinfo);
+			set_relation_column_names(dpns, rte, colinfo, rtindex);
+		rtindex++;
 	}
 }
 
@@ -4107,6 +4311,7 @@ set_simple_column_names(deparse_namespace *dpns)
 {
 	ListCell   *lc;
 	ListCell   *lc2;
+	int			rtindex;
 
 	/* Initialize dpns->rtable_columns to contain zeroed structs */
 	dpns->rtable_columns = NIL;
@@ -4115,13 +4320,15 @@ set_simple_column_names(deparse_namespace *dpns)
 									   palloc0_object(deparse_columns));
 
 	/* Assign unique column aliases within each non-join RTE */
+	rtindex = 1;
 	forboth(lc, dpns->rtable, lc2, dpns->rtable_columns)
 	{
 		RangeTblEntry *rte = (RangeTblEntry *) lfirst(lc);
 		deparse_columns *colinfo = (deparse_columns *) lfirst(lc2);
 
 		if (rte->rtekind != RTE_JOIN)
-			set_relation_column_names(dpns, rte, colinfo);
+			set_relation_column_names(dpns, rte, colinfo, rtindex);
+		rtindex++;
 	}
 }
 
@@ -4320,7 +4527,21 @@ set_using_names(deparse_namespace *dpns, Node *jtnode, List *parentUsing)
 				/* Assert it's a merged column */
 				Assert(leftattnos[i] != 0 && rightattnos[i] != 0);
 
-				/* Adopt passed-down name if any, else select unique name */
+				/*
+				 * Adopt passed-down name if any, else select unique name
+				 *
+				 * Note for redaction: the name chosen here is the real USING
+				 * column name, and it is pushed down into both child RTEs
+				 * below, where set_relation_column_names() will keep it
+				 * rather than substitute a pseudonym -- its substitution only
+				 * applies when no name was passed down.  That is confined to
+				 * query deparsing: set_using_names() is reached only from
+				 * set_deparse_for_query(), and the plan path uses
+				 * set_simple_column_names(), which skips join RTEs entirely.
+				 * A USING join in a plan is therefore redacted correctly.
+				 * Threading redaction in here would be needed before that
+				 * ceases to be true.
+				 */
 				if (colinfo->colnames[i] != NULL)
 					colname = colinfo->colnames[i];
 				else
@@ -4381,7 +4602,7 @@ set_using_names(deparse_namespace *dpns, Node *jtnode, List *parentUsing)
  */
 static void
 set_relation_column_names(deparse_namespace *dpns, RangeTblEntry *rte,
-						  deparse_columns *colinfo)
+						  deparse_columns *colinfo, int rtindex)
 {
 	int			ncolumns;
 	char	  **real_colnames;
@@ -4516,8 +4737,68 @@ set_relation_column_names(deparse_namespace *dpns, RangeTblEntry *rte,
 		/* If alias already assigned, that's what to use */
 		if (colname == NULL)
 		{
+			/*
+			 * Under redaction the column gets a pseudonym instead, and
+			 * neither the real column name nor a user-written output alias is
+			 * consulted.
+			 *
+			 * One substitution covers both ways the real names were gathered
+			 * above -- the catalog, for a relation, and eref or expandRTE()
+			 * for everything else.  That matters because the second branch is
+			 * the only source available for a subquery, join, VALUES,
+			 * function, CTE or tuplestore RTE: those have no relid and no
+			 * catalog attribute number, so a (relid, attno) key could not
+			 * name their columns at all (FR-46).  Keying on (range-table
+			 * index, position) works for every kind.
+			 *
+			 * The qualifier is the reference name this RTE was already given,
+			 * rather than one derived here, so a column and its relation
+			 * cannot end up with unrelated names.  Deriving it would produce
+			 * "a1_c1" for a relation that prints as "t1", since an unaliased
+			 * relation is keyed by OID while a column is keyed by range-table
+			 * index.  Where no reference name was chosen -- an RTE the plan
+			 * does not reference -- fall back to this RTE's own alias
+			 * pseudonym.
+			 *
+			 * As in set_rtable_names(), this happens before
+			 * make_colname_unique(), so the tie-breaking below becomes a
+			 * no-op rather than appending a digit to a generated name
+			 * (FR-47).
+			 *
+			 * The columns of an exempt relation keep their real names, for
+			 * the same reason its own name is kept: they are PostgreSQL's
+			 * names rather than the application's, so withholding them
+			 * protects nothing and costs a great deal.  Without this a plan
+			 * over the system catalogs read "pg_class.pg_class_c2" instead of
+			 * "pg_class.relname" -- unreadable, and still disclosing the
+			 * attribute's position, which for a catalog table is public
+			 * knowledge anyway.
+			 *
+			 * Only RTE_RELATION can be tested this way: every other kind has
+			 * no catalog object behind it and so nothing to be exempt.
+			 */
+			if (dpns->redact != NULL &&
+				!(rte->rtekind == RTE_RELATION &&
+				  explain_redact_exempt(dpns->redact, REDACT_RELATION,
+										rte->relid)))
+			{
+				const char *qualifier = NULL;
+
+				if (rtindex >= 1 &&
+					rtindex <= list_length(dpns->rtable_names))
+					qualifier = (const char *) list_nth(dpns->rtable_names,
+														rtindex - 1);
+				if (qualifier == NULL)
+					qualifier = explain_redact_local(dpns->redact,
+													 REDACT_ALIAS, rtindex, 0);
+
+				colname = unconstify(char *,
+									 explain_redact_column(dpns->redact,
+														   qualifier,
+														   rtindex, i + 1));
+			}
 			/* If user wrote an alias, prefer that over real column name */
-			if (rte->alias && i < list_length(rte->alias->colnames))
+			else if (rte->alias && i < list_length(rte->alias->colnames))
 				colname = strVal(list_nth(rte->alias->colnames, i));
 			else
 				colname = real_colname;
@@ -4535,7 +4816,15 @@ set_relation_column_names(deparse_namespace *dpns, RangeTblEntry *rte,
 		colinfo->is_new_col[j] = (i >= noldcolumns);
 		j++;
 
-		/* Remember if any assigned aliases differ from "real" name */
+		/*
+		 * Remember if any assigned aliases differ from "real" name
+		 *
+		 * Under redaction every name differs, so this becomes true and
+		 * colinfo->printaliases follows.  That only affects get_rte_alias()
+		 * and get_column_alias_list(), both of which print a FROM item's
+		 * alias list during query deparsing; a plan has no FROM clause, so
+		 * EXPLAIN never reads it.
+		 */
 		if (!changed_any && strcmp(colname, real_colname) != 0)
 			changed_any = true;
 	}
@@ -5446,7 +5735,7 @@ make_ruledef(StringInfo buf, HeapTuple ruletup, TupleDesc rulettc,
 	/* The relation the rule is fired on */
 	appendStringInfo(buf, " TO %s",
 					 (prettyFlags & PRETTYFLAG_SCHEMA) ?
-					 generate_relation_name(ev_class, NIL) :
+					 generate_relation_name(ev_class, NIL, NULL) :
 					 generate_qualified_relation_name(ev_class));
 
 	/* If the rule has an event qualification, add it */
@@ -5477,7 +5766,9 @@ make_ruledef(StringInfo buf, HeapTuple ruletup, TupleDesc rulettc,
 		 */
 		query = getInsertSelectQuery(query, NULL);
 
-		/* Must acquire locks right away; see notes in get_query_def() */
+		/*
+		 * Must acquire locks right away; see notes in get_query_def()
+		 */
 		AcquireRewriteLocks(query, false, false);
 
 		context.buf = buf;
@@ -5493,6 +5784,7 @@ make_ruledef(StringInfo buf, HeapTuple ruletup, TupleDesc rulettc,
 		context.inGroupBy = false;
 		context.varInOrderBy = false;
 		context.appendparents = NULL;
+		context.redact = NULL;
 
 		set_deparse_for_query(&dpns, query, NIL);
 
@@ -5516,7 +5808,8 @@ make_ruledef(StringInfo buf, HeapTuple ruletup, TupleDesc rulettc,
 		{
 			query = (Query *) lfirst(action);
 			get_query_def(query, buf, NIL, viewResultDesc, true,
-						  prettyFlags, WRAP_COLUMN_DEFAULT, 0);
+						  prettyFlags, WRAP_COLUMN_DEFAULT, 0,
+						  NULL);
 			if (prettyFlags)
 				appendStringInfoString(buf, ";\n");
 			else
@@ -5530,7 +5823,8 @@ make_ruledef(StringInfo buf, HeapTuple ruletup, TupleDesc rulettc,
 
 		query = (Query *) linitial(actions);
 		get_query_def(query, buf, NIL, viewResultDesc, true,
-					  prettyFlags, WRAP_COLUMN_DEFAULT, 0);
+					  prettyFlags, WRAP_COLUMN_DEFAULT, 0,
+					  NULL);
 		appendStringInfoChar(buf, ';');
 	}
 
@@ -5604,7 +5898,8 @@ make_viewdef(StringInfo buf, HeapTuple ruletup, TupleDesc rulettc,
 	ev_relation = table_open(ev_class, AccessShareLock);
 
 	get_query_def(query, buf, NIL, RelationGetDescr(ev_relation), true,
-				  prettyFlags, wrapColumn, 0);
+				  prettyFlags, wrapColumn, 0,
+				  NULL);
 	appendStringInfoChar(buf, ';');
 
 	table_close(ev_relation, AccessShareLock);
@@ -5631,7 +5926,8 @@ make_viewdef(StringInfo buf, HeapTuple ruletup, TupleDesc rulettc,
 static void
 get_query_def(Query *query, StringInfo buf, List *parentnamespace,
 			  TupleDesc resultDesc, bool colNamesVisible,
-			  int prettyFlags, int wrapColumn, int startIndent)
+			  int prettyFlags, int wrapColumn, int startIndent,
+			  struct RedactCtx *redact)
 {
 	deparse_context context;
 	deparse_namespace dpns;
@@ -5685,6 +5981,7 @@ get_query_def(Query *query, StringInfo buf, List *parentnamespace,
 	context.inGroupBy = false;
 	context.varInOrderBy = false;
 	context.appendparents = NULL;
+	context.redact = redact;
 
 	set_deparse_for_query(&dpns, query, parentnamespace);
 
@@ -5835,7 +6132,8 @@ get_with_clause(Query *query, deparse_context *context)
 		get_query_def((Query *) cte->ctequery, buf, context->namespaces, NULL,
 					  true,
 					  context->prettyFlags, context->wrapColumn,
-					  context->indentLevel);
+					  context->indentLevel,
+					  context->redact);
 		if (PRETTY_INDENT(context))
 			appendContextKeyword(context, "", 0, 0, 0);
 		appendStringInfoChar(buf, ')');
@@ -6457,7 +6755,8 @@ get_setop_query(Node *setOp, Query *query, deparse_context *context)
 		get_query_def(subquery, buf, context->namespaces,
 					  context->resultDesc, context->colNamesVisible,
 					  context->prettyFlags, context->wrapColumn,
-					  context->indentLevel);
+					  context->indentLevel,
+					  context->redact);
 		if (need_paren)
 			appendStringInfoChar(buf, ')');
 	}
@@ -6740,7 +7039,7 @@ get_rule_orderby(List *orderList, List *targetList,
 			appendStringInfo(buf, " USING %s",
 							 generate_operator_name(srt->sortop,
 													sortcoltype,
-													sortcoltype));
+													sortcoltype, context->redact));
 			/* be specific to eliminate ambiguity */
 			if (srt->nulls_first)
 				appendStringInfoString(buf, " NULLS FIRST");
@@ -6937,6 +7236,7 @@ get_window_frame_options_for_explain(int frameOptions,
 	context.inGroupBy = false;
 	context.varInOrderBy = false;
 	context.appendparents = NULL;
+	context.redact = NULL;
 
 	get_window_frame_options(frameOptions, startOffset, endOffset, &context);
 
@@ -6998,7 +7298,7 @@ get_insert_query_def(Query *query, deparse_context *context)
 		appendStringInfoChar(buf, ' ');
 	}
 	appendStringInfo(buf, "INSERT INTO %s",
-					 generate_relation_name(rte->relid, NIL));
+					 generate_relation_name(rte->relid, NIL, context->redact));
 
 	/* Print the relation alias, if needed; INSERT requires explicit AS */
 	get_rte_alias(rte, query->resultRelation, true, context);
@@ -7062,7 +7362,8 @@ get_insert_query_def(Query *query, deparse_context *context)
 		get_query_def(select_rte->subquery, buf, context->namespaces, NULL,
 					  false,
 					  context->prettyFlags, context->wrapColumn,
-					  context->indentLevel);
+					  context->indentLevel,
+					  context->redact);
 	}
 	else if (values_rte)
 	{
@@ -7197,7 +7498,7 @@ get_update_query_def(Query *query, deparse_context *context)
 	}
 	appendStringInfo(buf, "UPDATE %s%s",
 					 only_marker(rte),
-					 generate_relation_name(rte->relid, NIL));
+					 generate_relation_name(rte->relid, NIL, context->redact));
 
 	/* Print the FOR PORTION OF, if needed */
 	get_for_portion_of(query->forPortionOf, rte, context);
@@ -7404,7 +7705,7 @@ get_delete_query_def(Query *query, deparse_context *context)
 	}
 	appendStringInfo(buf, "DELETE FROM %s%s",
 					 only_marker(rte),
-					 generate_relation_name(rte->relid, NIL));
+					 generate_relation_name(rte->relid, NIL, context->redact));
 
 	/* Print the FOR PORTION OF, if needed */
 	get_for_portion_of(query->forPortionOf, rte, context);
@@ -7456,7 +7757,7 @@ get_merge_query_def(Query *query, deparse_context *context)
 	}
 	appendStringInfo(buf, "MERGE INTO %s%s",
 					 only_marker(rte),
-					 generate_relation_name(rte->relid, NIL));
+					 generate_relation_name(rte->relid, NIL, context->redact));
 
 	/* Print the relation alias, if needed */
 	get_rte_alias(rte, query->resultRelation, false, context);
@@ -7905,8 +8206,8 @@ get_variable(Var *var, int levelsup, bool istoplevel, deparse_context *context)
 		appendStringInfoChar(buf, '*');
 		if (istoplevel)
 			appendStringInfo(buf, "::%s",
-							 format_type_with_typemod(var->vartype,
-													  var->vartypmod));
+							 redact_format_type(var->vartype,
+												var->vartypmod, context->redact));
 	}
 
 	return attname;
@@ -8806,6 +9107,30 @@ get_parameter(Param *param, deparse_context *context)
 	 */
 	if (param->paramkind == PARAM_EXTERN && context->namespaces != NIL)
 	{
+		/*
+		 * Under redaction an external parameter always prints as "$n" and
+		 * never as a function argument name.  The branch below would
+		 * otherwise print "funcname.argname" or "argname", both identifiers
+		 * the user wrote.
+		 *
+		 * Like the operator-class guard in get_rule_expr(), this is not
+		 * reachable from EXPLAIN today.  The only code that fills in argnames
+		 * is print_function_sqlbody(), which builds its own deparse_namespace
+		 * for pg_get_functiondef() and never turns redaction on, so on the
+		 * EXPLAIN path argnames is always NULL and control already reaches
+		 * the "$n" fallback at the end of this function.  Nothing observable
+		 * changes; the guard is here so that a future caller supplying
+		 * argument names cannot leak them.
+		 *
+		 * It repeats that fallback rather than jumping to it, which keeps
+		 * this change an insertion with no existing line moved.
+		 */
+		if (context->redact != NULL)
+		{
+			appendStringInfo(context->buf, "$%d", param->paramid);
+			return;
+		}
+
 		dpns = llast(context->namespaces);
 		if (dpns->argnames &&
 			param->paramid > 0 &&
@@ -8875,7 +9200,24 @@ get_simple_binary_op_name(OpExpr *expr)
 		Node	   *arg2 = (Node *) lsecond(args);
 		const char *op;
 
-		op = generate_operator_name(expr->opno, exprType(arg1), exprType(arg2));
+		/*
+		 * NULL, not the caller's redaction handle, and that is deliberate.
+		 *
+		 * This name is never printed.  It is classified by its first
+		 * character to work out operator precedence, and the caller only
+		 * proceeds if strlen(op) == 1.  A pseudonym such as "op1" would fail
+		 * that test, so passing the handle would change where parentheses are
+		 * placed -- which would make a redacted expression structurally
+		 * different from the same expression unredacted, and disclose whether
+		 * the operator was a single character.  Reading the real name here
+		 * discloses nothing, because nothing reaches the output.
+		 *
+		 * EXPLAIN does not reach this code in any case: it deparses with
+		 * prettyFlags == 0, and the caller requires PRETTYFLAG_PAREN.  The
+		 * argument above is what matters if that ever changes.
+		 */
+		op = generate_operator_name(expr->opno, exprType(arg1), exprType(arg2),
+									NULL);
 		if (strlen(op) == 1)
 			return op;
 	}
@@ -9470,7 +9812,7 @@ get_rule_expr(Node *node, deparse_context *context,
 				appendStringInfo(buf, " %s %s (",
 								 generate_operator_name(expr->opno,
 														exprType(arg1),
-														get_base_element_type(exprType(arg2))),
+														get_base_element_type(exprType(arg2)), context->redact),
 								 expr->useOr ? "ANY" : "ALL");
 				get_rule_expr_paren(arg2, context, true, node);
 
@@ -9489,8 +9831,8 @@ get_rule_expr(Node *node, deparse_context *context,
 				if (IsA(arg2, SubLink) &&
 					((SubLink *) arg2)->subLinkType == EXPR_SUBLINK)
 					appendStringInfo(buf, "::%s",
-									 format_type_with_typemod(exprType(arg2),
-															  exprTypmod(arg2)));
+									 redact_format_type(exprType(arg2),
+														exprTypmod(arg2), context->redact));
 				appendStringInfoChar(buf, ')');
 				if (!PRETTY_PAREN(context))
 					appendStringInfoChar(buf, ')');
@@ -9838,7 +10180,7 @@ get_rule_expr(Node *node, deparse_context *context,
 					appendStringInfoChar(buf, '(');
 				get_rule_expr_paren(arg, context, showimplicit, node);
 				appendStringInfo(buf, " COLLATE %s",
-								 generate_collation_name(collate->collOid));
+								 redact_collation_name(collate->collOid, context->redact));
 				if (!PRETTY_PAREN(context))
 					appendStringInfoChar(buf, ')');
 			}
@@ -9934,7 +10276,7 @@ get_rule_expr(Node *node, deparse_context *context,
 				 */
 				if (arrayexpr->elements == NIL)
 					appendStringInfo(buf, "::%s",
-									 format_type_with_typemod(arrayexpr->array_typeid, -1));
+									 redact_format_type(arrayexpr->array_typeid, -1, context->redact));
 			}
 			break;
 
@@ -9996,7 +10338,7 @@ get_rule_expr(Node *node, deparse_context *context,
 				appendStringInfoChar(buf, ')');
 				if (rowexpr->row_format == COERCE_EXPLICIT_CAST)
 					appendStringInfo(buf, "::%s",
-									 format_type_with_typemod(rowexpr->row_typeid, -1));
+									 redact_format_type(rowexpr->row_typeid, -1, context->redact));
 			}
 			break;
 
@@ -10023,7 +10365,7 @@ get_rule_expr(Node *node, deparse_context *context,
 				appendStringInfo(buf, ") %s ROW(",
 								 generate_operator_name(linitial_oid(rcexpr->opnos),
 														exprType(linitial(rcexpr->largs)),
-														exprType(linitial(rcexpr->rargs))));
+														exprType(linitial(rcexpr->rargs)), context->redact));
 				get_rule_list_toplevel(rcexpr->rargs, context, true);
 				appendStringInfoString(buf, "))");
 			}
@@ -10119,6 +10461,47 @@ get_rule_expr(Node *node, deparse_context *context,
 			break;
 
 		case T_XmlExpr:
+
+			/*
+			 * Under redaction an XML expression is not deparsed at all: we
+			 * print a placeholder and drop the subtree (FR-95).
+			 *
+			 * Why the whole construct goes rather than just its sensitive
+			 * parts: nearly everything an XML construct carries is text the
+			 * user wrote.  XMLELEMENT and XMLPI name an element, XMLFOREST
+			 * and XMLATTRIBUTES label attributes, and none of those names
+			 * belongs to a database object, so there is no catalog entry
+			 * behind them and nothing stable to key a pseudonym on.  XML
+			 * payloads are a corner case that does not earn a naming scheme
+			 * of their own, and eliding the construct is leak-proof by
+			 * inspection.  Note that "skipped" here means omitted from the
+			 * output; it never means left printing raw.
+			 *
+			 * The keyword is safe to keep and worth keeping.  It is SQL
+			 * vocabulary, not user data -- the same reason this code still
+			 * prints built-in function and operator names -- and it tells a
+			 * reader what kind of thing stood here instead of leaving an
+			 * unexplained gap.  It is also plainly not the "?" that replaces
+			 * a redacted constant.
+			 *
+			 * One fixed token, not the op's own keyword (XMLELEMENT,
+			 * XMLSERIALIZE, ...), because IS_DOCUMENT has no keyword of its
+			 * own: it deparses as "arg IS DOCUMENT".  An op-accurate
+			 * placeholder could therefore not be one self-contained NAME(...)
+			 * shape for every op, and that shape is what lets isSimpleNode()
+			 * go on calling an XmlExpr "function-like", leaving every
+			 * parenthesization rule alone.
+			 *
+			 * What we give up is diagnostic detail: a Var inside the
+			 * construct would otherwise have printed as its column pseudonym
+			 * and shown which columns fed it.  That is the accepted cost of
+			 * collapsing.
+			 */
+			if (context->redact != NULL)
+			{
+				appendStringInfoString(buf, "XMLEXPR(...)");
+				break;
+			}
 			{
 				XmlExpr    *xexpr = (XmlExpr *) node;
 				bool		needcomma = false;
@@ -10264,8 +10647,8 @@ get_rule_expr(Node *node, deparse_context *context,
 				if (xexpr->op == IS_XMLSERIALIZE)
 				{
 					appendStringInfo(buf, " AS %s",
-									 format_type_with_typemod(xexpr->type,
-															  xexpr->typmod));
+									 redact_format_type(xexpr->type,
+														xexpr->typmod, context->redact));
 					if (xexpr->indent)
 						appendStringInfoString(buf, " INDENT");
 					else
@@ -10395,6 +10778,41 @@ get_rule_expr(Node *node, deparse_context *context,
 			break;
 
 		case T_CurrentOfExpr:
+
+			/*
+			 * A cursor name is redacted (FR-97).  It is an identifier the
+			 * application chose, and it reaches plan output here: EXPLAIN of
+			 * an "UPDATE ... WHERE CURRENT OF c" prints it inside the TID
+			 * Cond.
+			 *
+			 * Only the named branch needs this.  The other branch prints
+			 * "CURRENT OF $n" from cursor_param, which is a parameter index
+			 * the parser assigned and not anything the user wrote, so it is
+			 * left as it is and this guard falls through to it.
+			 *
+			 * The pseudonym is keyed on a hash of the name because
+			 * explain_redact_local() keys on two integers and a cursor has no
+			 * numeric identity to offer.  The hash is only ever a hash-table
+			 * key; it is never printed and nothing is derived from it.  A
+			 * hash rather than a fixed key so that two different cursors in
+			 * one record cannot both come out as "cur1" -- a data-modifying
+			 * CTE can carry a second DELETE with its own WHERE CURRENT OF,
+			 * which puts two of these in one plan.  Two names that happened
+			 * to hash alike would share a pseudonym, which costs readability
+			 * and leaks nothing.
+			 */
+			if (context->redact != NULL &&
+				((CurrentOfExpr *) node)->cursor_name != NULL)
+			{
+				char	   *curname = ((CurrentOfExpr *) node)->cursor_name;
+				int			curkey = (int) hash_bytes((const unsigned char *) curname,
+													  strlen(curname));
+
+				appendStringInfo(buf, "CURRENT OF %s",
+								 explain_redact_local(context->redact,
+													  REDACT_CURSOR, curkey, 0));
+				break;
+			}
 			{
 				CurrentOfExpr *cexpr = (CurrentOfExpr *) node;
 
@@ -10418,7 +10836,7 @@ get_rule_expr(Node *node, deparse_context *context,
 				appendStringInfoString(buf, "nextval(");
 				simple_quote_literal(buf,
 									 generate_relation_name(nvexpr->seqid,
-															NIL));
+															NIL, context->redact));
 				appendStringInfoChar(buf, ')');
 			}
 			break;
@@ -10457,13 +10875,68 @@ get_rule_expr(Node *node, deparse_context *context,
 
 				if (iexpr->infercollid)
 					appendStringInfo(buf, " COLLATE %s",
-									 generate_collation_name(iexpr->infercollid));
+									 redact_collation_name(iexpr->infercollid, context->redact));
 
 				/* Add the operator class name, if not default */
 				if (iexpr->inferopclass)
 				{
 					Oid			inferopclass = iexpr->inferopclass;
 					Oid			inferopcinputtype = get_opclass_input_type(iexpr->inferopclass);
+
+					/*
+					 * The operator class of an ON CONFLICT inference element
+					 * is redacted (FR-98c).  An operator class is a catalog
+					 * object, so it takes a pseudonym only when it is not
+					 * exempt; a built-in class such as text_pattern_ops is
+					 * exempt and keeps its real name, printed by the call
+					 * below.
+					 *
+					 * The guard sits at this call site and NOT inside
+					 * get_opclass_name(), which is the opposite of where the
+					 * tablefunc guard went, and the reason is worth spelling
+					 * out because the next reader will otherwise want to
+					 * "fix" it. get_opclass_name() is handed a bare
+					 * StringInfo and no deparse context, so it cannot tell
+					 * whether redaction is active.  Its other two callers are
+					 * pg_get_indexdef_worker() and the partition-bound
+					 * printer, both of which produce DDL that has to name
+					 * real objects and must never redact.  A guard inside the
+					 * function would corrupt pg_get_indexdef() output.
+					 *
+					 * Not reachable from EXPLAIN today, so this ships as a
+					 * guard verified by a direct deparse call rather than by
+					 * SQL. InferenceElem nodes hang off the Query's
+					 * OnConflictExpr; the planner reduces them to a list of
+					 * index OIDs on the ModifyTable node, and EXPLAIN builds
+					 * "Conflict Arbiter Indexes" from those OIDs without ever
+					 * deparsing an inference element.  Keep the guard: if the
+					 * path becomes reachable it is already safe.
+					 *
+					 * The break leaves the enclosing switch in
+					 * get_rule_expr(). Nothing else in this case follows the
+					 * operator class, and context->varprefix has already been
+					 * restored above.
+					 */
+					if (context->redact != NULL &&
+						!explain_redact_exempt(context->redact, REDACT_OPCLASS,
+											   inferopclass))
+					{
+						/*
+						 * get_opclass_name() prints nothing at all when the
+						 * opclass is the default for the input type, and the
+						 * pseudonym has to do the same.  A user-defined class
+						 * can be a type's default, and printing "opc1" for it
+						 * would tell the reader an operator class had been
+						 * specified when none was.
+						 */
+						if (GetDefaultOpClass(inferopcinputtype,
+											  get_opclass_method(inferopclass)) != inferopclass)
+							appendStringInfo(buf, " %s",
+											 explain_redact_name(context->redact,
+																 REDACT_OPCLASS,
+																 inferopclass));
+						break;
+					}
 
 					get_opclass_name(inferopclass, inferopcinputtype, buf);
 				}
@@ -10593,6 +11066,23 @@ get_rule_expr(Node *node, deparse_context *context,
 			break;
 
 		case T_JsonExpr:
+
+			/*
+			 * Collapsed under redaction, for the reason spelled out at
+			 * T_XmlExpr above (FR-96).  A JSON_EXISTS, JSON_QUERY or
+			 * JSON_VALUE expression carries a path expression and the labels
+			 * given to its PASSING arguments.  The path is a constant and
+			 * would already print as "?", but the labels are raw identifiers
+			 * the user chose, so the construct goes as a whole.
+			 *
+			 * One token for all three ops, so that the op-to-keyword mapping
+			 * just below has no second copy here to be kept in step with it.
+			 */
+			if (context->redact != NULL)
+			{
+				appendStringInfoString(buf, "JSONEXPR(...)");
+				break;
+			}
 			{
 				JsonExpr   *jexpr = (JsonExpr *) node;
 
@@ -10642,7 +11132,7 @@ get_rule_expr(Node *node, deparse_context *context,
 				if (jexpr->op != JSON_EXISTS_OP ||
 					jexpr->returning->typid != BOOLOID)
 					get_json_returning(jexpr->returning, context->buf,
-									   jexpr->op == JSON_QUERY_OP);
+									   jexpr->op == JSON_QUERY_OP, context->redact);
 
 				get_json_expr_options(jexpr, context,
 									  jexpr->op != JSON_EXISTS_OP ?
@@ -10751,8 +11241,8 @@ get_rule_expr_funccall(Node *node, deparse_context *context,
 		/* no point in showing any top-level implicit cast */
 		get_rule_expr(node, context, false);
 		appendStringInfo(buf, " AS %s)",
-						 format_type_with_typemod(exprType(node),
-												  exprTypmod(node)));
+						 redact_format_type(exprType(node),
+											exprTypmod(node), context->redact));
 	}
 }
 
@@ -10808,7 +11298,7 @@ get_oper_expr(OpExpr *expr, deparse_context *context)
 		appendStringInfo(buf, " %s ",
 						 generate_operator_name(opno,
 												exprType(arg1),
-												exprType(arg2)));
+												exprType(arg2), context->redact));
 		get_rule_expr_paren(arg2, context, true, (Node *) expr);
 	}
 	else
@@ -10819,7 +11309,7 @@ get_oper_expr(OpExpr *expr, deparse_context *context)
 		appendStringInfo(buf, "%s ",
 						 generate_operator_name(opno,
 												InvalidOid,
-												exprType(arg)));
+												exprType(arg), context->redact));
 		get_rule_expr_paren(arg, context, true, (Node *) expr);
 	}
 	if (!PRETTY_PAREN(context))
@@ -10909,7 +11399,7 @@ get_func_expr(FuncExpr *expr, deparse_context *context,
 											argnames, argtypes,
 											expr->funcvariadic,
 											&use_variadic,
-											context->inGroupBy));
+											context->inGroupBy, context->redact));
 	nargs = 0;
 	foreach(l, expr->args)
 	{
@@ -10979,7 +11469,7 @@ get_agg_expr_helper(Aggref *aggref, deparse_context *context,
 		funcname = generate_function_name(aggref->aggfnoid, nargs, NIL,
 										  argtypes, aggref->aggvariadic,
 										  &use_variadic,
-										  context->inGroupBy);
+										  context->inGroupBy, context->redact);
 
 	/* Print the aggregate name, schema-qualified if needed */
 	appendStringInfo(buf, "%s(%s", funcname,
@@ -11120,7 +11610,7 @@ get_windowfunc_expr_helper(WindowFunc *wfunc, deparse_context *context,
 	if (!funcname)
 		funcname = generate_function_name(wfunc->winfnoid, nargs, argnames,
 										  argtypes, false, NULL,
-										  context->inGroupBy);
+										  context->inGroupBy, context->redact);
 
 	appendStringInfo(buf, "%s(", funcname);
 
@@ -11275,6 +11765,44 @@ get_func_sql_syntax(FuncExpr *expr, deparse_context *context)
 		case F_EXTRACT_TEXT_INTERVAL:
 			/* EXTRACT (x FROM y) */
 			appendStringInfoString(buf, "EXTRACT(");
+
+			/*
+			 * The field is redacted (FR-98d).  "EXTRACT(field FROM x)" reads
+			 * as though the field could only ever be a keyword such as year
+			 * or month, but it is an ordinary text constant and the grammar
+			 * accepts any string at all.  The "unit not recognized" error
+			 * that would reject a bad one is raised at execution time, and
+			 * EXPLAIN without ANALYZE does not execute, so whatever the user
+			 * wrote is planned, deparsed and printed.  Measured:
+			 *
+			 * EXPLAIN (COSTS OFF, VERBOSE) SELECT EXTRACT('any text at all'
+			 * FROM now());
+			 *
+			 * prints the string straight back in the Output list.  So the
+			 * field is user-controlled text and gets the same "?" as any
+			 * other redacted constant.
+			 *
+			 * This site needs a guard of its own because it reads the datum
+			 * directly out of the Const instead of going through
+			 * get_const_expr(), so the redaction applied there does not reach
+			 * it.
+			 *
+			 * Replaced unconditionally rather than checked against the real
+			 * field names: losing "year" versus "month" is accepted, and an
+			 * allowlist would be one more list to keep in step with the
+			 * date/time code.
+			 *
+			 * The two normalization-form sites below -- "x IS <form>
+			 * NORMALIZED" and "NORMALIZE(x, <form>)" -- look like the same
+			 * pattern and are deliberately left alone.  There the form is a
+			 * grammar keyword rather than an expression: "x IS 'whatever'
+			 * NORMALIZED" and "NORMALIZE(x, 'whatever')" are both syntax
+			 * errors, so only NFC, NFD, NFKC and NFKD can ever reach those
+			 * lines and nothing user-derived can.
+			 */
+			if (context->redact != NULL)
+				appendStringInfoChar(buf, '?');
+			else
 			{
 				Const	   *con = (Const *) linitial(expr->args);
 
@@ -11502,12 +12030,68 @@ get_coercion_expr(Node *arg, deparse_context *context,
 	/*
 	 * Never emit resulttype(arg) functional notation. A pg_proc entry could
 	 * take precedence, and a resulttype in pg_temp would require schema
-	 * qualification that format_type_with_typemod() would usually omit. We've
-	 * standardized on arg::resulttype, but CAST(arg AS resulttype) notation
-	 * would work fine.
+	 * qualification that redact_format_type(, context->redact) would usually
+	 * omit. We've standardized on arg::resulttype, but CAST(arg AS
+	 * resulttype) notation would work fine.
 	 */
 	appendStringInfo(buf, "::%s",
-					 format_type_with_typemod(resulttype, resulttypmod));
+					 redact_format_type(resulttype, resulttypmod, context->redact));
+}
+
+/*
+ * redact_format_type
+ *		format_type_with_typemod(), with a user-defined type replaced by its
+ *		pseudonym.
+ *
+ * One helper rather than an edit at each of the fifteen places the expression
+ * path prints a type, so the rule lives in one readable spot and a site added
+ * later is a one-word change.
+ *
+ * Core type labels are kept, for the same reason built-in function names are
+ * (FR-20 covers user-defined types only).  A cast printed as "?::ty3" instead of
+ * "?::integer" would tell a reader nothing, and "integer" discloses nothing --
+ * it is PostgreSQL's name, and a reader who could not look it up would be no
+ * better off.
+ *
+ * The typmod goes with the pseudonym: there is no "ty1(10)".  A pseudonym stands
+ * for the type as an object, and a length or precision is a property of the
+ * declaration rather than of the name.  Exempt types keep theirs, so
+ * "character varying(10)" still prints in full.
+ *
+ * One consequence worth knowing: an array of a user-defined type has its own OID
+ * in the user's schema, so it redacts to a plain "ty1" and the reader loses the
+ * fact that it was an array.  An array of a core type keeps "integer[]" because
+ * the array type is in pg_catalog too.
+ */
+static char *
+redact_format_type(Oid typid, int32 typmod, struct RedactCtx *redact)
+{
+	if (redact != NULL && !explain_redact_exempt(redact, REDACT_TYPE, typid))
+		return pstrdup(explain_redact_name(redact, REDACT_TYPE, typid));
+
+	return format_type_with_typemod(typid, typmod);
+}
+
+/*
+ * redact_collation_name
+ *		generate_collation_name(), with a user-defined collation replaced by its
+ *		pseudonym.
+ *
+ * A helper rather than a new parameter on generate_collation_name(), which is
+ * exported and has callers outside the expression path that must not change.
+ *
+ * Core collations keep their names.  "COLLATE \"C\"" and "COLLATE \"en_US\"" are
+ * PostgreSQL's, and a sort whose collation had become "coll2" would be harder to
+ * diagnose for no gain.
+ */
+static char *
+redact_collation_name(Oid collid, struct RedactCtx *redact)
+{
+	if (redact != NULL &&
+		!explain_redact_exempt(redact, REDACT_COLLATION, collid))
+		return pstrdup(explain_redact_name(redact, REDACT_COLLATION, collid));
+
+	return generate_collation_name(collid);
 }
 
 /* ----------
@@ -11534,6 +12118,55 @@ get_const_expr(Const *constval, deparse_context *context, int showtype)
 	char	   *extval;
 	bool		needlabel = false;
 
+	/*
+	 * Under redaction the value is replaced by a placeholder, and the type
+	 * label is kept so a reader can still tell what kind of comparison a plan
+	 * is doing (FR-21).
+	 *
+	 * No value class is exempt, NULL included.  That is not over-caution: a
+	 * NULL literal in a plan asserts something about real rows -- that the
+	 * query tested for their absence -- and "?" versus "NULL" is exactly the
+	 * distinction that would give it away.  true and false go the same way.
+	 * Treating every constant alike also means the redacted form cannot be
+	 * used to classify the original (D6).
+	 *
+	 * Returning here rather than further down matters twice over.  The type's
+	 * output function is never called, so a sensitive value is never rendered
+	 * into a buffer only to be discarded, and a user-defined output function
+	 * -- which may run arbitrary code -- is never invoked on it.  Same
+	 * reasoning as the parameter list in ExplainQueryParameters().
+	 *
+	 * The label is emitted whenever the caller permits one, and deliberately
+	 * without consulting "needlabel".  The unredacted rule below decides that
+	 * from the value: a negative int4 prints as '-5'::integer while a
+	 * positive one prints as 5, and a numeric gets a cast unless it looks
+	 * like a float. Keeping that rule would have let the presence or absence
+	 * of "::integer" disclose the sign of a value that had just been replaced
+	 * precisely so it would not be disclosed.
+	 *
+	 * showtype == -1 still means "no label", because the caller prints the
+	 * type itself and a cast inserted here would land in the middle of its
+	 * output. The type information survives either way.
+	 *
+	 * The type and collation names printed below are still the real ones;
+	 * they are separate objects with their own requirement (FR-20) and are
+	 * pseudonymized in T11.  Nothing is exposed in the meantime, since
+	 * EXPLAIN suppresses expressions entirely until T21.
+	 */
+	if (context->redact != NULL)
+	{
+		appendStringInfoChar(buf, '?');
+
+		if (showtype >= 0)
+		{
+			appendStringInfo(buf, "::%s",
+							 redact_format_type(constval->consttype,
+												constval->consttypmod, context->redact));
+			get_const_collation(constval, context);
+		}
+		return;
+	}
+
 	if (constval->constisnull)
 	{
 		/*
@@ -11544,8 +12177,8 @@ get_const_expr(Const *constval, deparse_context *context, int showtype)
 		if (showtype >= 0)
 		{
 			appendStringInfo(buf, "::%s",
-							 format_type_with_typemod(constval->consttype,
-													  constval->consttypmod));
+							 redact_format_type(constval->consttype,
+												constval->consttypmod, context->redact));
 			get_const_collation(constval, context);
 		}
 		return;
@@ -11646,8 +12279,8 @@ get_const_expr(Const *constval, deparse_context *context, int showtype)
 	}
 	if (needlabel || showtype > 0)
 		appendStringInfo(buf, "::%s",
-						 format_type_with_typemod(constval->consttype,
-												  constval->consttypmod));
+						 redact_format_type(constval->consttype,
+											constval->consttypmod, context->redact));
 
 	get_const_collation(constval, context);
 }
@@ -11667,7 +12300,7 @@ get_const_collation(Const *constval, deparse_context *context)
 		if (constval->constcollid != typcollation)
 		{
 			appendStringInfo(buf, " COLLATE %s",
-							 generate_collation_name(constval->constcollid));
+							 redact_collation_name(constval->constcollid, context->redact));
 		}
 	}
 }
@@ -11714,14 +12347,14 @@ get_json_format(JsonFormat *format, StringInfo buf)
  */
 static void
 get_json_returning(JsonReturning *returning, StringInfo buf,
-				   bool json_format_by_default)
+				   bool json_format_by_default, struct RedactCtx *redact)
 {
 	if (!OidIsValid(returning->typid))
 		return;
 
 	appendStringInfo(buf, " RETURNING %s",
-					 format_type_with_typemod(returning->typid,
-											  returning->typmod));
+					 redact_format_type(returning->typid,
+										returning->typmod, redact));
 
 	if (!json_format_by_default ||
 		returning->format->format_type !=
@@ -11760,10 +12393,11 @@ get_json_constructor(JsonConstructorExpr *ctor, deparse_context *context,
 
 		get_query_def(query, buf, context->namespaces, NULL, false,
 					  context->prettyFlags, context->wrapColumn,
-					  context->indentLevel);
+					  context->indentLevel,
+					  context->redact);
 
 		get_json_format(ctor->format, buf);
-		get_json_constructor_options(ctor, buf);
+		get_json_constructor_options(ctor, buf, context->redact);
 		appendStringInfoChar(buf, ')');
 
 		return;
@@ -11807,7 +12441,7 @@ get_json_constructor(JsonConstructorExpr *ctor, deparse_context *context,
 		get_rule_expr((Node *) lfirst(lc), context, true);
 	}
 
-	get_json_constructor_options(ctor, buf);
+	get_json_constructor_options(ctor, buf, context->redact);
 	appendStringInfoChar(buf, ')');
 }
 
@@ -11815,7 +12449,8 @@ get_json_constructor(JsonConstructorExpr *ctor, deparse_context *context,
  * Append options, if any, to the JSON constructor being deparsed
  */
 static void
-get_json_constructor_options(JsonConstructorExpr *ctor, StringInfo buf)
+get_json_constructor_options(JsonConstructorExpr *ctor, StringInfo buf,
+							 struct RedactCtx *redact)
 {
 	if (ctor->absent_on_null)
 	{
@@ -11838,7 +12473,7 @@ get_json_constructor_options(JsonConstructorExpr *ctor, StringInfo buf)
 	 * support one.
 	 */
 	if (ctor->type != JSCTOR_JSON_PARSE && ctor->type != JSCTOR_JSON_SCALAR)
-		get_json_returning(ctor->returning, buf, true);
+		get_json_returning(ctor->returning, buf, true, redact);
 }
 
 /*
@@ -11851,7 +12486,7 @@ get_json_agg_constructor(JsonConstructorExpr *ctor, deparse_context *context,
 	StringInfoData options;
 
 	initStringInfo(&options);
-	get_json_constructor_options(ctor, &options);
+	get_json_constructor_options(ctor, &options, context->redact);
 
 	if (IsA(ctor->func, Aggref))
 		get_agg_expr_helper((Aggref *) ctor->func, context,
@@ -11954,7 +12589,7 @@ get_sublink_expr(SubLink *sublink, deparse_context *context)
 			get_rule_expr(linitial(opexpr->args), context, true);
 			opname = generate_operator_name(opexpr->opno,
 											exprType(linitial(opexpr->args)),
-											exprType(lsecond(opexpr->args)));
+											exprType(lsecond(opexpr->args)), context->redact);
 		}
 		else if (IsA(sublink->testexpr, BoolExpr))
 		{
@@ -11973,7 +12608,7 @@ get_sublink_expr(SubLink *sublink, deparse_context *context)
 				if (!opname)
 					opname = generate_operator_name(opexpr->opno,
 													exprType(linitial(opexpr->args)),
-													exprType(lsecond(opexpr->args)));
+													exprType(lsecond(opexpr->args)), context->redact);
 				sep = ", ";
 			}
 			appendStringInfoChar(buf, ')');
@@ -11987,7 +12622,7 @@ get_sublink_expr(SubLink *sublink, deparse_context *context)
 			get_rule_expr((Node *) rcexpr->largs, context, true);
 			opname = generate_operator_name(linitial_oid(rcexpr->opnos),
 											exprType(linitial(rcexpr->largs)),
-											exprType(linitial(rcexpr->rargs)));
+											exprType(linitial(rcexpr->rargs)), context->redact);
 			appendStringInfoChar(buf, ')');
 		}
 		else
@@ -12036,7 +12671,8 @@ get_sublink_expr(SubLink *sublink, deparse_context *context)
 
 	get_query_def(query, buf, context->namespaces, NULL, false,
 				  context->prettyFlags, context->wrapColumn,
-				  context->indentLevel);
+				  context->indentLevel,
+				  context->redact);
 
 	if (need_paren)
 		appendStringInfoString(buf, "))");
@@ -12121,7 +12757,7 @@ get_xmltable(TableFunc *tf, deparse_context *context, bool showimplicit)
 
 			appendStringInfo(buf, "%s %s", quote_identifier(colname),
 							 ordinality ? "FOR ORDINALITY" :
-							 format_type_with_typemod(typid, typmod));
+							 redact_format_type(typid, typmod, context->redact));
 			if (ordinality)
 				continue;
 
@@ -12318,7 +12954,7 @@ get_json_table_columns(TableFunc *tf, JsonTablePathScan *scan,
 
 		appendStringInfo(buf, "%s %s", quote_identifier(colname),
 						 ordinality ? "FOR ORDINALITY" :
-						 format_type_with_typemod(typid, typmod));
+						 redact_format_type(typid, typmod, context->redact));
 		if (ordinality)
 			continue;
 
@@ -12454,6 +13090,42 @@ get_json_table(TableFunc *tf, deparse_context *context, bool showimplicit)
 static void
 get_tablefunc(TableFunc *tf, deparse_context *context, bool showimplicit)
 {
+	/*
+	 * XMLTABLE and JSON_TABLE are collapsed under redaction (FR-95, FR-96).
+	 * They carry more user-chosen names than any other expression: the column
+	 * names of the table they produce, XMLNAMESPACES prefixes, the label on
+	 * the root path and on every NESTED PATH, those same labels repeated in a
+	 * PLAN clause, and PASSING argument labels.  Pseudonymizing all of them,
+	 * and keeping every appearance of a label agreeing with the others and
+	 * every COLUMNS entry agreeing with the column names printed elsewhere in
+	 * the plan, is machinery this corner case does not justify.  As at
+	 * T_XmlExpr in get_rule_expr(), "skipped" here means omitted from the
+	 * output; it never means left printing raw.
+	 *
+	 * The guard belongs to this function rather than to its call sites so
+	 * that a new call site is covered by default.  Both of today's callers
+	 * need it: get_rule_expr()'s T_TableFunc case, and get_from_clause_item()
+	 * deparsing a table function in the FROM clause of a whole query.  The
+	 * latter is not reachable from EXPLAIN yet -- redacted query text is
+	 * deferred -- which is exactly why the guard should not be sitting in the
+	 * other caller.
+	 *
+	 * Which of the two constructs it was costs nothing to say and is worth
+	 * saying, and both spell as a self-contained NAME(...), so here the
+	 * placeholder does follow the construct -- unlike the T_XmlExpr case,
+	 * where one op has no keyword of its own to follow.  The if/else-if
+	 * mirrors the live code below deliberately: an unrecognized functype
+	 * prints nothing there and prints nothing here.
+	 */
+	if (context->redact != NULL)
+	{
+		if (tf->functype == TFT_XMLTABLE)
+			appendStringInfoString(context->buf, "XMLTABLE(...)");
+		else if (tf->functype == TFT_JSON_TABLE)
+			appendStringInfoString(context->buf, "JSON_TABLE(...)");
+		return;
+	}
+
 	/* XMLTABLE and JSON_TABLE are the only existing implementations.  */
 
 	if (tf->functype == TFT_XMLTABLE)
@@ -12588,7 +13260,7 @@ get_from_clause_item(Node *jtnode, Query *query, deparse_context *context)
 				appendStringInfo(buf, "%s%s",
 								 only_marker(rte),
 								 generate_relation_name(rte->relid,
-														context->namespaces));
+														context->namespaces, context->redact));
 				break;
 			case RTE_SUBQUERY:
 				/* Subquery RTE */
@@ -12596,7 +13268,8 @@ get_from_clause_item(Node *jtnode, Query *query, deparse_context *context)
 				get_query_def(rte->subquery, buf, context->namespaces, NULL,
 							  true,
 							  context->prettyFlags, context->wrapColumn,
-							  context->indentLevel);
+							  context->indentLevel,
+							  context->redact);
 				appendStringInfoChar(buf, ')');
 				break;
 			case RTE_FUNCTION:
@@ -13041,11 +13714,11 @@ get_from_clause_coldeflist(RangeTblFunction *rtfunc,
 			appendStringInfoString(buf, ", ");
 		appendStringInfo(buf, "%s %s",
 						 quote_identifier(attname),
-						 format_type_with_typemod(atttypid, atttypmod));
+						 redact_format_type(atttypid, atttypmod, context->redact));
 		if (OidIsValid(attcollation) &&
 			attcollation != get_typcollation(atttypid))
 			appendStringInfo(buf, " COLLATE %s",
-							 generate_collation_name(attcollation));
+							 redact_collation_name(attcollation, context->redact));
 
 		i++;
 	}
@@ -13072,7 +13745,7 @@ get_tablesample_def(TableSampleClause *tablesample, deparse_context *context)
 	appendStringInfo(buf, " TABLESAMPLE %s (",
 					 generate_function_name(tablesample->tsmhandler, 1,
 											NIL, argtypes,
-											false, NULL, false));
+											false, NULL, false, context->redact));
 
 	nargs = 0;
 	foreach(l, tablesample->args)
@@ -13393,7 +14066,7 @@ get_relation_name(Oid relid)
  * visible in the namespace list.
  */
 static char *
-generate_relation_name(Oid relid, List *namespaces)
+generate_relation_name(Oid relid, List *namespaces, struct RedactCtx *redact)
 {
 	HeapTuple	tp;
 	Form_pg_class reltup;
@@ -13402,6 +14075,20 @@ generate_relation_name(Oid relid, List *namespaces)
 	char	   *relname;
 	char	   *nspname;
 	char	   *result;
+
+	/*
+	 * A relation the user owns is replaced by its pseudonym, and returning
+	 * here skips the schema qualification below -- deliberately, since FR-11
+	 * drops schema names and there is nothing to qualify a generated name
+	 * against.
+	 *
+	 * An exempt relation, one in pg_catalog or information_schema, falls
+	 * through to the original path untouched and keeps its qualification
+	 * rules.  That is about readability rather than safety: a plan that scans
+	 * pg_class should say so.
+	 */
+	if (redact != NULL && !explain_redact_exempt(redact, REDACT_RELATION, relid))
+		return pstrdup(explain_redact_name(redact, REDACT_RELATION, relid));
 
 	tp = SearchSysCache1(RELOID, ObjectIdGetDatum(relid));
 	if (!HeapTupleIsValid(tp))
@@ -13491,7 +14178,7 @@ generate_qualified_relation_name(Oid relid)
 static char *
 generate_function_name(Oid funcid, int nargs, List *argnames, Oid *argtypes,
 					   bool has_variadic, bool *use_variadic_p,
-					   bool inGroupBy)
+					   bool inGroupBy, struct RedactCtx *redact)
 {
 	char	   *result;
 	HeapTuple	proctup;
@@ -13577,7 +14264,21 @@ generate_function_name(Oid funcid, int nargs, List *argnames, Oid *argtypes,
 	else
 		nspname = get_namespace_name_or_temp(procform->pronamespace);
 
-	result = quote_qualified_identifier(nspname, proname);
+	/*
+	 * A user-defined function becomes its pseudonym; a built-in keeps its
+	 * name. Keeping built-ins is what leaves a redacted plan readable -- a
+	 * Filter reading "(t1_c1 = ?::text)" can be diagnosed, one reading
+	 * "f7(t1_c1, ?::text)" where f7 is lower() cannot.
+	 *
+	 * Substituted here rather than on entry so use_variadic_p is still
+	 * answered from the catalog: the caller needs it to decide whether to
+	 * print VARIADIC, which describes the call rather than the name.
+	 */
+	if (redact != NULL &&
+		!explain_redact_exempt(redact, REDACT_FUNCTION, funcid))
+		result = pstrdup(explain_redact_name(redact, REDACT_FUNCTION, funcid));
+	else
+		result = quote_qualified_identifier(nspname, proname);
 
 	ReleaseSysCache(proctup);
 
@@ -13596,7 +14297,8 @@ generate_function_name(Oid funcid, int nargs, List *argnames, Oid *argtypes,
  * in an expression.
  */
 static char *
-generate_operator_name(Oid operid, Oid arg1, Oid arg2)
+generate_operator_name(Oid operid, Oid arg1, Oid arg2,
+					   struct RedactCtx *redact)
 {
 	StringInfoData buf;
 	HeapTuple	opertup;
@@ -13604,6 +14306,20 @@ generate_operator_name(Oid operid, Oid arg1, Oid arg2)
 	char	   *oprname;
 	char	   *nspname;
 	Operator	p_result;
+
+	/*
+	 * A user-defined operator becomes its pseudonym, with no
+	 * OPERATOR(schema.op) wrapper: the wrapper exists so the name re-parses
+	 * to the same operator, which a generated name cannot do and redacted
+	 * output does not promise.
+	 *
+	 * Built-in operators keep their names, and that is not a concession.  An
+	 * expression whose "=" had become "op1" would tell a reader nothing about
+	 * what the plan was doing, and the catalog operators are exactly the ones
+	 * a reader could look up anyway.
+	 */
+	if (redact != NULL && !explain_redact_exempt(redact, REDACT_OPERATOR, operid))
+		return pstrdup(explain_redact_name(redact, REDACT_OPERATOR, operid));
 
 	initStringInfo(&buf);
 
