@@ -77,8 +77,8 @@ sub query_log
 # Returns only the auto_explain plan records from a log chunk.
 #
 # As in 002_redact.pl: the cluster logs every statement in full (Cluster.pm sets
-# log_statement = all and a log_line_prefix containing %q), so an assertion about
-# what redaction did has to be scoped to the record redaction produced.  Dies
+# log_statement = all), so an assertion about what redaction did has to be
+# scoped to the record redaction produced.  Dies
 # rather than returning empty, because an empty return would turn every
 # assertion built on it into a tautology -- which is the specific failure this
 # file is most exposed to.

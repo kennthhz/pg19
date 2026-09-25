@@ -55,10 +55,11 @@
 # is not an optimisation.  Three other things put user names into the same file
 # and would make the scan report leaks that redaction never caused:
 #
-#   - PostgreSQL::Test::Cluster sets log_statement = all and a log_line_prefix
-#     containing %q, so every statement would appear verbatim.  This test
-#     overrides both, and asserts the overrides took effect, because if they
-#     silently did not the scan would drown in false positives.
+#   - PostgreSQL::Test::Cluster sets log_statement = all, so every statement
+#     would appear verbatim.  This test overrides it, and asserts the override
+#     took effect, because if it silently did not the scan would drown in false
+#     positives.  (The harness's log_line_prefix is replaced too, but only for
+#     tidiness: the %q in it prints nothing.)
 #   - The regression suite provokes errors on purpose, and an error message names
 #     the object it is about ("relation ... does not exist"), followed by a
 #     STATEMENT: line carrying the whole query.  Redaction does not govern error

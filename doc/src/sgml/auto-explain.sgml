@@ -371,13 +371,16 @@ LOAD 'auto_explain';
        <xref linkend="guc-log-min-duration-statement"/> or
        <xref linkend="guc-log-min-error-statement"/> are written in full,
        including the text that was removed from the plan.
-       <xref linkend="guc-log-line-prefix"/> is expanded as usual, so
-       <literal>%Q</literal>, for example, still shows the query identifier
-       that is left out of the plan.  The fields that the
-       <literal>csvlog</literal> and <literal>jsonlog</literal> formats attach
-       to every record, such as the user name, database name,
-       <varname>application_name</varname>, client address and query
-       identifier, are written unchanged, on the redacted records too.  If
+       <xref linkend="guc-log-line-prefix"/> is expanded as usual, and the
+       fields that the <literal>csvlog</literal> and <literal>jsonlog</literal>
+       formats attach to every record, such as the user name, database name,
+       <varname>application_name</varname> and client address, are written
+       unchanged, on the redacted records too.  The exception is the query
+       identifier, which is left out of the plan: on the line that carries a
+       redacted plan, <literal>%Q</literal> and the query identifier field of
+       <literal>csvlog</literal> and <literal>jsonlog</literal> show
+       <literal>0</literal>.  Every other line shows it as usual, including
+       other messages written while the same statement runs.  If
        <xref linkend="guc-log-min-messages"/> is <literal>debug1</literal> or
        lower, the log also receives the text of every statement whose plan
        was redacted (see <xref linkend="auto-explain-redaction"/>).  Review
@@ -638,7 +641,8 @@ LOG:  duration: 0.210 ms  ref: 3674e079c7cb48e4  plan:
    As described under <varname>auto_explain.log_redact</varname>, redaction
    applies only to the plan records themselves; other log output, including
    the fields that <literal>csvlog</literal> and <literal>jsonlog</literal>
-   add to each record, is written as usual.  When a redacted plan is logged,
+   add to each record, is written as usual, except that the line carrying a
+   redacted plan shows no query identifier.  When a redacted plan is logged,
    <filename>auto_explain</filename> writes a message to the log once per
    session if it finds <varname>log_statement</varname> or
    <varname>log_min_duration_statement</varname> enabled, or

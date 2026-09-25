@@ -178,10 +178,11 @@ sub without_query_text
 # Returns only the auto_explain plan records from a log chunk.
 #
 # Needed because this cluster -- like every cluster PostgreSQL::Test::Cluster
-# creates -- runs with "log_statement = all" and a log_line_prefix containing
-# "%q" (Cluster.pm:713-714).  Both put the verbatim statement into the same log
-# file, so a chunk always contains the marked names whatever auto_explain did
-# with them.  "No marker appears in this log" is therefore not a provable
+# creates -- runs with "log_statement = all" (Cluster.pm:714), which puts the
+# verbatim statement into the same log file, so a chunk always contains the
+# marked names whatever auto_explain did with them.  (Its log_line_prefix also
+# contains %q, which an earlier version of this comment blamed as well; %q
+# prints nothing, so it plays no part.)  "No marker appears in this log" is therefore not a provable
 # assertion, and a claim about redaction has to be scoped to the record
 # redaction is responsible for.
 #

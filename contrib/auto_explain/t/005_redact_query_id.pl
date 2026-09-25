@@ -1,0 +1,355 @@
+
+# Copyright (c) 2026, PostgreSQL Global Development Group
+
+# FR-37 on the redacted record's own log line.
+#
+# FR-37 leaves Query Identifier out of a redacted plan: the identifier is a
+# publicly specified hash of the parse tree, so anyone holding a guessed
+# statement can compute it and confirm that the guess ran.  Omitting the plan
+# property is not the whole of it.  %Q in log_line_prefix and the query_id field
+# of csvlog and jsonlog read the backend's current query identifier at the moment
+# a line is written, and with compute_query_id on that is the value the plan
+# withholds.  auto_explain therefore clears it for the one ereport that writes a
+# redacted record, and puts it back afterwards.
+#
+# A file of its own rather than more of 002_redact.pl, because jsonlog needs
+# logging_collector, and once the collector runs the server log no longer goes to
+# the file PostgreSQL::Test::Cluster->logfile names -- the file every helper in
+# 002 reads.  Here the log is read from the collector's files, as listed in
+# current_logfiles, and each read waits for the collector to catch up.
+#
+# Every assertion that an identifier is absent is paired with one showing that
+# the same identifier is present where redaction does not apply.  Without that,
+# compute_query_id quietly not taking effect would make each of them pass.
+
+use strict;
+use warnings FATAL => 'all';
+
+use JSON::PP;
+use PostgreSQL::Test::Cluster;
+use PostgreSQL::Test::Utils;
+use Test::More;
+use Time::HiRes qw(usleep);
+
+# The collector's current files, by destination.  current_logfiles is written by
+# the collector once it is running, so it may not exist yet right after start.
+sub log_files
+{
+	my ($node) = @_;
+	my $path = $node->data_dir . '/current_logfiles';
+
+	foreach (1 .. 10 * $PostgreSQL::Test::Utils::timeout_default)
+	{
+		if (-f $path)
+		{
+			my %files;
+			foreach my $line (split /\n/, slurp_file($path))
+			{
+				$files{$1} = $node->data_dir . "/$2"
+				  if $line =~ /^(\S+) (.*)$/;
+			}
+			return \%files if $files{stderr} && $files{jsonlog};
+		}
+		usleep(100_000);
+	}
+	die "current_logfiles never listed both a stderr and a jsonlog file";
+}
+
+my $end_seq = 0;
+
+# Runs $sql in one session and returns the psql output together with the part of
+# each log that the session wrote.
+#
+# The collector writes asynchronously, so returning from psql does not mean the
+# log is complete.  The session therefore ends with a marker statement, and each
+# log is read until log_statement's line for the marker has arrived.  One
+# backend's messages reach the collector in order, so everything the session
+# logged before the marker is then present.  The chunk is cut after the marker's
+# line, which also guarantees that no partially written entry is parsed.
+#
+# $params: GUC name => value, passed through PGOPTIONS as in 002_redact.pl.
+sub run_logged
+{
+	my ($node, $sql, $params) = @_;
+	$params ||= {};
+
+	my $files = log_files($node);
+	my %offset = map { $_ => (-s $files->{$_}) || 0 } qw(stderr jsonlog);
+	my $end = 'zq-end-' . ++$end_seq;
+
+	local $ENV{PGOPTIONS} = join ' ',
+	  map { "-c $_=$params->{$_}" } sort keys %$params;
+	my $out = $node->safe_psql('postgres', "$sql\nSELECT '$end';");
+
+	foreach (1 .. 10 * $PostgreSQL::Test::Utils::timeout_default)
+	{
+		my %chunk = (out => $out);
+		my $complete = 1;
+		foreach my $dest (qw(stderr jsonlog))
+		{
+			my $text = slurp_file($files->{$dest}, $offset{$dest});
+			if ($text =~ /\A(.*?statement: SELECT '\Q$end\E';[^\n]*\n)/s)
+			{
+				$chunk{$dest} = $1;
+			}
+			else
+			{
+				$complete = 0;
+			}
+		}
+		return \%chunk if $complete;
+		usleep(100_000);
+	}
+	die "the logs never showed the end marker $end";
+}
+
+# The jsonlog entries in a chunk.
+sub json_entries
+{
+	my ($chunk) = @_;
+	return map { decode_json($_) } grep { /^\{/ } split /\n/, $chunk;
+}
+
+# Redacted records in a jsonlog chunk: token => query_id.
+sub json_redacted_records
+{
+	my ($chunk) = @_;
+	my %rec;
+	foreach my $e (json_entries($chunk))
+	{
+		$rec{$1} = "$e->{query_id}"
+		  if $e->{message} =~
+		  /^duration: [\d.]+ ms  ref: ([0-9a-f]{16})  plan:/;
+	}
+	return %rec;
+}
+
+# Redacted records in a stderr chunk: token => the value %Q printed.
+sub stderr_redacted_records
+{
+	my ($chunk) = @_;
+	my %rec;
+	$rec{$2} = $1
+	  while $chunk =~
+	  /^[^\n]* qid=(-?\d+) [^\n]*LOG:  duration: [\d.]+ ms  ref: ([0-9a-f]{16})  plan:$/mg;
+	return %rec;
+}
+
+# The one plan line the whole file is keyed on.
+my $probe = 'SELECT b FROM zq_t WHERE a = 3;';
+
+# compute_query_id = on    the leak exists only when an identifier is computed
+# logging_collector, jsonlog  jsonlog's query_id field is one of the two carriers
+# log_line_prefix with %Q  the other carrier.  %q is kept in it, as the test
+#                          harness has it, because FR-75 used to warn about %q
+#                          and the removal of that warning is tested below.
+# log_rotation_*  = 0      a rotation mid-test would move the log from under an
+#                          offset taken on the previous file
+my $node = PostgreSQL::Test::Cluster->new('redact_query_id');
+$node->init;
+$node->append_conf(
+	'postgresql.conf', q{
+session_preload_libraries = 'auto_explain'
+auto_explain.log_min_duration = 0
+compute_query_id = on
+logging_collector = on
+log_destination = 'stderr, jsonlog'
+log_rotation_age = 0
+log_rotation_size = 0
+lc_messages = 'C'
+log_line_prefix = '%m [%p] qid=%Q %q%a '
+});
+$node->start;
+
+# run_logged() finds the end of a session's output through log_statement.
+is($node->safe_psql('postgres', 'SHOW log_statement'),
+	'all', 'log_statement = all, which run_logged() relies on');
+
+$node->safe_psql(
+	'postgres', q{
+CREATE TABLE zq_t (a int, b text);
+INSERT INTO zq_t SELECT g, 'x' || g FROM generate_series(1, 10) g;
+
+-- Reads this backend's query_id before and after running nested statements.
+-- pg_stat_activity is read through a per-transaction snapshot, hence the
+-- pg_stat_clear_snapshot() between the two reads; without it the second read
+-- would return the first one's cached value whatever the backend now holds.
+CREATE FUNCTION zq_nested_then_qid(OUT before_qid bigint, OUT after_qid bigint)
+LANGUAGE plpgsql AS $$
+BEGIN
+  SELECT query_id INTO before_qid FROM pg_stat_activity
+    WHERE pid = pg_backend_pid();
+  PERFORM pg_stat_clear_snapshot();
+  PERFORM count(*) FROM zq_t WHERE a > 0;
+  SELECT query_id INTO after_qid FROM pg_stat_activity
+    WHERE pid = pg_backend_pid();
+END $$;
+});
+
+# The identifiers the statements under test really have, from EXPLAIN VERBOSE.
+# Interactive EXPLAIN is not affected by auto_explain.log_redact.
+sub explain_query_id
+{
+	my ($sql) = @_;
+	my $plan =
+	  $node->safe_psql('postgres', "EXPLAIN (VERBOSE, COSTS OFF) $sql");
+	$plan =~ /^Query Identifier: (-?\d+)$/m
+	  or die "EXPLAIN VERBOSE printed no Query Identifier for $sql";
+	return $1;
+}
+my $probe_qid = explain_query_id($probe);
+my $outer_sql = 'SELECT before_qid, after_qid FROM zq_nested_then_qid();';
+my $outer_qid = explain_query_id($outer_sql);
+isnt($probe_qid, '0', 'the probe statement has a query identifier');
+
+# ---------------------------------------------------------------------------
+# Redaction off.  These are the anti-vacuity halves: the same configuration, the
+# same statement, and the identifier is on the record's line in both carriers.
+# They also show that off-mode does not clear it (FR-62).
+# ---------------------------------------------------------------------------
+my $chunk = run_logged($node, $probe, { 'auto_explain.log_verbose' => 'on' });
+
+my ($off_prefix_qid) = $chunk->{stderr} =~
+  /^[^\n]* qid=(-?\d+) [^\n]*LOG:  duration: [\d.]+ ms  plan:\n\tQuery Text: \Q$probe\E\n/m;
+is($off_prefix_qid, $probe_qid,
+	'unredacted: %Q prints the query identifier on the record line');
+
+my @off_json =
+  grep {
+	$_->{message} =~ /^duration: [\d.]+ ms  plan:\nQuery Text: \Q$probe\E\n/
+  } json_entries($chunk->{jsonlog});
+is(scalar(@off_json), 1, 'unredacted: one jsonlog record for the probe');
+is("$off_json[0]{query_id}", $probe_qid,
+	'unredacted: the jsonlog record carries the query identifier');
+
+# ---------------------------------------------------------------------------
+# Redaction on.
+# ---------------------------------------------------------------------------
+$node->append_conf('postgresql.conf', 'auto_explain.log_redact = on');
+$node->reload;
+$node->poll_query_until('postgres', 'SHOW auto_explain.log_redact', 'on')
+  or die 'auto_explain.log_redact did not become on after reload';
+
+# DEBUG1 turns on the companion entry, which is what ties a redacted record to
+# the probe: it pairs the record's token with the statement.  It also supplies
+# an anti-vacuity half inside the very same session -- the companion is written
+# by the same backend, for the same statement, immediately before the record,
+# and it keeps its identifier.
+$chunk = run_logged(
+	$node, $probe,
+	{
+		'auto_explain.log_verbose' => 'on',
+		'log_min_messages' => 'debug1'
+	});
+
+my ($token, $companion_json_qid);
+foreach my $e (json_entries($chunk->{jsonlog}))
+{
+	if ($e->{message} =~ /^auto_explain ref ([0-9a-f]{16}): \Q$probe\E$/)
+	{
+		$token = $1;
+		$companion_json_qid = "$e->{query_id}";
+	}
+}
+ok(defined $token, 'redacted: the companion entry names the probe');
+
+my %json_rec = json_redacted_records($chunk->{jsonlog});
+is($json_rec{$token}, '0',
+	'redacted: the record\'s jsonlog entry carries no query identifier');
+is($companion_json_qid, $probe_qid,
+	'redacted: the companion entry in the same session still carries it');
+is_deeply([ grep { $_ ne '0' } values %json_rec ],
+	[], 'redacted: no redacted jsonlog record carries a nonzero query_id');
+
+my %stderr_rec = stderr_redacted_records($chunk->{stderr});
+is($stderr_rec{$token}, '0',
+	'redacted: %Q prints no query identifier on the record line');
+my ($companion_prefix_qid) =
+  $chunk->{stderr} =~
+  /^[^\n]* qid=(-?\d+) [^\n]*DEBUG:  auto_explain ref \Q$token\E: /m;
+is($companion_prefix_qid, $probe_qid,
+	'redacted: %Q still prints it on the companion line of the same session');
+
+# ---------------------------------------------------------------------------
+# Restore.  Under log_nested_statements a nested record is written while the
+# outer statement is still running, and the identifier cleared for it is the
+# outer statement's.  The function reads its own backend's query_id before and
+# after its nested statements; both reads must return the outer statement's.
+#
+# before_qid alone would not show much: it is read before any nested record is
+# written.  after_qid is the one that fails without a correct restore, and not
+# as zero: a clear left in place is overwritten by the next nested statement's
+# ExecutorStart, since a zero identifier reads as "no top-level statement yet".
+# So after_qid is compared against the outer statement's own identifier, not
+# merely against zero.
+# ---------------------------------------------------------------------------
+$chunk = run_logged($node, $outer_sql,
+	{ 'auto_explain.log_nested_statements' => 'on' });
+
+my ($before, $after) = $chunk->{out} =~ /^(-?\d+)\|(-?\d+)$/m;
+is($before, $outer_qid,
+	'restore: the function sees the outer statement\'s query identifier');
+is($after, $outer_qid,
+	'restore: after redacted nested records, the outer identifier is back');
+
+# Anti-vacuity: nested records really were written, redacted, with the
+# identifier cleared on their lines.  The records that must exist are the outer
+# statement's, the second SELECT INTO's, and at least one written before the
+# second read -- otherwise nothing was cleared that a restore could have got
+# wrong.  Hence at least three.  (This tree logs five: each of the four
+# statements in the body, the PERFORM of pg_stat_clear_snapshot() included, and
+# the outer one.  The bound is the logical minimum rather than that count, so
+# that a change in how PL/pgSQL runs simple expressions does not break it.)
+%stderr_rec = stderr_redacted_records($chunk->{stderr});
+cmp_ok(scalar(keys %stderr_rec), '>=', 3,
+	'restore: the nested and outer statements were logged as redacted records'
+);
+is_deeply([ grep { $_ ne '0' } values %stderr_rec ],
+	[], 'restore: every one of them was written with %Q cleared');
+
+# ---------------------------------------------------------------------------
+# track_activities = off.  pgstat_report_query_id() then does nothing and the
+# backend entry holds no identifier at all, so the save and restore are both
+# no-ops.  The statement must still succeed and log its record.
+# ---------------------------------------------------------------------------
+$chunk = run_logged($node, $probe, { 'track_activities' => 'off' });
+%stderr_rec = stderr_redacted_records($chunk->{stderr});
+%json_rec = json_redacted_records($chunk->{jsonlog});
+cmp_ok(scalar(keys %stderr_rec),
+	'>=', 1, 'track_activities off: the redacted record is still written');
+is_deeply([ grep { $_ ne '0' } (values %stderr_rec, values %json_rec) ],
+	[], 'track_activities off: no identifier on the record line either');
+
+# ---------------------------------------------------------------------------
+# FR-75 no longer warns about %q.  %q prints nothing, so a warning that it
+# "carries the current statement" was false.  Asserted against a session where
+# the envelope check demonstrably ran and reported the other three settings, so
+# the absence is of this one warning and not of the check.
+# ---------------------------------------------------------------------------
+like($node->safe_psql('postgres', 'SHOW log_line_prefix'),
+	qr/%q/, 'log_line_prefix contains %q');
+
+$chunk = run_logged(
+	$node, $probe,
+	{
+		'log_min_duration_statement' => '0',
+		'log_min_messages' => 'debug1'
+	});
+like(
+	$chunk->{stderr},
+	qr/log_redact is enabled, but log_statement is also active/,
+	'FR-75: log_statement is still reported');
+like(
+	$chunk->{stderr},
+	qr/log_redact is enabled, but log_min_duration_statement is also active/,
+	'FR-75: log_min_duration_statement is still reported');
+like(
+	$chunk->{stderr},
+	qr/log_redact is enabled, but a log level of debug1 or lower is also active/,
+	'FR-75: companion entries being logged are still reported');
+unlike(
+	$chunk->{stderr},
+	qr/log_redact is enabled, but a log_line_prefix|carries the current statement/,
+	'FR-75: a log_line_prefix containing %q is not reported');
+
+done_testing();

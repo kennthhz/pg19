@@ -32,6 +32,7 @@ tests += {
       't/002_redact.pl',
       't/003_redact_scan.pl',
       't/004_redact_allow_schemas.pl',
+      't/005_redact_query_id.pl',
     ],
   },
 }

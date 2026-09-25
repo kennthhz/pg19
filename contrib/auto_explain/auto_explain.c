@@ -25,6 +25,7 @@
 #include "nodes/value.h"
 #include "parser/scansup.h"
 #include "tcop/tcopprot.h"
+#include "utils/backend_status.h"
 #include "utils/guc.h"
 #include "utils/varlena.h"
 
@@ -596,7 +597,6 @@ check_logging_envelope(void)
 {
 	static bool warned_log_statement = false;
 	static bool warned_log_min_duration = false;
-	static bool warned_log_line_prefix = false;
 	static bool warned_reference_entries = false;
 
 	if (log_statement != LOGSTMT_NONE && !warned_log_statement)
@@ -633,16 +633,13 @@ check_logging_envelope(void)
 	}
 
 	/*
-	 * %q is the marker for the process-title portion of log_line_prefix,
-	 * which carries the current statement.
+	 * log_line_prefix is not checked.  An earlier version warned about %q on
+	 * the premise that it prints the current statement, but %q prints
+	 * nothing: it only marks where the prefix stops for non-session
+	 * processes.  The escape that does carry something withheld from the plan
+	 * is %Q, the query identifier, and for the record itself that is handled
+	 * where the record is written rather than warned about.
 	 */
-	if (Log_line_prefix != NULL && strstr(Log_line_prefix, "%q") != NULL &&
-		!warned_log_line_prefix)
-	{
-		warned_log_line_prefix = true;
-		warn_redaction_conflict("a log_line_prefix containing %q",
-								"The prefix carries the current statement, including the text redacted from the plan.");
-	}
 }
 
 /*
@@ -767,13 +764,46 @@ explain_ExecutorEnd(QueryDesc *queryDesc)
 			if (es->redact)
 			{
 				char	   *token = make_reference_token();
+				int64		saved_query_id;
 
 				emit_reference_entry(token, queryDesc->sourceText);
 
-				ereport(auto_explain_log_level,
-						(errmsg("duration: %.3f ms  ref: %s  plan:\n%s",
-								msec, token, es->str->data),
-						 errhidestmt(true)));
+				/*
+				 * FR-37 for the line the record is written on.  Leaving Query
+				 * Identifier out of the plan is not enough on its own: %Q in
+				 * log_line_prefix and the query_id field of csvlog and
+				 * jsonlog read the backend's current query identifier when
+				 * the line is written, and would put the same value beside
+				 * the plan.  This module issues the ereport, so it can clear
+				 * the identifier for exactly that line.
+				 *
+				 * force = true is what makes the clear happen: without it a
+				 * nonzero identifier is taken to belong to an enclosing
+				 * top-level statement and is left alone.  The restore uses it
+				 * too, so that it overwrites anything reported while the
+				 * record was being written.  It must put back exactly what
+				 * was there: under log_nested_statements the saved value is
+				 * the outer statement's, still running, and pg_stat_activity
+				 * reports it.  PG_FINALLY so that an error raised while the
+				 * record is written does not leave it cleared.
+				 *
+				 * The companion entry above keeps its identifier.  It holds
+				 * the whole statement, from which the identifier follows.
+				 */
+				saved_query_id = pgstat_get_my_query_id();
+				PG_TRY();
+				{
+					pgstat_report_query_id(INT64CONST(0), true);
+					ereport(auto_explain_log_level,
+							(errmsg("duration: %.3f ms  ref: %s  plan:\n%s",
+									msec, token, es->str->data),
+							 errhidestmt(true)));
+				}
+				PG_FINALLY();
+				{
+					pgstat_report_query_id(saved_query_id, true);
+				}
+				PG_END_TRY();
 			}
 			else
 				ereport(auto_explain_log_level,
