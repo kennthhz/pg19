@@ -2178,6 +2178,21 @@ needs unwinding.
 
 #### T21c — Verification with expressions live
 
+*(rev. T21c deferral: **deferred by the user, not abandoned.** Nothing below has
+been discharged. Still owed: T20's sort-key guard with a user-defined collation
+**and** a user-defined ordering operator (item 4); FR-97 and FR-99 (item 5); the
+guard perturbation with output live (item 6); the §10.2 sweep re-run as a
+standing property rather than a one-off measurement (item 1); the §10.3 mode
+matrix (item 2); the §10.4 controls (item 3); and T21b's handovers, the 35 → 34
+denominator reconciled under a stated convention and the two missing plan dumps,
+`Sort Key … COLLATE coll`*N* and `Cache Key`. One finding from the aborted
+attempt (`design/.t21c-notes.md`) corrects item 4: `USING <` cannot be the exempt
+negative control, because `<` is text's `lt_opr` and `show_sortorder_options()`
+prints `USING` only for an operator that is neither `lt_opr` nor `gt_opr`, so
+`ORDER BY x USING <` prints no decoration in either mode and an assertion on it
+is vacuous. The reachable exempt control is `~<~` (text_pattern_ops, in
+`pg_catalog`), which T21b smoke-tested.)*
+
 **Goal.** Discharge everything the plan has been accumulating against T21. Adds
 tests only; changes no behavior. Splitting it out is not bookkeeping — it is the
 only sub-task whose scope is known in advance to exceed the other two combined,

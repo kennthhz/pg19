@@ -582,7 +582,7 @@ LOG:  duration: 3.651 ms  plan:
    providers, and the output of <command>EXPLAIN</command> options added by
    loadable modules.  If <varname>auto_explain.log_extension_options</varname>
    is set, its options are ignored, and a message saying so is written to the
-   log once per session.
+   log once per session, and again after the setting is changed.
   </para>
 
   <para>

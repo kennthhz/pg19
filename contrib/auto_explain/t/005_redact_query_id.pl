@@ -603,6 +603,100 @@ with_reloaded(
 		);
 	});
 
+# ---------------------------------------------------------------------------
+# FR-73's warning is written once per session, not once per record.  It states
+# a fact about the configuration, so repeating it on every record would say
+# nothing new and would fill the log the operator is trying to keep clean.
+#
+# The latch is re-armed by the parameter's assign hook, so a superuser who SETs
+# the option partway through a session is told again, once.  And it belongs to
+# the backend: a second session with the same setting is told as well.
+#
+# Every warning count is paired with the count of redacted records the session
+# wrote.  A session that logged no record would warn zero times; "exactly once"
+# means something only after several records.  Each session runs three
+# statements that are logged as redacted records.  (run_logged()'s end marker is
+# one too, but its record comes after the log_statement line the chunk is cut
+# at, so it is not counted, and neither is anything it might warn.)
+# ---------------------------------------------------------------------------
+my $extopt_msg =
+  'auto_explain.log_redact is enabled, but auto_explain.log_extension_options is also active';
+
+# The number of FR-73 warnings in a stderr text, and in a jsonlog text.
+sub extopt_stderr_warnings
+{
+	my ($text) = @_;
+	my @lines = $text =~ /^[^\n]*LOG:  \Q$extopt_msg\E$/mg;
+	return scalar(@lines);
+}
+
+sub extopt_json_warnings
+{
+	my ($text) = @_;
+	return scalar(grep { $_->{message} eq $extopt_msg } json_entries($text));
+}
+
+my %extopt_params = (
+	'session_preload_libraries' => 'pg_overexplain,auto_explain',
+	'auto_explain.log_extension_options' => 'range_table');
+
+with_reloaded(
+	{ 'auto_explain.log_redact' => 'on' },
+	sub {
+		# Two sessions, the same configuration: once in each.
+		foreach my $session (1, 2)
+		{
+			my $chunk =
+			  run_logged($node, join("\n", ($probe) x 3), \%extopt_params);
+			my %rec = stderr_redacted_records($chunk->{stderr});
+			my %jrec = json_redacted_records($chunk->{jsonlog});
+			is( scalar(keys %rec),
+				3,
+				"extension options latch, session $session: three redacted records (stderr)"
+			);
+			is( scalar(keys %jrec),
+				3,
+				"extension options latch, session $session: three redacted records (jsonlog)"
+			);
+			is(extopt_stderr_warnings($chunk->{stderr}), 1,
+				"extension options latch, session $session: warned exactly once (stderr)"
+			);
+			is(extopt_json_warnings($chunk->{jsonlog}), 1,
+				"extension options latch, session $session: warned exactly once (jsonlog)"
+			);
+		}
+
+		# A SET partway through re-arms it: twice in the session, once on
+		# each side of the SET.
+		my $set = "SET auto_explain.log_extension_options = 'debug';";
+		my $chunk = run_logged(
+			$node,
+			join("\n",
+				$probe, $probe, $set,
+				'SHOW auto_explain.log_extension_options;', $probe),
+			\%extopt_params);
+		like($chunk->{out}, qr/^debug$/m,
+			'extension options re-arm: the SET changed the option');
+		my %rec = stderr_redacted_records($chunk->{stderr});
+		my %jrec = json_redacted_records($chunk->{jsonlog});
+		is(scalar(keys %rec),
+			3, 'extension options re-arm: three redacted records (stderr)');
+		is(scalar(keys %jrec),
+			3, 'extension options re-arm: three redacted records (jsonlog)');
+		is(extopt_stderr_warnings($chunk->{stderr}),
+			2, 'extension options re-arm: warned exactly twice (stderr)');
+		is(extopt_json_warnings($chunk->{jsonlog}),
+			2, 'extension options re-arm: warned exactly twice (jsonlog)');
+
+		my ($before, $after) =
+		  split /^[^\n]*LOG:  statement: \Q$set\E\n/m, $chunk->{stderr}, 2;
+		ok(defined $after, 'extension options re-arm: the SET was logged');
+		is(extopt_stderr_warnings($before),
+			1, 'extension options re-arm: once before the SET');
+		is(extopt_stderr_warnings($after // ''),
+			1, 'extension options re-arm: once after the SET');
+	});
+
 
 # ---------------------------------------------------------------------------
 # FR-100: no CONTEXT on a redacted record or on auto_explain's warnings.

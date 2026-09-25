@@ -105,6 +105,12 @@ static auto_explain_allow_schemas * allow_schemas = NULL;
  */
 static bool warned_allow_public = false;
 
+/*
+ * Latch for the FR-73 warning, at file scope for the same reason: the assign
+ * hook for auto_explain.log_extension_options clears it.
+ */
+static bool warned_extension_options = false;
+
 static const struct config_enum_entry format_options[] = {
 	{"text", EXPLAIN_FORMAT_TEXT, false},
 	{"xml", EXPLAIN_FORMAT_XML, false},
@@ -767,9 +773,13 @@ explain_ExecutorEnd(QueryDesc *queryDesc)
 			if (es->redact)
 			{
 				if (extension_options != NULL &&
-					extension_options->noptions > 0)
+					extension_options->noptions > 0 &&
+					!warned_extension_options)
+				{
+					warned_extension_options = true;
 					warn_redaction_conflict("auto_explain.log_extension_options",
 											"The requested extension output is omitted, because output produced by an extension cannot be redacted.");
+				}
 			}
 			else
 				apply_extension_options(es, extension_options);
@@ -980,6 +990,15 @@ static void
 assign_log_extension_options(const char *newval, void *extra)
 {
 	extension_options = (auto_explain_extension_options *) extra;
+
+	/*
+	 * Re-arm the FR-73 warning.  The parameter is PGC_SUSET, so a superuser
+	 * can SET it partway through a session, and the new value is then
+	 * reported rather than covered by the warning about the old one.  This
+	 * runs whether or not redaction is on, but it only clears a flag and
+	 * writes nothing, so off mode is unchanged (FR-62).
+	 */
+	warned_extension_options = false;
 }
 
 /*
