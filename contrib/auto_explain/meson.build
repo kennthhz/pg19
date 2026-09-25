@@ -30,6 +30,8 @@ tests += {
     'tests': [
       't/001_auto_explain.pl',
       't/002_redact.pl',
+      't/003_redact_scan.pl',
+      't/004_redact_allow_schemas.pl',
     ],
   },
 }

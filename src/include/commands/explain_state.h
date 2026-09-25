@@ -78,6 +78,20 @@ typedef struct ExplainState
 	 * explain_redact.c, so nothing outside that file can dereference this.
 	 */
 	struct RedactCtx *redact_ctx;
+
+	/*
+	 * Schemas exempted from redaction in addition to pg_catalog and
+	 * information_schema (FR-51/D7).  A list of name strings, read once when
+	 * the map above is created, so it must be set before any output is
+	 * generated; NIL -- the palloc0 default -- means no additional exemption.
+	 *
+	 * Set by the caller rather than derived here, because the option that
+	 * populates it is auto_explain.redact_allow_schemas and core has no
+	 * equivalent: an interactive EXPLAIN (REDACT) leaves this NIL.  The
+	 * strings are borrowed, not copied -- explain_redact_create() copies them
+	 * into the map's own context -- so they need only outlive that call.
+	 */
+	List	   *redact_allow_schemas;
 	/* state for output formatting --- not reset for each new plan tree */
 	int			indent;			/* current indentation level */
 	List	   *grouping_stack; /* format-specific grouping state */

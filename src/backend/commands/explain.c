@@ -787,9 +787,13 @@ ExplainPrintSettings(ExplainState *es)
  * reset alongside the per-tree fields of ExplainState, and is left to the
  * caller's memory context to free (FR-45).
  *
- * The allowlist is empty: exemption currently covers pg_catalog and
- * information_schema only.  T22 adds auto_explain.redact_allow_schemas and
- * this is where the list will arrive from.
+ * The allowlist comes from es->redact_allow_schemas, which the caller fills in
+ * before generating output (FR-51).  It is read exactly once, here: the map
+ * caches each object's exemption outcome, so changing the list after the first
+ * name has been assigned would make one record answer the question two ways.
+ * NIL -- every caller in core, since the option that populates it belongs to
+ * auto_explain -- leaves exemption covering pg_catalog and information_schema
+ * only.
  */
 static RedactCtx *
 explain_redact_context(ExplainState *es)
@@ -797,7 +801,7 @@ explain_redact_context(ExplainState *es)
 	Assert(es->redact);
 
 	if (es->redact_ctx == NULL)
-		es->redact_ctx = explain_redact_create(NIL);
+		es->redact_ctx = explain_redact_create(es->redact_allow_schemas);
 
 	return es->redact_ctx;
 }

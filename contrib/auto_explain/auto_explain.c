@@ -45,6 +45,7 @@ static bool auto_explain_log_triggers = false;
 static bool auto_explain_log_timing = true;
 static bool auto_explain_log_settings = false;
 static bool auto_explain_log_redact = false;
+static char *auto_explain_redact_allow_schemas = NULL;
 static int	auto_explain_log_format = EXPLAIN_FORMAT_TEXT;
 static int	auto_explain_log_level = LOG;
 static bool auto_explain_log_nested_statements = false;
@@ -74,6 +75,34 @@ typedef struct auto_explain_extension_options
 } auto_explain_extension_options;
 
 static auto_explain_extension_options *extension_options = NULL;
+
+/*
+ * Parsed form of auto_explain.redact_allow_schemas, stored as GUC extra.
+ *
+ * Kept in parsed form so the string is split once per reload rather than once
+ * per logged record: names[] points into a copy of the normalised names that
+ * follows the array, in one allocation.
+ *
+ * has_public is decided here for the same reason -- it is a property of the
+ * setting, not of the record that reports it.
+ */
+typedef struct auto_explain_allow_schemas
+{
+	int			nschemas;
+	bool		has_public;
+	char	   *names[FLEXIBLE_ARRAY_MEMBER];
+	/* the null-terminated names follow the array */
+}			auto_explain_allow_schemas;
+
+static auto_explain_allow_schemas * allow_schemas = NULL;
+
+/*
+ * Latch for the FR-51 warning below.  At file scope rather than inside the
+ * function that emits it, because the assign hook clears it: a reload that adds
+ * a user schema to the list must be reported by sessions that already reported
+ * -- or already declined to report -- the previous list.
+ */
+static bool warned_allow_public = false;
 
 static const struct config_enum_entry format_options[] = {
 	{"text", EXPLAIN_FORMAT_TEXT, false},
@@ -124,6 +153,11 @@ static void explain_ExecutorEnd(QueryDesc *queryDesc);
 static bool check_log_extension_options(char **newval, void **extra,
 										GucSource source);
 static void assign_log_extension_options(const char *newval, void *extra);
+static bool check_redact_allow_schemas(char **newval, void **extra,
+									   GucSource source);
+static void assign_redact_allow_schemas(const char *newval, void *extra);
+static List *auto_explain_allow_schema_list(void);
+static void warn_allowlisted_public(void);
 static char *make_reference_token(void);
 static void emit_reference_entry(const char *token, const char *query_text);
 static void warn_redaction_conflict(const char *setting, const char *why);
@@ -209,6 +243,42 @@ _PG_init(void)
 							 NULL,
 							 NULL,
 							 NULL);
+
+	/*
+	 * The allowlist (FR-51/D7).  Empty by default, which is the whole of the
+	 * default policy: this is the one setting in the feature that *widens*
+	 * disclosure, so it does nothing until an administrator names a schema.
+	 *
+	 * PGC_SIGHUP for the reason above and with more force (D9).  log_redact
+	 * at SUSET would let a session turn redaction off for itself; this one at
+	 * SUSET would let a session exempt its own schema -- the same outcome,
+	 * reached through a setting whose name does not mention redaction.
+	 *
+	 * GUC_LIST_INPUT and not GUC_LIST_QUOTE, which is not a judgement call:
+	 * an extension that passes GUC_LIST_QUOTE to DefineCustomStringVariable()
+	 * gets elog(FATAL) ("extensions cannot define GUC_LIST_QUOTE variables",
+	 * guc.c:4821), because the value would be re-quoted wrongly when the
+	 * defining extension is not loaded.  Nothing is lost here: the flag
+	 * governs how a stored value is re-quoted for dump and for ALTER
+	 * ROLE/DATABASE SET, none of which can carry a PGC_SIGHUP setting, and
+	 * quoted elements are still accepted on input -- the check hook's parser
+	 * handles them.
+	 */
+	DefineCustomStringVariable("auto_explain.redact_allow_schemas",
+							   "Schemas exempted from redaction in logged plans.",
+							   "Objects in these schemas keep their real names; "
+							   "everything else is still redacted. Empty by "
+							   "default. A schema listed here is exempt for "
+							   "every object created in it later, so schemas "
+							   "holding application objects, such as public, "
+							   "should not be listed.",
+							   &auto_explain_redact_allow_schemas,
+							   "",
+							   PGC_SIGHUP,
+							   GUC_LIST_INPUT,
+							   check_redact_allow_schemas,
+							   assign_redact_allow_schemas,
+							   NULL);
 
 	DefineCustomBoolVariable("auto_explain.log_verbose",
 							 "Use EXPLAIN VERBOSE for plan logging.",
@@ -599,6 +669,15 @@ explain_ExecutorEnd(QueryDesc *queryDesc)
 			ExplainState *es = NewExplainState();
 
 			es->redact = auto_explain_log_redact;
+
+			/*
+			 * FR-51.  Set before any output is generated, because the
+			 * pseudonym map reads the list once, when it is created on the
+			 * first name it is asked for.  Built only under redaction:
+			 * off-mode must reach no new code at all (FR-62).
+			 */
+			if (es->redact)
+				es->redact_allow_schemas = auto_explain_allow_schema_list();
 			es->analyze = (queryDesc->instrument_options && auto_explain_log_analyze);
 			es->verbose = auto_explain_log_verbose;
 			es->buffers = (es->analyze && auto_explain_log_buffers);
@@ -670,7 +749,10 @@ explain_ExecutorEnd(QueryDesc *queryDesc)
 			 * decision to make.
 			 */
 			if (es->redact)
+			{
 				check_logging_envelope();
+				warn_allowlisted_public();
+			}
 
 			/*
 			 * Note: we rely on the existing logging of context or
@@ -791,6 +873,170 @@ static void
 assign_log_extension_options(const char *newval, void *extra)
 {
 	extension_options = (auto_explain_extension_options *) extra;
+}
+
+/*
+ * GUC check hook for auto_explain.redact_allow_schemas.
+ *
+ * Parses and normalises the list, and hands the result to the assign hook as
+ * GUC extra.  A check hook cannot ereport() -- it reports through
+ * GUC_check_errdetail() and a false return, which is what turns a bad value into
+ * a rejected configuration rather than an error at reload time.
+ */
+static bool
+check_redact_allow_schemas(char **newval, void **extra, GucSource source)
+{
+	char	   *rawstring;
+	List	   *namelist;
+	ListCell   *lc;
+	auto_explain_allow_schemas *result;
+	Size		allocsize;
+	Size		namebytes = 0;
+	char	   *nameptr;
+	int			i;
+
+	/* NULL or empty string means no exempted schemas, which is the default. */
+	if (*newval == NULL || (*newval)[0] == '\0')
+	{
+		*extra = NULL;
+		return true;
+	}
+
+	/* SplitIdentifierString scribbles on its input. */
+	rawstring = pstrdup(*newval);
+
+	/*
+	 * SplitIdentifierString() is required here, not merely convenient.  The
+	 * pseudonym engine compares these names to catalog names with strcmp()
+	 * (explain_redact.c, redact_is_exempt()), and this is the parser that
+	 * produces catalog-normalised names: it downcases an unquoted identifier,
+	 * takes a double-quoted one verbatim, and truncates at NAMEDATALEN
+	 * exactly as the catalog did when the schema was created.  Splitting on
+	 * commas by hand would leave redact_allow_schemas = 'MySchema' matching
+	 * nothing, and failing to exempt is silent -- the objects would simply
+	 * stay pseudonymised, with no error anywhere to explain why.
+	 */
+	if (!SplitIdentifierString(rawstring, ',', &namelist))
+	{
+		GUC_check_errdetail("List syntax is invalid.");
+		pfree(rawstring);
+		list_free(namelist);
+		return false;
+	}
+
+	foreach(lc, namelist)
+		namebytes += strlen((const char *) lfirst(lc)) + 1;
+
+	allocsize = offsetof(auto_explain_allow_schemas, names) +
+		sizeof(char *) * list_length(namelist) + namebytes;
+	result = (auto_explain_allow_schemas *) guc_malloc(LOG, allocsize);
+	if (result == NULL)
+	{
+		pfree(rawstring);
+		list_free(namelist);
+		return false;
+	}
+
+	result->nschemas = list_length(namelist);
+	result->has_public = false;
+
+	/* Copy the names in after the pointer array, as one allocation. */
+	nameptr = (char *) &result->names[result->nschemas];
+	i = 0;
+	foreach(lc, namelist)
+	{
+		const char *name = (const char *) lfirst(lc);
+		Size		len = strlen(name) + 1;
+
+		memcpy(nameptr, name, len);
+		result->names[i++] = nameptr;
+
+		/*
+		 * Decided once, here, rather than per record.  Compared after
+		 * normalisation, so "PUBLIC" and "public" are both recognised -- the
+		 * schema they name is the same one.
+		 */
+		if (strcmp(nameptr, "public") == 0)
+			result->has_public = true;
+
+		nameptr += len;
+	}
+
+	pfree(rawstring);
+	list_free(namelist);
+
+	*extra = result;
+	return true;
+}
+
+/*
+ * GUC assign hook for auto_explain.redact_allow_schemas.
+ */
+static void
+assign_redact_allow_schemas(const char *newval, void *extra)
+{
+	allow_schemas = (auto_explain_allow_schemas *) extra;
+
+	/*
+	 * Re-arm the FR-51 warning.  This hook runs in each backend as it
+	 * processes the reload, so a session that has already warned -- or that
+	 * started when the list was harmless -- reports the new list rather than
+	 * staying quiet about it.
+	 */
+	warned_allow_public = false;
+}
+
+/*
+ * The allowlist as a List, for ExplainState.redact_allow_schemas.
+ *
+ * Built per record in whatever context the caller has switched to, which for
+ * the one caller is the per-query context the map itself lives in.  The strings
+ * are borrowed from the GUC extra rather than copied: explain_redact_create()
+ * copies them into the map's own context, so nothing here has to outlive the
+ * call.  Only the list cells are per-record work -- splitting and normalising
+ * happened once, in the check hook.
+ */
+static List *
+auto_explain_allow_schema_list(void)
+{
+	List	   *result = NIL;
+
+	if (allow_schemas == NULL)
+		return NIL;
+
+	for (int i = 0; i < allow_schemas->nschemas; i++)
+		result = lappend(result, allow_schemas->names[i]);
+
+	return result;
+}
+
+/*
+ * FR-51: report that the allowlist exempts a schema an application's objects are
+ * likely to live in.
+ *
+ * Allowlisting a schema exempts everything in it, including everything created
+ * in it later, so "public" is the single entry that can quietly turn redaction
+ * off for most of a database.  It is permitted rather than refused -- a site may
+ * keep only trusted extensions there -- but it is not permitted silently.
+ *
+ * It surfaces on the record-generating path, in the same log as the records it
+ * qualifies, because that is where the reader who needs the caveat is looking.
+ * Not from the assign hook: that runs while the configuration is reloaded, in
+ * the postmaster and again in every backend, so a warning from there would
+ * arrive detached from any record, once per process, and would say nothing about
+ * whether redaction was even in use.
+ */
+static void
+warn_allowlisted_public(void)
+{
+	if (allow_schemas == NULL || !allow_schemas->has_public)
+		return;
+	if (warned_allow_public)
+		return;
+
+	warned_allow_public = true;
+	warn_redaction_conflict("\"public\" in auto_explain.redact_allow_schemas",
+							"Objects in an allowlisted schema print their real names, including objects created in it later. Schemas holding application objects should not be allowlisted.");
 }
 
 /*
