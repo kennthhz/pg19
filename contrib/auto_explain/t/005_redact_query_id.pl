@@ -21,6 +21,12 @@
 # Every assertion that an identifier is absent is paired with one showing that
 # the same identifier is present where redaction does not apply.  Without that,
 # compute_query_id quietly not taking effect would make each of them pass.
+#
+# FR-100 is here too, at the end: no CONTEXT on a redacted record or on
+# auto_explain's warnings.  It needs what this file already has -- jsonlog, so
+# that "no context field" can be asserted of a field rather than a line, and a
+# function whose nested statements are logged -- and its assertions scan whole
+# entries, which stderr alone cannot delimit as reliably.
 
 use strict;
 use warnings FATAL => 'all';
@@ -595,6 +601,221 @@ with_reloaded(
 			[$probe_qid],
 			'extension options warning: the companion in the same session carries the identifier (%Q)'
 		);
+	});
+
+
+# ---------------------------------------------------------------------------
+# FR-100: no CONTEXT on a redacted record or on auto_explain's warnings.
+#
+# Under log_nested_statements a nested plan is logged while PL/pgSQL's
+# error-context callback is active, and the callback attaches the nested
+# statement's SQL, verbatim, and the function's name to whatever is reported.
+# That arrived on the CONTEXT: line in stderr and in the context field of
+# jsonlog, inside the record that was meant to be redacted.  Nothing noticed,
+# because the checks examined only the plan lines.
+#
+# Here, then, whole entries are examined: every line of a stderr entry and
+# every field of a jsonlog entry.  The markers are the fixture's own names, all
+# of which begin "zq_".  Each absence is paired with a presence in the same
+# configuration, so that PL/pgSQL no longer setting context, or the entry
+# reader cutting entries short, would fail the test rather than pass it.
+# ---------------------------------------------------------------------------
+
+# Fixture names found in $text: sorted, lower-cased, de-duplicated.
+sub zq_names
+{
+	my ($text) = @_;
+	my %seen;
+	$seen{ lc($1) } = 1 while $text =~ /(zq_[a-z0-9_]*)/gi;
+	return [ sort keys %seen ];
+}
+
+# The whole stderr entries in a chunk, each with every line it wrote.  An entry
+# starts on a prefixed line whose severity is a message level; prefixed lines
+# naming a secondary field (DETAIL, CONTEXT, ...) and tab-indented
+# continuations belong to the entry above them.
+sub stderr_entries
+{
+	my ($chunk) = @_;
+	my @entries;
+	foreach my $line (split /\n/, $chunk)
+	{
+		if ($line =~
+			/^\S+ \S+ \S+ \[\d+\] qid=-?\d+ [^\n]*? ([A-Z]+[0-9]?):  /
+			&& $1 =~
+			/^(?:DEBUG[1-5]?|LOG|INFO|NOTICE|WARNING|ERROR|FATAL|PANIC)$/)
+		{
+			push @entries, "$line\n";
+		}
+		elsif (@entries)
+		{
+			$entries[-1] .= "$line\n";
+		}
+	}
+	return @entries;
+}
+
+# The one jsonlog entry whose message matches $re, and the one stderr entry
+# whose text matches $re.  Exactly one, because a pattern that matched none
+# would turn every assertion on the result into one about nothing.
+sub json_entry
+{
+	my ($chunk, $re) = @_;
+	my @e = grep { $_->{message} =~ $re } json_entries($chunk);
+	die "expected one jsonlog entry matching $re, found " . scalar(@e)
+	  unless @e == 1;
+	return $e[0];
+}
+
+sub stderr_entry
+{
+	my ($chunk, $re) = @_;
+	my @e = grep { $_ =~ $re } stderr_entries($chunk);
+	die "expected one stderr entry matching $re, found " . scalar(@e)
+	  unless @e == 1;
+	return $e[0];
+}
+
+my $nested_sql = 'SELECT count(*) FROM zq_t WHERE a > 0';
+my $warning_re = qr/auto_explain\.log_redact is enabled, but /;
+
+# Redaction off: the anti-vacuity halves.  The same function, the same nested
+# statement, and CONTEXT names both.  This is also FR-62 for the unredacted
+# record: it keeps its CONTEXT.
+with_reloaded(
+	{ 'auto_explain.log_redact' => 'off' },
+	sub {
+		my $chunk = run_logged($node, $outer_sql,
+			{ 'auto_explain.log_nested_statements' => 'on' });
+
+		my $re =
+		  qr/^duration: [\d.]+ ms  plan:\nQuery Text: \Q$nested_sql\E\n/;
+		my $json = json_entry($chunk->{jsonlog}, $re);
+		like(
+			$json->{context} // '',
+			qr/^SQL statement "\Q$nested_sql\E"\nPL\/pgSQL function zq_nested_then_qid\(\) line \d+ at PERFORM$/,
+			'FR-100 off: the nested record\'s jsonlog context names the SQL and the function'
+		);
+
+		my $entry =
+		  stderr_entry($chunk->{stderr}, qr/\tQuery Text: \Q$nested_sql\E\n/);
+		like(
+			$entry,
+			qr/^[^\n]* CONTEXT:  SQL statement "\Q$nested_sql\E"\n\tPL\/pgSQL function zq_nested_then_qid\(\) line \d+ at PERFORM$/m,
+			'FR-100 off: the nested record\'s stderr entry has a CONTEXT line naming both'
+		);
+		is_deeply(
+			zq_names(encode_json($json)),
+			[ 'zq_nested_then_qid', 'zq_t' ],
+			'FR-100 off: the whole-entry scan finds both fixture names');
+		unlike($chunk->{stderr}, $warning_re,
+			'FR-100 off: no redaction warnings are written');
+	});
+
+# Redaction on.  DEBUG1 turns on the companion entries, which identify the
+# nested statement's record by its token and supply the same-session presence
+# halves: each companion is written by the same backend, in the same context,
+# immediately before its record.
+with_reloaded(
+	{ 'auto_explain.log_redact' => 'on' },
+	sub {
+		my $chunk = run_logged(
+			$node,
+			$outer_sql,
+			{
+				'auto_explain.log_nested_statements' => 'on',
+				'log_min_messages' => 'debug1'
+			});
+		my @json = json_entries($chunk->{jsonlog});
+		my @stderr = stderr_entries($chunk->{stderr});
+
+		# The nested statement's companion, and through its token the record.
+		my $comp = json_entry($chunk->{jsonlog},
+			qr/^auto_explain ref [0-9a-f]{16}: \Q$nested_sql\E$/);
+		my ($token) = $comp->{message} =~ /^auto_explain ref ([0-9a-f]{16}):/;
+		my $rec = json_entry($chunk->{jsonlog},
+			qr/^duration: [\d.]+ ms  ref: \Q$token\E  plan:/);
+		my $rec_stderr =
+		  stderr_entry($chunk->{stderr}, qr/ref: \Q$token\E  plan:/);
+
+		ok( !exists $rec->{context},
+			'FR-100 on: the nested record\'s jsonlog entry has no context field'
+		);
+		unlike($rec_stderr, qr/CONTEXT:/,
+			'FR-100 on: the nested record\'s stderr entry has no CONTEXT line'
+		);
+
+		# The companion keeps its CONTEXT, deliberately.  Also the presence
+		# half for the two assertions above: the context stack was live at
+		# the moment the record was written.
+		like(
+			$comp->{context} // '',
+			qr/^SQL statement "\Q$nested_sql\E"\nPL\/pgSQL function zq_nested_then_qid\(\) line \d+ at PERFORM$/,
+			'FR-100 on: the companion entry still carries the nested CONTEXT (jsonlog)'
+		);
+		like(
+			stderr_entry(
+				$chunk->{stderr}, qr/DEBUG:  auto_explain ref \Q$token\E: /),
+			qr/^[^\n]* CONTEXT:  SQL statement "\Q$nested_sql\E"\n\tPL\/pgSQL function zq_nested_then_qid\(\) line \d+ at PERFORM$/m,
+			'FR-100 on: the companion entry still carries the nested CONTEXT (stderr)'
+		);
+
+		# No fixture name anywhere in any redacted record's whole entry:
+		# message, detail, context, every jsonlog field, every stderr line.
+		my @rec_json =
+		  grep {
+			$_->{message} =~ /^duration: [\d.]+ ms  ref: [0-9a-f]{16}  plan:/
+		  } @json;
+		my @rec_stderr =
+		  grep {
+			/\A[^\n]*LOG:  duration: [\d.]+ ms  ref: [0-9a-f]{16}  plan:$/m
+		  } @stderr;
+		cmp_ok(scalar(@rec_json), '>=', 3,
+			'FR-100 on: the nested and outer statements were logged redacted'
+		);
+		is(scalar(@rec_stderr), scalar(@rec_json),
+			'FR-100 on: stderr has the same redacted records as jsonlog');
+		is_deeply(zq_names(join "\n", map { encode_json($_) } @rec_json),
+			[], 'FR-100 on: no fixture name in any redacted jsonlog entry');
+		is_deeply(zq_names(join '', @rec_stderr),
+			[], 'FR-100 on: no fixture name in any redacted stderr entry');
+
+		# The presence half of the scan, same session: the companions hold
+		# both names, one in the message and one in the context.
+		is_deeply(
+			zq_names(
+				join "\n",
+				map    { encode_json($_) }
+				  grep { $_->{message} =~ /^auto_explain ref / } @json),
+			[ 'zq_nested_then_qid', 'zq_t' ],
+			'FR-100 on: the same scan finds both names in the companions');
+
+		# The warnings.  The session's first redacted record is the function's
+		# first nested statement, so they are written inside its PL/pgSQL
+		# context: the entry right after the last of them is that statement's
+		# companion, and its context names the function.
+		my @warn_idx = grep { $json[$_]{message} =~ $warning_re } 0 .. $#json;
+		cmp_ok(scalar(@warn_idx), '>=', 2,
+			'FR-100 on: log_statement and debug1 were both warned about');
+		my $after = $json[ $warn_idx[-1] + 1 ];
+		like(
+			$after->{message} . "\n" . ($after->{context} // ''),
+			qr/^auto_explain ref [0-9a-f]{16}: .*\nSQL statement ".*"\nPL\/pgSQL function zq_nested_then_qid\(\) line \d+ at /s,
+			'FR-100 on: the warnings were written inside the nested statement\'s context'
+		);
+		is_deeply([ grep { exists $json[$_]{context} } @warn_idx ],
+			[], 'FR-100 on: no warning\'s jsonlog entry has a context field');
+		my @warn_stderr = grep { /\A[^\n]*LOG:  $warning_re/ } @stderr;
+		is(scalar(@warn_stderr), scalar(@warn_idx),
+			'FR-100 on: stderr has the same warnings as jsonlog');
+		is_deeply([ grep { /CONTEXT:/ } @warn_stderr ],
+			[], 'FR-100 on: no warning\'s stderr entry has a CONTEXT line');
+		is_deeply(
+			zq_names(
+				join "\n", (map { encode_json($json[$_]) } @warn_idx),
+				@warn_stderr),
+			[],
+			'FR-100 on: no fixture name in any warning entry');
 	});
 
 done_testing();

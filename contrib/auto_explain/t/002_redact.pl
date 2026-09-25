@@ -234,6 +234,44 @@ sub plan_record
 	return join("\n", @kept) . "\n";
 }
 
+# Returns every log entry in a chunk that auto_explain wrote, whole: the first
+# line and every line after it that belongs to the same entry, DETAIL and
+# CONTEXT included.  That is, everything except log_statement's own entries,
+# which carry the statement by design.
+#
+# plan_record() keeps only the tab-indented lines after a record's first line.
+# A CONTEXT line starts with the log_line_prefix, so it ends the record there
+# and is never examined -- which is how a nested record's CONTEXT, holding the
+# nested statement verbatim, went unseen (FR-100).  Assertions about what a
+# redacted entry discloses belong on this helper; plan_record() stays for
+# assertions about the plan itself.
+#
+# An entry starts on a prefixed line whose keyword is a message severity.  Any
+# other line, a prefixed secondary field or a continuation, is appended to the
+# entry above it, so a field name this list does not know is still scanned.
+sub auto_explain_entries
+{
+	my ($log) = @_;
+	my @entries;
+	foreach my $line (split /\n/, $log)
+	{
+		if ($line =~
+			/^\d{4}-\d\d-\d\d \d\d:\d\d:\d\d[^\n]*?\] [^\n]*? ([A-Z]+[0-9]?):  /
+			&& $1 =~
+			/^(?:DEBUG[1-5]?|LOG|INFO|NOTICE|WARNING|ERROR|FATAL|PANIC)$/)
+		{
+			push @entries, "$line\n";
+		}
+		elsif (@entries)
+		{
+			$entries[-1] .= "$line\n";
+		}
+	}
+	@entries = grep { !/\A[^\n]*?[A-Z]+:  statement: / } @entries;
+	die "auto_explain_entries() found nothing in this log chunk"
+	  unless @entries;
+	return @entries;
+}
 # Returns the sorted, de-duplicated marker strings found in $log -- that is, the
 # fixture identifiers and values that leaked.  An empty list means no leak.
 #
@@ -700,6 +738,19 @@ is(scalar(@false_positives), 0,
 	'detector reports nothing for a query with no fixture objects, including "time zone"'
 );
 
+# FR-2 / FR-100, unredacted: a nested record's CONTEXT carries the nested
+# statement verbatim.  The partner of the whole-entry check in phase 2, and
+# the reason that check exists: plan_record() never sees this line.
+my $fr2_sql =
+  "SET search_path = zsec_ns, public; DO \$\$ BEGIN PERFORM count(*) FROM zsec_customers WHERE zsec_ssn > 'a'; END \$\$;";
+$log = query_log($node, $fr2_sql,
+	{ 'auto_explain.log_nested_statements' => 'on' });
+like(
+	join('', auto_explain_entries($log)),
+	qr/ CONTEXT:  SQL statement "SELECT count\(\*\) FROM zsec_customers WHERE zsec_ssn > 'a'"\n\tPL\/pgSQL function inline_code_block line \d+ at PERFORM$/m,
+	'FR-2 unredacted: the nested record\'s CONTEXT carries the nested SQL');
+unlike(plan_record($log), qr/CONTEXT:/,
+	'FR-2 unredacted: plan_record() does not see the CONTEXT line');
 # ---------------------------------------------------------------------------
 # PHASE 2 (T04): the same channels with redaction enabled.
 #
@@ -862,9 +913,7 @@ like(
 
 # FR-2: a nested statement is redacted too.  The function body runs below the
 # top-level statement, and log_nested_statements is what makes it logged at all.
-$log = query_log(
-	$node,
-	"SET search_path = zsec_ns, public; DO \$\$ BEGIN PERFORM count(*) FROM zsec_customers WHERE zsec_ssn > 'a'; END \$\$;",
+$log = query_log($node, $fr2_sql,
 	{ 'auto_explain.log_nested_statements' => 'on' });
 like(
 	$log,
@@ -872,6 +921,17 @@ like(
 	'FR-2 redacted: the nested statement really was logged');
 is_deeply([ leaked(plan_record($log)) ],
 	[], 'FR-2 redacted: nested statements carry no marker either');
+# FR-100: the whole entry, not only the plan lines.  The session's first
+# redacted record is the nested one, so the FR-75 warning is written inside
+# the same PL/pgSQL context and is covered here too.
+is_deeply(
+	[ leaked(join('', auto_explain_entries($log))) ],
+	[],
+	'FR-2 redacted: no marker in any whole entry, CONTEXT and warnings included'
+);
+unlike(join('', auto_explain_entries($log)),
+	qr/CONTEXT:/,
+	'FR-2 redacted: no entry auto_explain wrote has a CONTEXT line');
 
 # Negative controls.  Without these the phase above passes by deleting the
 # record wholesale, which would satisfy every "absent" assertion at once.

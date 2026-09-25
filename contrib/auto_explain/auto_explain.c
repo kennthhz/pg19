@@ -595,6 +595,13 @@ restore_query_id(int64 saved_query_id)
  * shortcoming.  A site that does enable it has chosen to keep the statements and
  * should route them accordingly, which is why check_logging_envelope() reports
  * that they are being written.
+ *
+ * Unlike the record and the warnings, this entry keeps its CONTEXT, and that
+ * is deliberate.  For a nested statement the context is the statement's own
+ * text again plus the function that ran it: nothing this entry does not
+ * already disclose, and exactly what the record gives up by hiding its own
+ * (see explain_ExecutorEnd).  The token is what joins the two, so this is
+ * where an operator recovers which function a redacted nested plan came from.
  */
 static void
 emit_reference_entry(const char *token, const char *query_text)
@@ -619,6 +626,12 @@ emit_reference_entry(const char *token, const char *query_text)
  * these warnings name a setting that already logs the whole statement, but the
  * allowlist and extension-option ones do not, and one rule for all of them is
  * simpler to reason about than one per warning.  Only called under redaction.
+ *
+ * Written without CONTEXT, for the same reason as the record.  The warnings
+ * fire just before the first redacted record of a session, and when that
+ * record is a nested statement they are inside the same error-context stack:
+ * PL/pgSQL's callback would attach the nested statement's text and the
+ * function's name to each warning line.
  */
 static void
 warn_redaction_conflict(const char *setting, const char *why)
@@ -631,7 +644,8 @@ warn_redaction_conflict(const char *setting, const char *why)
 				(errmsg("auto_explain.log_redact is enabled, but %s is also active",
 						setting),
 				 errdetail("%s", why),
-				 errhidestmt(true)));
+				 errhidestmt(true),
+				 errhidecontext(true)));
 	}
 	PG_FINALLY();
 	{
@@ -828,6 +842,30 @@ explain_ExecutorEnd(QueryDesc *queryDesc)
 				 * hide_query_id().  The companion entry above keeps its
 				 * identifier: it holds the whole statement, from which the
 				 * identifier follows.
+				 *
+				 * FR-100: nor any CONTEXT.  Under log_nested_statements the
+				 * record is written while the caller's error-context
+				 * callbacks are active, and PL/pgSQL's attaches the nested
+				 * statement's SQL, verbatim, and the name of the function
+				 * running it -- the very text the plan withholds, on the
+				 * CONTEXT: line and in the context field of csvlog and
+				 * jsonlog.  errhidestmt() alone does not cover it.  The flag
+				 * reaches every server log destination: syslog and eventlog
+				 * are written from the same buffer as stderr.  It does not
+				 * reach the client, since send_message_to_frontend() ignores
+				 * it, so at a log_level the client is sent (info always;
+				 * notice and warning at the default client_min_messages) the
+				 * session still gets CONTEXT.  That is its own statement,
+				 * sent to the user who wrote it.
+				 *
+				 * The cost: a redacted nested plan no longer says which
+				 * function ran it.  The reference token is the mitigation.
+				 * The companion entry pairs it with the nested statement's
+				 * text and keeps its own CONTEXT, so the same information is
+				 * there, written at DEBUG1 for routing somewhere trusted.
+				 *
+				 * The unredacted record below keeps its CONTEXT: off mode is
+				 * unchanged (FR-62).
 				 */
 				saved_query_id = hide_query_id();
 				PG_TRY();
@@ -835,7 +873,8 @@ explain_ExecutorEnd(QueryDesc *queryDesc)
 					ereport(auto_explain_log_level,
 							(errmsg("duration: %.3f ms  ref: %s  plan:\n%s",
 									msec, token, es->str->data),
-							 errhidestmt(true)));
+							 errhidestmt(true),
+							 errhidecontext(true)));
 				}
 				PG_FINALLY();
 				{

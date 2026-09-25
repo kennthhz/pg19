@@ -640,6 +640,14 @@ LOG:  duration: 0.210 ms  ref: 3674e079c7cb48e4  plan:
   </para>
 
   <para>
+   A redacted record carries no <literal>CONTEXT</literal>, so with
+   <varname>auto_explain.log_nested_statements</varname> on, a nested plan
+   does not show which function ran it.  The <literal>DEBUG1</literal>
+   message with the same reference keeps its <literal>CONTEXT</literal>, and
+   is the way to recover that.
+  </para>
+
+  <para>
    As described under <varname>auto_explain.log_redact</varname>, redaction
    applies only to the plan records themselves; other log output, including
    the fields that <literal>csvlog</literal> and <literal>jsonlog</literal>
