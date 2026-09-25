@@ -256,7 +256,94 @@ sub catalog_names
 		  . join(' ', sort @suppressed))
 	  if @suppressed;
 
-	return \%names;
+	return (\%names, exempt_names($node, $dbname, \%names));
+}
+
+# Names of pg_catalog and information_schema objects, for scan() to recognise in
+# the positions where such a name is allowed to print.
+#
+# Since T21b a redacted record prints expressions again, and with them the names
+# of exempt objects: the type after "::", a built-in function, a catalog column.
+# Many of those collide with some user object in the regression database -- it
+# has objects called "text", "sum" and "relname" -- and the scan cannot tell
+# pg_catalog.text printed as a cast from a user column called text leaking.
+#
+# The answer is not the vocabulary.  Folding "text" into %plan_vocabulary would
+# blind the scan to a user object of that name everywhere, including exactly the
+# column position where it would be a leak.  Instead scan() skips a token only
+# where it is in a position an exempt name may occupy *and* it is an exempt name
+# of the kind that position holds; see there.
+#
+# Columns are the exception, because no position distinguishes them: a user
+# column called relname leaking would print exactly like pg_class.relname behind
+# a pseudonym alias.  Those names are a second blind spot, reported next to the
+# vocabulary one and for the same reason.
+sub exempt_names
+{
+	my ($node, $dbname, $names) = @_;
+	my %exempt;
+	my $in_exempt = q{IN ('pg_catalog','information_schema')};
+
+	# A type is matched by its catalog name and by the spelling format_type()
+	# gives it, which is what ruleutils prints: "timestamp with time zone" for
+	# timestamptz, "bit varying" for varbit, "char" in quotes.  Qualifiers and
+	# quotes are stripped here and allowed for in scan().
+	my $types_sql = qq{
+		SELECT lower(t.typname) FROM pg_type t
+		  JOIN pg_namespace n ON n.oid = t.typnamespace
+		 WHERE n.nspname $in_exempt
+		UNION
+		SELECT lower(regexp_replace(replace(format_type(t.oid, NULL), '"', ''),
+		                            '^(pg_catalog|information_schema)[.]', ''))
+		  FROM pg_type t
+		  JOIN pg_namespace n ON n.oid = t.typnamespace
+		 WHERE n.nspname $in_exempt};
+	my $funcs_sql = qq{
+		SELECT DISTINCT lower(p.proname) FROM pg_proc p
+		  JOIN pg_namespace n ON n.oid = p.pronamespace
+		 WHERE n.nspname $in_exempt};
+	my $columns_sql = qq{
+		SELECT DISTINCT lower(a.attname) FROM pg_attribute a
+		  JOIN pg_class c ON c.oid = a.attrelid
+		  JOIN pg_namespace n ON n.oid = c.relnamespace
+		 WHERE n.nspname $in_exempt
+		   AND c.relkind IN ('r','v','m','p','f')
+		   AND a.attnum > 0 AND NOT a.attisdropped};
+
+	$exempt{types} = {
+		map { $_ => 1 } grep { $_ ne '' && !/\[/ }
+		  split /\n/,
+		$node->safe_psql($dbname, $types_sql)
+	};
+	$exempt{funcs} = {
+		map { $_ => 1 } grep { $_ ne '' }
+		  split /\n/,
+		$node->safe_psql($dbname, $funcs_sql)
+	};
+
+	# Only the columns that collide with a user name matter, and only they are a
+	# blind spot, so only they are kept.
+	$exempt{columns} = {
+		map { $_ => 1 } grep { $names->{$_} }
+		  split /\n/,
+		$node->safe_psql($dbname, $columns_sql)
+	};
+
+	# The second honest number.  Every name here is a user name the scan cannot
+	# see in an expression property, because it is also the name of a catalog
+	# column that property may legitimately print.  It still sees them in node
+	# header lines, where columns never print.  A jump in this number means the
+	# catalog or the suite changed and is worth a look; it cannot be grown to
+	# keep the test quiet, because nothing in this file lists its members.
+	my @cols = sort keys %{ $exempt{columns} };
+	note(   "names this scan cannot see in expression properties, because "
+		  . "they are also columns of pg_catalog or information_schema "
+		  . "relations ("
+		  . scalar(@cols) . "): "
+		  . join(' ', @cols))
+	  if @cols;
+
+	return \%exempt;
 }
 
 # Report which catalog names appear in the given plan-record lines.
@@ -294,18 +381,88 @@ my @fixed_value_properties = (
 );
 my $fixed_re = join '|', map { quotemeta } @fixed_value_properties;
 
+# Positions where an exempt name may print.  See exempt_names() for why these
+# exist; the rule for every one of them is that a token is removed only when it
+# is in the position *and* is an exempt name of the kind the position holds.  A
+# user name in the same position is still seen: "?::zsec_mytype" is reported,
+# which is what stops "skip whatever follows ::" from passing this file while
+# blinding it to the type-name leaks T11 exists to prevent.  The PHASE 0 cases
+# below pin every rule in both directions.
+#
+#   - Property labels.  The text up to the first colon of a property line is a
+#     code constant ("Sort Key", "Rows Removed by Filter", "Worker 0"), never
+#     user text, so it is dropped before tokenizing; that is what lets "key" be
+#     searched for everywhere else.  The pattern admits only capitalised words,
+#     "by" and numbers, so it cannot run into a value or match a node header
+#     line.  The one text-format line that puts a name before its colon is
+#     "Trigger <name>: time=..." (explain.c, report_triggers), excluded by name.
+#   - Types, after "::", optionally qualified by pg_catalog or
+#     information_schema and optionally quoted.  The longest exempt spelling
+#     wins, so "::timestamp with time zone" removes all four words while
+#     "::timestamp" followed by some other word removes one.
+#   - Functions, immediately followed by "(", which is how ruleutils prints a
+#     call.  A call qualified by any other schema is not skipped.
+#   - The tablesample method, the first word of a "Sampling:" value; ruleutils
+#     prints it with a space before the "(".
+#   - Syntax: IS [NOT] JSON, and ruleutils' own "colN" field label on a
+#     multi-column sub-plan, "(SubPlan sp1).col1".
+#   - Columns of exempt relations, on property lines only.  This is the blind
+#     spot exempt_names() reports; node header lines never print a column, so
+#     there the names stay visible.
+my $ident = qr/[a-z_][a-z0-9_]*/;
+my $exempt_qual = qr/(?:pg_catalog|information_schema)\./;
+my $typmod = qr/\(\d+(?:,\d+)?\)/;
+my $label_re =
+  qr/^\s*(?!Trigger\b)([A-Z][A-Za-z\/-]*(?: (?:[A-Z][A-Za-z\/-]*|by|\d+))*):(?=\s|$)/;
+
+# The spelling that follows "::", less the longest leading run of words that is
+# an exempt type name; undef when no leading run is one.
+sub strip_exempt_type
+{
+	my ($spelling, $types) = @_;
+	(my $bare = $spelling) =~ s/$typmod//g;
+	my @w = split / /, $bare;
+	for (my $k = $#w; $k >= 0; $k--)
+	{
+		return join(' ', '', @w[ $k + 1 .. $#w ])
+		  if $types->{ join(' ', @w[ 0 .. $k ]) };
+	}
+	return undef;
+}
+
 sub scan
 {
-	my ($records, $names) = @_;
+	my ($records, $names, $exempt) = @_;
 	my %found;
 
 	foreach my $line (@$records)
 	{
 		next if $line =~ /^\s*(?:$fixed_re):/;
 
-		while ($line =~ /([A-Za-z_][A-Za-z0-9_]*)/g)
+		my $v = $line;
+		my $label;
+		$label = $1 if $v =~ s/$label_re//;
+
+		$v =~ s/\bIS (?:NOT )?\KJSON\b//g;
+		$v =~ s/((?:SubPlan|InitPlan) \w+\))\.col\d+\b/$1/g;
+
+		$v =~ s{::(?:$exempt_qual)?"?($ident(?:$typmod? $ident)*)}{
+			my $all = $&;
+			my $rest = strip_exempt_type($1, $exempt->{types});
+			defined $rest ? "::$rest" : $all;
+		}ge;
+
+		$v =~ s{^(\s*)($ident)(?= \()}{$exempt->{funcs}{$2} ? $1 : $&}e
+		  if defined $label && $label eq 'Sampling';
+		$v =~ s{(?<![\w.])(?:$exempt_qual)?($ident)(?=\()}{
+			$exempt->{funcs}{$1} ? '' : $&
+		}ge;
+
+		while ($v =~ /([A-Za-z_][A-Za-z0-9_]*)/g)
 		{
 			my $tok = lc($1);
+
+			next if defined $label && $exempt->{columns}{$tok};
 
 			# Keep the line each name first appeared on.  A bare list of names
 			# cannot be acted on: the first question is always which property
@@ -315,6 +472,75 @@ sub scan
 		}
 	}
 	return \%found;
+}
+
+# ---------------------------------------------------------------------------
+# PHASE 0 -- the scanner's filter, against synthetic records.
+#
+# The positional rules above are what make the suite run pass, and a filter that
+# makes a test pass is easy to write.  These cases show it still catches leaks:
+# for each rule, an exempt name in its position is not reported, and a user name
+# in the same line shape -- or the same name in another position -- is.  The
+# names and exempt sets are hand-built, so this needs no catalog and runs in no
+# time.
+# ---------------------------------------------------------------------------
+{
+	my %t_names = map { $_ => 1 } qw(
+	  text char zone key col1 json relname sum system
+	  zsec_mytype zsec_fn zsec_tsm zsec_trig zsec_schema);
+	my %t_exempt = (
+		types => {
+			map { $_ => 1 } (
+				'text', 'char',
+				'bit', 'bit varying',
+				'timestamp', 'timestamp with time zone')
+		},
+		funcs => { map { $_ => 1 } qw(sum random system) },
+		columns => { relname => 1 },);
+
+	# [ group, record line, name, 1 if it must be found ]
+	my @cases = (
+		[ 1, 'Filter: (a1_c1 = ?::text)', 'text', 0 ],
+		[ 1, 'Filter: (text = ?::text)', 'text', 1 ],
+		[ 1, 'Filter: (a1_c1 = ?::pg_catalog.text)', 'text', 0 ],
+		[ 1, 'Filter: (a1_c1 = ?::"char")', 'char', 0 ],
+		[ 1, 'Sort Key: ((a1.a1_c1)::bit varying)', 'bit', 0 ],
+		[ 1, 'Filter: (a1_c1 = ?::timestamp with time zone)', 'zone', 0 ],
+		[ 1, 'Filter: (zone = ?::timestamp(3) with time zone)', 'zone', 1 ],
+		[ 1, 'Filter: (a1_c1 = ?::zsec_mytype)', 'zsec_mytype', 1 ],
+		[
+			1, 'Filter: (a1_c1 = ?::information_schema.zsec_mytype)',
+			'zsec_mytype', 1
+		],
+		[ 2, 'Filter: (sum(DISTINCT a1.a1_c4) > ?::integer)', 'sum', 0 ],
+		[ 2, 'Filter: (sum = ?::integer)', 'sum', 1 ],
+		[ 2, 'Filter: (zsec_schema.sum(a1_c1) > ?::integer)', 'sum', 1 ],
+		[ 2, 'Filter: (zsec_fn(a1_c1) > ?::integer)', 'zsec_fn', 1 ],
+		[ 2, 'Sampling: system (a1.a1_c2)', 'system', 0 ],
+		[ 2, 'Sampling: zsec_tsm (a1.a1_c2)', 'zsec_tsm', 1 ],
+		[ 3, 'Filter: (relname ~~ ?::text)', 'relname', 0 ],
+		[
+			3, '->  Seq Scan on relname a1  (cost=0.00..1.01 rows=1 width=4)',
+			'relname', 1
+		],
+		[ 4, 'Sort Key: a1_c1', 'key', 0 ],
+		[ 4, 'Filter: (key = ?::integer)', 'key', 1 ],
+		[ 4, 'Trigger zsec_trig: time=0.012 calls=1', 'zsec_trig', 1 ],
+		[ 5, 'Filter: (a1_c1 IS JSON)', 'json', 0 ],
+		[ 5, 'Filter: (json IS NOT NULL)', 'json', 1 ],
+		[ 5, 'Filter: (ANY (a1_c1 = (hashed SubPlan sp1).col1))', 'col1', 0 ],
+		[ 5, 'Filter: (col1 > 0)', 'col1', 1 ],);
+
+	foreach my $c (@cases)
+	{
+		my ($group, $line, $name, $want) = @$c;
+		my $hits = scan(["\t  $line"], \%t_names, \%t_exempt);
+		is( (exists $hits->{$name} ? 1 : 0),
+			$want,
+			"scan filter, group $group: \"$name\" "
+			  . ($want ? 'found' : 'not found')
+			  . " in: $line");
+	}
 }
 
 # ---------------------------------------------------------------------------
@@ -361,8 +587,9 @@ $node->safe_psql(
 	SELECT account_number, sum(balance) FROM customer_account
 	   GROUP BY account_number ORDER BY account_number LIMIT 5;
 });
-my $ctl_names = catalog_names($node, 'postgres');
-my $ctl_hits = scan(plan_records(slurp_file($logfile, $offset)), $ctl_names);
+my ($ctl_names, $ctl_exempt) = catalog_names($node, 'postgres');
+my $ctl_hits =
+  scan(plan_records(slurp_file($logfile, $offset)), $ctl_names, $ctl_exempt);
 my @ctl_found = sort keys %$ctl_hits;
 
 ok(scalar(keys %$ctl_names) > 0,
@@ -446,12 +673,12 @@ ok( scalar(@$records) > 1000,
 	  . scalar(@$records)
 	  . ' lines)');
 
-my $names = catalog_names($node, 'regression');
+my ($names, $exempt) = catalog_names($node, 'regression');
 ok( scalar(keys %$names) > 500,
 	'the catalog yielded a large body of names to search for ('
 	  . scalar(keys %$names) . ')');
 
-my $hits = scan($records, $names);
+my $hits = scan($records, $names, $exempt);
 my @leaked = sort keys %$hits;
 
 is_deeply(\@leaked, [],

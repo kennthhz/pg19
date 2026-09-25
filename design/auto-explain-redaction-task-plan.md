@@ -624,6 +624,32 @@ emission paths and a path that leaks a dropped table's name would leak a
 surviving one's. And a leak reachable only by a plan shape absent from every test
 suite remains unfalsifiable and accepted.
 
+*(rev. after T22 — **the scan broke at T21b and was repaired positionally; the
+allowlist is still empty.** Once T21b re-enabled expression output, test 9 reported
+64 names. None was a leak: every one was a `pg_catalog`/`information_schema` name
+that T10/T11/T17 keep on purpose and that also names some user object in the
+regression database — 38 type labels after `::` (`?::text`, `::information_schema.sql_identifier`),
+3 built-in calls (`sum(`, `random(`, tablesample `system`), 20 catalog columns
+(`relname`, `relkind`, `description`, …), the `Key` of `Sort Key:`, and two syntax
+labels (`IS JSON`, ruleutils' `(SubPlan sp1).col1`). Classified mechanically
+against the catalog, none left over. The fix leaves `%plan_vocabulary` and
+`%allowlist` untouched, for the reason `key` was kept out of the vocabulary above:
+`scan()` now drops a token only when it is **both** in a position an exempt name
+may occupy **and** an exempt name of the kind that position holds — a type
+spelling from `format_type()` after `::`, a `pg_catalog` function before `(`, the
+first word of a `Sampling:` value, `IS [NOT] JSON`, `SubPlan …).colN` — and it
+strips property labels, which are code constants, except the text-format
+`Trigger <name>:` line, whose label carries a name. A user name in the same
+position is still reported (`?::zsec_mytype` is found); an in-file PHASE 0 test
+pins every rule in both directions (24 cases), and ablating each rule over a real
+run brings back exactly its own group. What it does **not** see: catalog columns
+cannot be told apart by position, since a leaked user column `relname` prints like
+`pg_class.relname` behind a pseudonym alias. Those are a second blind spot,
+reported by the test beside the vocabulary one — **51** of 3,914 names (the
+`pg_class` columns, plus `comment data level location name oid size status type
+unit` and others), unseen in property lines, still seen in node header lines. The
+vocabulary count is unchanged at 8.)*
+
 ---
 
 #### T04a — original plan
