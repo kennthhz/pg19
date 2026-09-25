@@ -160,6 +160,8 @@ static void assign_redact_allow_schemas(const char *newval, void *extra);
 static List *auto_explain_allow_schema_list(void);
 static void warn_allowlisted_public(void);
 static char *make_reference_token(void);
+static int64 hide_query_id(void);
+static void restore_query_id(int64 saved_query_id);
 static void emit_reference_entry(const char *token, const char *query_text);
 static void warn_redaction_conflict(const char *setting, const char *why);
 static void check_logging_envelope(void);
@@ -542,6 +544,44 @@ make_reference_token(void)
 }
 
 /*
+ * FR-37 on the lines this module writes under redaction.
+ *
+ * %Q in log_line_prefix and the query_id field of csvlog and jsonlog read the
+ * backend's current query identifier when a line is written.  Leaving Query
+ * Identifier out of a redacted plan is not enough on its own: the line the
+ * plan is written on, and the warnings written just before it, would carry the
+ * same value.  hide_query_id() clears the identifier and returns what it was;
+ * restore_query_id() puts exactly that back.  Each caller wraps one ereport in
+ * them and restores in PG_FINALLY, because an ereport at ERROR or above does
+ * not return.
+ *
+ * pgstat_set_my_query_id() rather than pgstat_report_query_id(), for both.
+ * The latter does nothing when track_activities is off, and a superuser can
+ * turn it off partway through a statement (SET LOCAL in a function), after the
+ * outer statement's identifier was stored; pgstat_get_my_query_id() goes on
+ * returning that identifier, and so do %Q and the log formats.  The restore
+ * must be exact: under log_nested_statements the saved value is the outer
+ * statement's, still running, and pg_stat_activity reports it.  With no
+ * backend status entry both are no-ops.
+ *
+ * Only reached under redaction; off mode never calls either (FR-62).
+ */
+static int64
+hide_query_id(void)
+{
+	int64		saved_query_id = pgstat_get_my_query_id();
+
+	pgstat_set_my_query_id(INT64CONST(0));
+	return saved_query_id;
+}
+
+static void
+restore_query_id(int64 saved_query_id)
+{
+	pgstat_set_my_query_id(saved_query_id);
+}
+
+/*
  * Write the companion entry mapping a token to the statement it came from.
  *
  * This entry is the one part of the mechanism that contains user data, and it is
@@ -574,15 +614,30 @@ emit_reference_entry(const char *token, const char *query_text)
  * facts, not properties of the statement: a per-record notice would multiply
  * the log volume of the very log the operator is trying to keep clean, and
  * would say nothing new each time.
+ *
+ * Written with the query identifier cleared, like the record (FR-37).  Most of
+ * these warnings name a setting that already logs the whole statement, but the
+ * allowlist and extension-option ones do not, and one rule for all of them is
+ * simpler to reason about than one per warning.  Only called under redaction.
  */
 static void
 warn_redaction_conflict(const char *setting, const char *why)
 {
-	ereport(LOG,
-			(errmsg("auto_explain.log_redact is enabled, but %s is also active",
-					setting),
-			 errdetail("%s", why),
-			 errhidestmt(true)));
+	int64		saved_query_id = hide_query_id();
+
+	PG_TRY();
+	{
+		ereport(LOG,
+				(errmsg("auto_explain.log_redact is enabled, but %s is also active",
+						setting),
+				 errdetail("%s", why),
+				 errhidestmt(true)));
+	}
+	PG_FINALLY();
+	{
+		restore_query_id(saved_query_id);
+	}
+	PG_END_TRY();
 }
 
 /*
@@ -769,31 +824,14 @@ explain_ExecutorEnd(QueryDesc *queryDesc)
 				emit_reference_entry(token, queryDesc->sourceText);
 
 				/*
-				 * FR-37 for the line the record is written on.  Leaving Query
-				 * Identifier out of the plan is not enough on its own: %Q in
-				 * log_line_prefix and the query_id field of csvlog and
-				 * jsonlog read the backend's current query identifier when
-				 * the line is written, and would put the same value beside
-				 * the plan.  This module issues the ereport, so it can clear
-				 * the identifier for exactly that line.
-				 *
-				 * force = true is what makes the clear happen: without it a
-				 * nonzero identifier is taken to belong to an enclosing
-				 * top-level statement and is left alone.  The restore uses it
-				 * too, so that it overwrites anything reported while the
-				 * record was being written.  It must put back exactly what
-				 * was there: under log_nested_statements the saved value is
-				 * the outer statement's, still running, and pg_stat_activity
-				 * reports it.  PG_FINALLY so that an error raised while the
-				 * record is written does not leave it cleared.
-				 *
-				 * The companion entry above keeps its identifier.  It holds
-				 * the whole statement, from which the identifier follows.
+				 * FR-37: the record's line carries no query identifier.  See
+				 * hide_query_id().  The companion entry above keeps its
+				 * identifier: it holds the whole statement, from which the
+				 * identifier follows.
 				 */
-				saved_query_id = pgstat_get_my_query_id();
+				saved_query_id = hide_query_id();
 				PG_TRY();
 				{
-					pgstat_report_query_id(INT64CONST(0), true);
 					ereport(auto_explain_log_level,
 							(errmsg("duration: %.3f ms  ref: %s  plan:\n%s",
 									msec, token, es->str->data),
@@ -801,7 +839,7 @@ explain_ExecutorEnd(QueryDesc *queryDesc)
 				}
 				PG_FINALLY();
 				{
-					pgstat_report_query_id(saved_query_id, true);
+					restore_query_id(saved_query_id);
 				}
 				PG_END_TRY();
 			}

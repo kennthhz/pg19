@@ -352,4 +352,249 @@ unlike(
 	qr/log_redact is enabled, but a log_line_prefix|carries the current statement/,
 	'FR-75: a log_line_prefix containing %q is not reported');
 
+# ---------------------------------------------------------------------------
+# The remaining blocks set up what they need themselves, rather than relying on
+# the state the blocks above leave behind, and put it back afterwards.
+# ---------------------------------------------------------------------------
+
+# Sets a PGC_SIGHUP parameter through postgresql.conf and a reload, and waits
+# until a new session sees it.  Returns the value it replaced.
+sub set_by_reload
+{
+	my ($name, $value) = @_;
+	my $old = $node->safe_psql('postgres', "SHOW $name");
+	$node->append_conf('postgresql.conf', "$name = '$value'");
+	$node->reload;
+	$node->poll_query_until('postgres', "SHOW $name", $value)
+	  or die "$name did not become '$value' after reload";
+	return $old;
+}
+
+# Runs $code with the PGC_SIGHUP parameters in %$settings in effect, then
+# restores each one to the value it had before.
+sub with_reloaded
+{
+	my ($settings, $code) = @_;
+	my %old = map { $_ => set_by_reload($_, $settings->{$_}) }
+	  sort keys %$settings;
+	$code->();
+	set_by_reload($_, $old{$_}) foreach sort keys %old;
+	return;
+}
+
+# Companion entries in a stderr chunk: token => the value %Q printed.
+sub stderr_companions
+{
+	my ($chunk) = @_;
+	my %comp;
+	$comp{$2} = $1
+	  while $chunk =~
+	  /^[^\n]* qid=(-?\d+) [^\n]*DEBUG:  auto_explain ref ([0-9a-f]{16}): /mg;
+	return %comp;
+}
+
+# Companion entries in a jsonlog chunk: token => query_id.
+sub json_companions
+{
+	my ($chunk) = @_;
+	my %comp;
+	foreach my $e (json_entries($chunk))
+	{
+		$comp{$1} = "$e->{query_id}"
+		  if $e->{message} =~ /^auto_explain ref ([0-9a-f]{16}): /;
+	}
+	return %comp;
+}
+
+# auto_explain's own warning about $setting: [ %Q on its stderr line, jsonlog
+# query_id ].  Either is undef if that carrier has no such line.
+sub warning_qids
+{
+	my ($chunk, $setting) = @_;
+	my $msg =
+	  "auto_explain.log_redact is enabled, but $setting is also active";
+	my ($prefix_qid) =
+	  $chunk->{stderr} =~ /^[^\n]* qid=(-?\d+) [^\n]*LOG:  \Q$msg\E$/m;
+	my @json =
+	  map { "$_->{query_id}" }
+	  grep { $_->{message} eq $msg } json_entries($chunk->{jsonlog});
+	return [ $prefix_qid, $json[0] ];
+}
+
+# ---------------------------------------------------------------------------
+# track_activities turned off partway through a statement.  It is a superuser
+# setting, so a function can SET LOCAL it.  pgstat_report_query_id() then does
+# nothing at all, while pgstat_get_my_query_id() -- which is what %Q and the
+# csvlog/jsonlog field read -- goes on returning the identifier stored for the
+# outer statement before the setting changed.  A clear made through
+# pgstat_report_query_id() was therefore a no-op, and every record written
+# after the SET LOCAL printed the outer statement's identifier.
+#
+# The present half is in the same session: each record's companion entry,
+# written by the same backend immediately before it, still carries the outer
+# identifier.  That shows the backend really was holding it when the record was
+# written, so the zero on the record's line is the clear and not merely a
+# consequence of track_activities being off.
+#
+# The function also reads its own query_id before and after the nested
+# statements, as the restore test above does.  Here a restore that went through
+# pgstat_report_query_id() would leave the clear in place for good, since no
+# later nested statement reports anything either, so after_qid would read NULL.
+# ---------------------------------------------------------------------------
+with_reloaded(
+	{ 'auto_explain.log_redact' => 'on' },
+	sub {
+		$node->safe_psql(
+			'postgres', q{
+CREATE FUNCTION zq_untracked_then_qid(OUT tracking text,
+    OUT before_qid bigint, OUT after_qid bigint)
+LANGUAGE plpgsql AS $$
+BEGIN
+  SET LOCAL track_activities = off;
+  tracking := current_setting('track_activities');
+  SELECT query_id INTO before_qid FROM pg_stat_activity
+    WHERE pid = pg_backend_pid();
+  PERFORM pg_stat_clear_snapshot();
+  PERFORM count(*) FROM zq_t WHERE a > 1;
+  SELECT query_id INTO after_qid FROM pg_stat_activity
+    WHERE pid = pg_backend_pid();
+END $$;
+});
+		my $sql =
+		  'SELECT tracking, before_qid, after_qid FROM zq_untracked_then_qid();';
+		my $qid = explain_query_id($sql);
+
+		my $chunk = run_logged(
+			$node, $sql,
+			{
+				'auto_explain.log_nested_statements' => 'on',
+				'log_min_messages' => 'debug1'
+			});
+
+		my ($tracking, $before, $after) =
+		  $chunk->{out} =~ /^(\w+)\|(-?\d*)\|(-?\d*)$/m;
+		is($tracking, 'off',
+			'untracked: SET LOCAL turned track_activities off in the function'
+		);
+
+		my %rec = stderr_redacted_records($chunk->{stderr});
+		my %comp = stderr_companions($chunk->{stderr});
+		cmp_ok(scalar(keys %rec), '>=', 3,
+			'untracked: the nested and outer statements were logged redacted'
+		);
+		is_deeply([ grep { $_ ne '0' } values %rec ],
+			[], 'untracked: %Q prints 0 on every redacted record line');
+		is_deeply(
+			[ sort keys %comp ],
+			[ sort keys %rec ],
+			'untracked: every redacted record has its companion entry');
+		is_deeply(
+			[ grep { $_ ne $qid } values %comp ],
+			[],
+			'untracked: %Q still prints the outer identifier on every companion line'
+		);
+
+		my %jrec = json_redacted_records($chunk->{jsonlog});
+		my %jcomp = json_companions($chunk->{jsonlog});
+		cmp_ok(scalar(keys %jrec),
+			'>=', 3, 'untracked: jsonlog has the redacted records too');
+		is_deeply([ grep { $_ ne '0' } values %jrec ],
+			[], 'untracked: every redacted jsonlog record has query_id 0');
+		is_deeply(
+			[ grep { !defined $jcomp{$_} || $jcomp{$_} ne $qid } keys %jrec ],
+			[],
+			'untracked: every jsonlog companion still carries the outer identifier'
+		);
+
+		is($before, $qid,
+			'untracked: the function sees the outer statement\'s query identifier'
+		);
+		is($after, $qid,
+			'untracked: after redacted nested records, the outer identifier is back'
+		);
+	});
+
+# ---------------------------------------------------------------------------
+# auto_explain's own warnings.  They are written during the statement whose
+# record follows, so they carried its identifier.  For most of them that told
+# nothing new -- the setting they name already logs the whole statement -- but
+# the allowlist and log_extension_options warnings put one identifier in the
+# log with nothing else to account for it.  Every warning is cleared the same
+# way, so all of them are checked here, not only those two.
+#
+# The present half is the probe's companion entry in the same session: it is
+# written after the warnings and before the record, and keeps the identifier.
+# ---------------------------------------------------------------------------
+with_reloaded(
+	{
+		'auto_explain.log_redact' => 'on',
+		'auto_explain.redact_allow_schemas' => 'public'
+	},
+	sub {
+		my $chunk =
+		  run_logged($node, $probe, { 'log_min_messages' => 'debug1' });
+
+		my $w = warning_qids($chunk,
+			'"public" in auto_explain.redact_allow_schemas');
+		is($w->[0], '0',
+			'allowlist warning: %Q prints 0 on the warning line');
+		is($w->[1], '0', 'allowlist warning: its jsonlog query_id is 0');
+
+		my %comp = json_companions($chunk->{jsonlog});
+		my %scomp = stderr_companions($chunk->{stderr});
+		is_deeply(
+			[ values %comp ],
+			[$probe_qid],
+			'allowlist warning: the companion in the same session carries the identifier (jsonlog)'
+		);
+		is_deeply(
+			[ values %scomp ],
+			[$probe_qid],
+			'allowlist warning: the companion in the same session carries the identifier (%Q)'
+		);
+
+		# The uniform rule: every warning in the session, whatever it names.
+		my @all = $chunk->{stderr} =~
+		  /^[^\n]* qid=(-?\d+) [^\n]*LOG:  auto_explain\.log_redact is enabled, but /mg;
+		cmp_ok(scalar(@all), '>=', 3,
+			'all warnings: log_statement, debug1 and the allowlist were reported'
+		);
+		is_deeply([ grep { $_ ne '0' } @all ],
+			[], 'all warnings: %Q prints 0 on every one of them');
+	});
+
+# The log_extension_options warning.  pg_overexplain registers the option, and
+# is loaded ahead of auto_explain for this session only so that the option
+# passes auto_explain's check hook; nothing else in the file loads it.
+with_reloaded(
+	{ 'auto_explain.log_redact' => 'on' },
+	sub {
+		my $chunk = run_logged(
+			$node, $probe,
+			{
+				'session_preload_libraries' => 'pg_overexplain,auto_explain',
+				'auto_explain.log_extension_options' => 'range_table',
+				'log_min_messages' => 'debug1'
+			});
+
+		my $w = warning_qids($chunk, 'auto_explain.log_extension_options');
+		is($w->[0], '0',
+			'extension options warning: %Q prints 0 on the warning line');
+		is($w->[1], '0',
+			'extension options warning: its jsonlog query_id is 0');
+
+		my %comp = json_companions($chunk->{jsonlog});
+		my %scomp = stderr_companions($chunk->{stderr});
+		is_deeply(
+			[ values %comp ],
+			[$probe_qid],
+			'extension options warning: the companion in the same session carries the identifier (jsonlog)'
+		);
+		is_deeply(
+			[ values %scomp ],
+			[$probe_qid],
+			'extension options warning: the companion in the same session carries the identifier (%Q)'
+		);
+	});
+
 done_testing();

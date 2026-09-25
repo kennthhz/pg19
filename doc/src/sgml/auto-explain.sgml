@@ -377,10 +377,12 @@ LOAD 'auto_explain';
        <varname>application_name</varname> and client address, are written
        unchanged, on the redacted records too.  The exception is the query
        identifier, which is left out of the plan: on the line that carries a
-       redacted plan, <literal>%Q</literal> and the query identifier field of
+       redacted plan, and on the messages <filename>auto_explain</filename>
+       writes to warn about settings that weaken redaction,
+       <literal>%Q</literal> and the query identifier field of
        <literal>csvlog</literal> and <literal>jsonlog</literal> show
        <literal>0</literal>.  Every other line shows it as usual, including
-       other messages written while the same statement runs.  If
+       any other message written while the same statement runs.  If
        <xref linkend="guc-log-min-messages"/> is <literal>debug1</literal> or
        lower, the log also receives the text of every statement whose plan
        was redacted (see <xref linkend="auto-explain-redaction"/>).  Review
@@ -642,7 +644,8 @@ LOG:  duration: 0.210 ms  ref: 3674e079c7cb48e4  plan:
    applies only to the plan records themselves; other log output, including
    the fields that <literal>csvlog</literal> and <literal>jsonlog</literal>
    add to each record, is written as usual, except that the line carrying a
-   redacted plan shows no query identifier.  When a redacted plan is logged,
+   redacted plan, like each of the messages described next, shows no query
+   identifier.  When a redacted plan is logged,
    <filename>auto_explain</filename> writes a message to the log once per
    session if it finds <varname>log_statement</varname> or
    <varname>log_min_duration_statement</varname> enabled, or

@@ -681,6 +681,34 @@ pgstat_report_query_id(int64 query_id, bool force)
 }
 
 /* --------
+ * pgstat_set_my_query_id() -
+ *
+ * Store exactly the given value as this backend's query identifier.
+ *
+ * Unlike pgstat_report_query_id(), this applies neither the top-level rule nor
+ * the track_activities check.  It is for a caller that reads the identifier
+ * with pgstat_get_my_query_id(), changes it for a moment, and must then put
+ * back precisely what it read.  pgstat_get_my_query_id() does not consult
+ * track_activities, so neither may the writer: if the setting was turned off
+ * after the identifier was stored (it can be, with SET LOCAL in a function),
+ * pgstat_report_query_id() would silently do nothing while the stored value
+ * went on being reported by pgstat_get_my_query_id().
+ * --------
+ */
+void
+pgstat_set_my_query_id(int64 query_id)
+{
+	volatile PgBackendStatus *beentry = MyBEEntry;
+
+	if (!beentry || beentry->st_query_id == query_id)
+		return;
+
+	PGSTAT_BEGIN_WRITE_ACTIVITY(beentry);
+	beentry->st_query_id = query_id;
+	PGSTAT_END_WRITE_ACTIVITY(beentry);
+}
+
+/* --------
  * pgstat_report_plan_id() -
  *
  * Called to update top-level plan identifier.
