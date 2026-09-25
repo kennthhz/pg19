@@ -342,12 +342,104 @@ LOAD 'auto_explain';
      </para>
     </listitem>
    </varlistentry>
+
+   <varlistentry id="auto-explain-configuration-parameters-log-redact">
+    <term>
+     <varname>auto_explain.log_redact</varname> (<type>boolean</type>)
+     <indexterm>
+      <primary><varname>auto_explain.log_redact</varname> configuration parameter</primary>
+     </indexterm>
+    </term>
+    <listitem>
+     <para>
+      <varname>auto_explain.log_redact</varname> causes logged plans to be
+      redacted: the names of user-defined objects are replaced by
+      pseudonyms, constants are replaced by <literal>?</literal>, and the
+      query text and parameter values are left out, while the plan shape,
+      costs, row counts and timings are kept.  The redaction is the same as
+      that of the <literal>REDACT</literal> option of
+      <command>EXPLAIN</command>, except that the schemas listed in
+      <varname>auto_explain.redact_allow_schemas</varname> are exempted.
+      <xref linkend="auto-explain-redaction"/> describes what a redacted plan
+      contains.  This parameter is off by default.
+     </para>
+     <warning>
+      <para>
+       Only the plans written by <filename>auto_explain</filename> are
+       redacted; nothing else that the server writes to the log is affected.
+       Statements logged because of <xref linkend="guc-log-statement"/>,
+       <xref linkend="guc-log-min-duration-statement"/> or
+       <xref linkend="guc-log-min-error-statement"/> are written in full,
+       including the text that was removed from the plan.
+       <xref linkend="guc-log-line-prefix"/> is expanded as usual, so
+       <literal>%Q</literal>, for example, still shows the query identifier
+       that is left out of the plan.  The fields that the
+       <literal>csvlog</literal> and <literal>jsonlog</literal> formats attach
+       to every record, such as the user name, database name,
+       <varname>application_name</varname>, client address and query
+       identifier, are written unchanged, on the redacted records too.  If
+       <xref linkend="guc-log-min-messages"/> is <literal>debug1</literal> or
+       lower, the log also receives the text of every statement whose plan
+       was redacted (see <xref linkend="auto-explain-redaction"/>).  Review
+       these settings before relying on redaction.
+      </para>
+     </warning>
+     <para>
+      Unlike the other <filename>auto_explain</filename> parameters, this
+      parameter can only be set in the <filename>postgresql.conf</filename>
+      file or on the server command line.  If a session could change it, a
+      session could turn redaction off for its own statements and write
+      unredacted plans into a log that is read by others.
+     </para>
+    </listitem>
+   </varlistentry>
+
+   <varlistentry id="auto-explain-configuration-parameters-redact-allow-schemas">
+    <term>
+     <varname>auto_explain.redact_allow_schemas</varname> (<type>string</type>)
+     <indexterm>
+      <primary><varname>auto_explain.redact_allow_schemas</varname> configuration parameter</primary>
+     </indexterm>
+    </term>
+    <listitem>
+     <para>
+      <varname>auto_explain.redact_allow_schemas</varname> is a
+      comma-separated list of schemas whose objects keep their real names in
+      redacted plans, for example the schema of a trusted extension.  The
+      names are interpreted as identifiers, so unquoted names are folded to
+      lower case.  Objects in other schemas are still redacted, and only
+      names are exempted: constants are shown as <literal>?</literal> and
+      aliases written in the query are shown as pseudonyms even where they
+      refer to an object in a listed schema.  The list has no effect unless
+      <varname>auto_explain.log_redact</varname> is on, and it does not apply
+      to <command>EXPLAIN (REDACT)</command>, which exempts only
+      <literal>pg_catalog</literal> and <literal>information_schema</literal>.
+      The default is empty.
+     </para>
+     <para>
+      Listing a schema exempts every object in it, including objects created
+      in it later.  A schema that holds application objects, such as
+      <literal>public</literal>, should therefore not be listed.  If
+      <literal>public</literal> is listed, <filename>auto_explain</filename>
+      writes a message saying so to the log once per session.
+     </para>
+     <para>
+      This parameter can only be set in the <filename>postgresql.conf</filename>
+      file or on the server command line, for the same reason as
+      <varname>auto_explain.log_redact</varname>: a session able to change it
+      could exempt its own schema.
+     </para>
+    </listitem>
+   </varlistentry>
   </variablelist>
 
   <para>
    In ordinary usage, these parameters are set
    in <filename>postgresql.conf</filename>, although superusers can alter them
-   on-the-fly within their own sessions.
+   on-the-fly within their own sessions.  The exceptions are
+   <varname>auto_explain.log_redact</varname> and
+   <varname>auto_explain.redact_allow_schemas</varname>, which can only be
+   set in the configuration file or on the server command line.
    Typical usage might be:
   </para>
 
@@ -389,6 +481,238 @@ LOG:  duration: 3.651 ms  plan:
                 ->  Seq Scan on pg_index  (cost=0.00..3.02 rows=92 width=4) (actual time=0.008..3.187 rows=92.00 loops=1)
                       Filter: indisunique
 ]]></screen>
+ </sect2>
+
+ <sect2 id="auto-explain-redaction">
+  <title>Redacted Plans</title>
+
+  <para>
+   When <varname>auto_explain.log_redact</varname> is on, each plan is logged
+   in a form intended to be shared with people who must not learn the names
+   of the database's objects or the data it holds, while still showing how
+   the statement was executed.  The same redaction is available interactively
+   through the <literal>REDACT</literal> option of
+   <xref linkend="sql-explain"/>, which is a convenient way to see what the
+   log will contain.
+  </para>
+
+  <para>
+   In a redacted plan:
+  </para>
+
+  <itemizedlist>
+   <listitem>
+    <para>
+     The name of each user-defined object is replaced by a pseudonym made of
+     a short prefix and a number: <literal>t1</literal> for a table, view,
+     sequence or other relation, <literal>i1</literal> for an index,
+     <literal>f1</literal> for a function, procedure or aggregate,
+     <literal>op1</literal> for an operator, <literal>ty1</literal> for a
+     type, <literal>coll1</literal> for a collation, <literal>trg1</literal>
+     for a trigger, <literal>con1</literal> for a constraint,
+     <literal>cte1</literal> for a <literal>WITH</literal> query,
+     <literal>sp1</literal> for a subplan, <literal>w1</literal> for a
+     window, <literal>fld1</literal> for a field of a composite type, and
+     <literal>cur1</literal> for a cursor.  The schema of a redacted object
+     is not shown.
+    </para>
+   </listitem>
+   <listitem>
+    <para>
+     Aliases written in the query are replaced by <literal>a1</literal>,
+     <literal>a2</literal>, and so on.  A column is shown as the pseudonym or
+     alias of its table followed by a column number, as in
+     <literal>t1_c2</literal> or <literal>a1_c3</literal>.
+    </para>
+   </listitem>
+   <listitem>
+    <para>
+     Every constant, including <literal>NULL</literal>, <literal>true</literal>
+     and <literal>false</literal>, is replaced by <literal>?</literal>
+     followed by its type, as in <literal>?::text</literal>.  Parameter
+     symbols such as <literal>$1</literal> are shown as they are.
+    </para>
+   </listitem>
+   <listitem>
+    <para>
+     XML functions such as <function>xmlelement</function> are shown as
+     <literal>XMLEXPR(...)</literal>, the SQL/JSON query functions
+     <function>JSON_EXISTS</function>, <function>JSON_QUERY</function> and
+     <function>JSON_VALUE</function> as <literal>JSONEXPR(...)</literal>, and
+     the table functions <function>XMLTABLE</function> and
+     <function>JSON_TABLE</function> as <literal>XMLTABLE(...)</literal> and
+     <literal>JSON_TABLE(...)</literal>.  Nothing inside them is shown,
+     because the element, path and column names they contain are chosen by
+     the user.
+    </para>
+   </listitem>
+  </itemizedlist>
+
+  <para>
+   Objects in <literal>pg_catalog</literal> and
+   <literal>information_schema</literal>, and in any schema listed in
+   <varname>auto_explain.redact_allow_schemas</varname>, keep their names, so
+   built-in functions, operators, types and collations appear as usual and
+   the plan remains readable.
+  </para>
+
+  <para>
+   Pseudonyms are assigned separately for each record and start again at 1
+   in every record.  Within one record the same object always has the same
+   pseudonym, so that, for example, a self-join still shows two scans of the
+   same table.  Between records they identify nothing:
+   <literal>t1</literal> in one record and <literal>t1</literal> in another
+   need not be the same table.  The assignment depends only on the plan,
+   though, so a statement that gets the same plan again gets the same
+   pseudonyms again.
+  </para>
+
+  <para>
+   The following are left out of a redacted plan entirely: the query text;
+   the values of query parameters; the settings shown by
+   <varname>auto_explain.log_settings</varname>; the query identifier; and
+   everything that extensions contribute, including the output of foreign
+   data wrappers (such as the remote SQL sent by
+   <literal>postgres_fdw</literal>), the output and name of custom scan
+   providers, and the output of <command>EXPLAIN</command> options added by
+   loadable modules.  If <varname>auto_explain.log_extension_options</varname>
+   is set, its options are ignored, and a message saying so is written to the
+   log once per session.
+  </para>
+
+  <para>
+   Everything else is kept: node types and the shape of the plan, join
+   methods, estimated costs, rows and widths, and, when
+   <varname>auto_explain.log_analyze</varname> is on, actual row counts,
+   loops and timings, buffer, WAL and I/O usage, worker details, trigger
+   timings and JIT timings.
+  </para>
+
+  <para>
+   Because a redacted plan does not include its statement, each redacted
+   record carries a random reference on its first line.  At the same time,
+   <filename>auto_explain</filename> writes a message at level
+   <literal>DEBUG1</literal> that pairs the same reference with the text of
+   the statement.  For example, with
+   <varname>auto_explain.log_analyze</varname> on, a join of tables
+   <structname>customers</structname> (with columns <structfield>id</structfield>,
+   <structfield>name</structfield>, <structfield>ssn</structfield> and
+   <structfield>region</structfield>) and <structname>orders</structname>
+   might be logged as:
+  </para>
+
+<screen><![CDATA[
+DEBUG:  auto_explain ref 3674e079c7cb48e4: SELECT c.name, sum(o.total) FROM customers c JOIN orders o ON o.customer_id = c.id WHERE c.ssn = '123-45-6789' GROUP BY c.name
+LOG:  duration: 0.210 ms  ref: 3674e079c7cb48e4  plan:
+  GroupAggregate  (cost=110.75..110.80 rows=1 width=36) (actual time=0.205..0.207 rows=0.00 loops=1)
+    Group Key: a1.a1_c2
+    ->  Sort  (cost=110.75..110.76 rows=5 width=9) (actual time=0.204..0.205 rows=0.00 loops=1)
+          Sort Key: a1.a1_c2
+          Sort Method: quicksort  Memory: 25kB
+          ->  Hash Join  (cost=19.51..110.69 rows=5 width=9) (actual time=0.180..0.181 rows=0.00 loops=1)
+                Hash Cond: (a2.a2_c2 = a1.a1_c1)
+                ->  Seq Scan on t1 a2  (cost=0.00..78.00 rows=5000 width=9) (actual time=0.073..0.073 rows=1.00 loops=1)
+                ->  Hash  (cost=19.50..19.50 rows=1 width=8) (actual time=0.087..0.087 rows=0.00 loops=1)
+                      Buckets: 1024  Batches: 1  Memory Usage: 8kB
+                      ->  Seq Scan on t2 a1  (cost=0.00..19.50 rows=1 width=8) (actual time=0.087..0.087 rows=0.00 loops=1)
+                            Filter: (a1_c3 = ?::text)
+                            Rows Removed by Filter: 1000
+]]></screen>
+
+  <para>
+   Here <literal>t2</literal> is <structname>customers</structname>,
+   <literal>a1</literal> is its alias <literal>c</literal>, and
+   <literal>a1_c3</literal> is its third column, <structfield>ssn</structfield>.
+   The reference is random and reveals nothing about the statement.  With
+   the default setting of <xref linkend="guc-log-min-messages"/>, the
+   <literal>DEBUG1</literal> message is not written at all, and records
+   cannot be tied back to their statements from the log alone.  If it is
+   written, it contains the full statement and must be handled like any
+   other unredacted statement text; with
+   <xref linkend="guc-log-destination"/> set to <literal>syslog</literal> it
+   is sent at priority <literal>debug</literal>, so the syslog daemon can
+   route it separately from the plans.
+  </para>
+
+  <para>
+   As described under <varname>auto_explain.log_redact</varname>, redaction
+   applies only to the plan records themselves; other log output, including
+   the fields that <literal>csvlog</literal> and <literal>jsonlog</literal>
+   add to each record, is written as usual.  When a redacted plan is logged,
+   <filename>auto_explain</filename> writes a message to the log once per
+   session if it finds <varname>log_statement</varname> or
+   <varname>log_min_duration_statement</varname> enabled, or
+   <literal>DEBUG1</literal> messages being logged, since each of these puts
+   statement text into the log beside the redacted plans.  These messages do
+   not cover every such setting.
+  </para>
+
+  <para>
+   Two limitations should be kept in mind.  The number in a column pseudonym
+   reflects the column's position in its table: <literal>t1_c3</literal> is
+   the third column of <literal>t1</literal>, so a reader learns the
+   column's position and that the table has at least that many columns.  And
+   the values of query parameters are left out entirely, not shown even as
+   placeholders, whereas a constant written into the query appears with its
+   type, as in <literal>?::text</literal>.
+  </para>
+
+  <para>
+   Redaction is meant to make plans safe to share.  It is not a security
+   boundary against anyone who can read the data or change the server's
+   configuration.  It also deliberately keeps information that is needed
+   for diagnosing performance and that can still say something about the
+   schema or the data:
+  </para>
+
+  <itemizedlist>
+   <listitem>
+    <para>
+     The shape of the schema: how many tables a statement uses, whether
+     they are scanned through indexes, how many partitions are scanned, and
+     the number and types of the arguments of a function.
+    </para>
+   </listitem>
+   <listitem>
+    <para>
+     Estimated row counts and widths, which are derived from the statistics
+     collected about the data.
+    </para>
+   </listitem>
+   <listitem>
+    <para>
+     With <varname>auto_explain.log_analyze</varname>, actual row counts and
+     timings.  These can confirm a guess: a reader who suspects the value
+     hidden behind <literal>(a1_c3 = ?::text)</literal> can learn from the
+     row counts whether matching rows exist.
+    </para>
+   </listitem>
+   <listitem>
+    <para>
+     Repetition: since a statement that gets the same plan gets the same
+     pseudonyms, a reader can tell that a statement recurs.
+    </para>
+   </listitem>
+   <listitem>
+    <para>
+     The names of objects in <literal>pg_catalog</literal>,
+     <literal>information_schema</literal> and allowlisted schemas.
+    </para>
+   </listitem>
+  </itemizedlist>
+
+  <para>
+   Sites that pass logs on to other parties may also want to check them with
+   a data-loss-prevention or personal-data detection tool before they leave.
+   Such a tool is a second, independent check, able to catch text shaped like
+   a sensitive value, such as an identifier, a card number or an address,
+   that reached the log by some route redaction does not govern.  It is not
+   a substitute for redaction, because it can only inspect what has already
+   been written, whereas redaction keeps names and values from being written
+   at all.  Nor does it address the retained information listed above: row
+   counts, timings and plan shape do not look like personal data and pass
+   such tools unchanged.
+  </para>
  </sect2>
 
  <sect2 id="auto-explain-author">

@@ -47,6 +47,7 @@ EXPLAIN [ ( <replaceable class="parameter">option</replaceable> [, ...] ) ] <rep
     SUMMARY [ <replaceable class="parameter">boolean</replaceable> ]
     MEMORY [ <replaceable class="parameter">boolean</replaceable> ]
     IO [ <replaceable class="parameter">boolean</replaceable> ]
+    REDACT [ <replaceable class="parameter">boolean</replaceable> ]
     FORMAT { TEXT | XML | JSON | YAML }
 </synopsis>
  </refsynopsisdiv>
@@ -318,6 +319,42 @@ ROLLBACK;
    </varlistentry>
 
    <varlistentry>
+    <term><literal>REDACT</literal></term>
+    <listitem>
+     <para>
+      Remove user-defined names and data values from the output, so that the
+      plan can be shown to someone who must not see the schema or the data.
+      The names of tables, columns, indexes, functions and other user-defined
+      objects, and the aliases written in the query, are replaced by
+      pseudonyms such as <literal>t1</literal>, <literal>a1</literal>,
+      <literal>t1_c2</literal> and <literal>i1</literal>, and their schemas
+      are not shown.  Every constant is replaced by <literal>?</literal>
+      followed by its type, as in <literal>?::integer</literal>.  The query
+      identifier, the settings shown by <literal>SETTINGS</literal>, and any
+      output supplied by extensions or foreign data wrappers are left out.
+      Names of objects in <literal>pg_catalog</literal> and
+      <literal>information_schema</literal> are kept, as are the shape of the
+      plan, costs, row counts and timings.  No other schema is exempted:
+      the list set by
+      <link linkend="auto-explain-configuration-parameters-redact-allow-schemas"><varname>auto_explain.redact_allow_schemas</varname></link>
+      applies only to <xref linkend="auto-explain"/>.
+      See <xref linkend="auto-explain-redaction"/> for a full description of
+      redacted output and of the information it deliberately retains.
+     </para>
+     <para>
+      <literal>REDACT</literal> cannot be combined with
+      <literal>SERIALIZE</literal>, nor with any option added by a loadable
+      module, such as the options of
+      <link linkend="pgoverexplain"><literal>pg_overexplain</literal></link>;
+      either combination raises an error.  Only the output of
+      <command>EXPLAIN</command> is redacted: the statement itself is still
+      logged in full if, for example, <xref linkend="guc-log-statement"/>
+      calls for it.  This parameter defaults to <literal>FALSE</literal>.
+     </para>
+    </listitem>
+   </varlistentry>
+
+   <varlistentry>
     <term><literal>FORMAT</literal></term>
     <listitem>
      <para>
@@ -488,6 +525,20 @@ EXPLAIN (COSTS FALSE) SELECT * FROM foo WHERE i = 4;
 ----------------------------
  Index Scan using fi on foo
    Index Cond: (i = 4)
+(2 rows)
+</programlisting>
+  </para>
+
+  <para>
+   Here is the same plan with names and values redacted:
+
+<programlisting>
+EXPLAIN (COSTS FALSE, REDACT) SELECT * FROM foo WHERE i = 4;
+
+             QUERY PLAN
+------------------------------------
+ Index Scan using i1 on t1
+   Index Cond: (t1_c1 = ?::integer)
 (2 rows)
 </programlisting>
   </para>
