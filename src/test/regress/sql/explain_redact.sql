@@ -2777,6 +2777,37 @@ SELECT count(*) > 0 AS serialize_alone_still_works
  WHERE l LIKE '%Serialize%';
 
 --
+-- FR-95/FR-96, interactive EXPLAIN: the table-function call is collapsed to its
+-- keyword.  Nothing above asserted the placeholder itself -- the sweep rows only
+-- show the markers absent -- so a guard that blanked the call, or dropped the
+-- property, would have passed.  Each redacted line is paired with the same plan
+-- unredacted, which must name the fixture, so neither half is vacuous.
+--
+-- This is the interactive path only.  auto_explain does not print these plans at
+-- all under redaction; it writes a stub record instead (FR-101), tested in
+-- contrib/auto_explain/t/006_redact_table_functions.pl.  The collapse stays here
+-- because this output goes to the user who ran the statement.
+--
+-- PASSING (NULL::xml) rather than a literal document: parsing an XML literal needs
+-- libxml, planning and deparsing XMLTABLE does not.
+--
+SELECT l AS xmltable_redacted
+  FROM zsec_plan($q$SELECT * FROM XMLTABLE(XMLNAMESPACES('http://zsec.example' AS zsec_xns), '/zsec_xr' PASSING (NULL::xml) COLUMNS zsec_xc text PATH 'zsec_xns:zsec_xp')$q$,
+                 'COSTS OFF, VERBOSE, REDACT') AS l
+ WHERE l LIKE '%Table Function Call%';
+SELECT count(*) AS xmltable_plain_names_fixture
+  FROM zsec_plan($q$SELECT * FROM XMLTABLE(XMLNAMESPACES('http://zsec.example' AS zsec_xns), '/zsec_xr' PASSING (NULL::xml) COLUMNS zsec_xc text PATH 'zsec_xns:zsec_xp')$q$,
+                 'COSTS OFF, VERBOSE') AS l
+ WHERE l LIKE '%Table Function Call: XMLTABLE(XMLNAMESPACES%zsec_xns%';
+SELECT l AS json_table_redacted
+  FROM zsec_plan($q$SELECT * FROM JSON_TABLE('{"a":1}'::jsonb, '$' AS zsec_jroot COLUMNS (zsec_jc int PATH '$.a'))$q$,
+                 'COSTS OFF, VERBOSE, REDACT') AS l
+ WHERE l LIKE '%Table Function Call%';
+SELECT count(*) AS json_table_plain_names_fixture
+  FROM zsec_plan($q$SELECT * FROM JSON_TABLE('{"a":1}'::jsonb, '$' AS zsec_jroot COLUMNS (zsec_jc int PATH '$.a'))$q$,
+                 'COSTS OFF, VERBOSE') AS l
+ WHERE l LIKE '%Table Function Call: JSON_TABLE(%zsec_jroot%';
+--
 -- Cleanup.  The fixture schema is dropped so this file leaves no state behind
 -- for other regression tests running in the same database.
 --

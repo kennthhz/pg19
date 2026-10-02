@@ -22,6 +22,7 @@
 #include "common/pg_prng.h"
 #include "executor/instrument.h"
 #include "nodes/makefuncs.h"
+#include "nodes/nodeFuncs.h"
 #include "nodes/value.h"
 #include "parser/scansup.h"
 #include "tcop/tcopprot.h"
@@ -171,6 +172,8 @@ static void restore_query_id(int64 saved_query_id);
 static void emit_reference_entry(const char *token, const char *query_text);
 static void warn_redaction_conflict(const char *setting, const char *why);
 static void check_logging_envelope(void);
+static bool find_table_function(PlanState *planstate, const char **found);
+static const char *plan_omission_reason(QueryDesc *queryDesc);
 static void apply_extension_options(ExplainState *es,
 									auto_explain_extension_options *ext);
 static char *auto_explain_scan_literal(char **endp, char **nextp);
@@ -718,6 +721,67 @@ check_logging_envelope(void)
 }
 
 /*
+ * FR-101: statements whose plan is not written under redaction.
+ *
+ * XMLTABLE and JSON_TABLE are the one construct whose redacted form says
+ * nothing useful and whose unredacted form is all user data: namespace URIs
+ * and names, row and column paths, JSON path names, column names and
+ * defaults.  Interactive EXPLAIN (REDACT) collapses the call to XMLTABLE(...)
+ * or JSON_TABLE(...).  Here the plan is left out altogether and a short
+ * record is written in its place (see explain_ExecutorEnd), so that no part
+ * of the table function's deparse is ever generated for the log, whatever a
+ * future change to the deparse might add.  That is the safer rule for a log
+ * that is kept and shipped.
+ *
+ * The test is on the plan-state tree, not the query text, and so covers a
+ * table function reached through a view, a subquery, a CTE, an init plan or a
+ * sub plan alike.  A function that runs XMLTABLE in a statement of its own is
+ * a nested statement and is tested when that statement ends.
+ *
+ * The range table is consulted as well, as a backstop: a table function whose
+ * scan the planner removed (proven empty, say) leaves its RTE_TABLEFUNC
+ * entry behind.  Nothing of it would be printed, but the rule stays the
+ * simple one -- the statement used a table function -- and errs toward
+ * omitting.  The final range table cannot name which one: setrefs.c clears
+ * rte->tablefunc when it flattens the range table.
+ *
+ * Only called under redaction (FR-62).
+ */
+static bool
+find_table_function(PlanState *planstate, const char **found)
+{
+	if (IsA(planstate->plan, TableFuncScan))
+	{
+		TableFunc  *tf = ((TableFuncScan *) planstate->plan)->tablefunc;
+
+		*found = (tf->functype == TFT_JSON_TABLE) ? "JSON_TABLE" : "XMLTABLE";
+		return true;
+	}
+	return planstate_tree_walker(planstate, find_table_function, found);
+}
+
+static const char *
+plan_omission_reason(QueryDesc *queryDesc)
+{
+	const char *found = NULL;
+	ListCell   *lc;
+
+	if (queryDesc->planstate != NULL &&
+		find_table_function(queryDesc->planstate, &found))
+		return found;
+
+	foreach(lc, queryDesc->plannedstmt->rtable)
+	{
+		RangeTblEntry *rte = lfirst_node(RangeTblEntry, lc);
+
+		if (rte->rtekind == RTE_TABLEFUNC)
+			return "XMLTABLE or JSON_TABLE";
+	}
+
+	return NULL;
+}
+
+/*
  * ExecutorEnd hook: log results if needed
  */
 static void
@@ -739,6 +803,7 @@ explain_ExecutorEnd(QueryDesc *queryDesc)
 		if (msec >= auto_explain_log_min_duration)
 		{
 			ExplainState *es = NewExplainState();
+			const char *omitted = NULL;
 
 			es->redact = auto_explain_log_redact;
 
@@ -784,32 +849,42 @@ explain_ExecutorEnd(QueryDesc *queryDesc)
 			else
 				apply_extension_options(es, extension_options);
 
-			ExplainBeginOutput(es);
-			ExplainQueryText(es, queryDesc);
-			ExplainQueryParameters(es, queryDesc->params, auto_explain_log_parameter_max_length);
-			ExplainPrintPlan(es, queryDesc);
-			if (es->analyze && auto_explain_log_triggers)
-				ExplainPrintTriggers(es, queryDesc);
-			if (es->costs)
-				ExplainPrintJITSummary(es, queryDesc);
-			/* Plugins can bypass every redaction guard (FR-25/D4) */
-			if (explain_per_plan_hook && !es->redact)
-				(*explain_per_plan_hook) (queryDesc->plannedstmt,
-										  NULL, es,
-										  queryDesc->sourceText,
-										  queryDesc->params,
-										  queryDesc->estate->es_queryEnv);
-			ExplainEndOutput(es);
+			/*
+			 * FR-101.  Decided before any output is generated, so that when
+			 * the plan is left out none of it is ever built.
+			 */
+			if (es->redact)
+				omitted = plan_omission_reason(queryDesc);
 
-			/* Remove last line break */
-			if (es->str->len > 0 && es->str->data[es->str->len - 1] == '\n')
-				es->str->data[--es->str->len] = '\0';
-
-			/* Fix JSON to output an object */
-			if (auto_explain_log_format == EXPLAIN_FORMAT_JSON)
+			if (omitted == NULL)
 			{
-				es->str->data[0] = '{';
-				es->str->data[es->str->len - 1] = '}';
+				ExplainBeginOutput(es);
+				ExplainQueryText(es, queryDesc);
+				ExplainQueryParameters(es, queryDesc->params, auto_explain_log_parameter_max_length);
+				ExplainPrintPlan(es, queryDesc);
+				if (es->analyze && auto_explain_log_triggers)
+					ExplainPrintTriggers(es, queryDesc);
+				if (es->costs)
+					ExplainPrintJITSummary(es, queryDesc);
+				/* Plugins can bypass every redaction guard (FR-25/D4) */
+				if (explain_per_plan_hook && !es->redact)
+					(*explain_per_plan_hook) (queryDesc->plannedstmt,
+											  NULL, es,
+											  queryDesc->sourceText,
+											  queryDesc->params,
+											  queryDesc->estate->es_queryEnv);
+				ExplainEndOutput(es);
+
+				/* Remove last line break */
+				if (es->str->len > 0 && es->str->data[es->str->len - 1] == '\n')
+					es->str->data[--es->str->len] = '\0';
+
+				/* Fix JSON to output an object */
+				if (auto_explain_log_format == EXPLAIN_FORMAT_JSON)
+				{
+					es->str->data[0] = '{';
+					es->str->data[es->str->len - 1] = '}';
+				}
 			}
 
 			/*
@@ -880,11 +955,25 @@ explain_ExecutorEnd(QueryDesc *queryDesc)
 				saved_query_id = hide_query_id();
 				PG_TRY();
 				{
-					ereport(auto_explain_log_level,
-							(errmsg("duration: %.3f ms  ref: %s  plan:\n%s",
-									msec, token, es->str->data),
-							 errhidestmt(true),
-							 errhidecontext(true)));
+					/*
+					 * FR-101: the stub keeps the duration and the token, so a
+					 * slow statement still leaves a trace and the companion
+					 * entry still names it.  It is written in this one form
+					 * whatever log_format is, because there is no plan to
+					 * format.
+					 */
+					if (omitted != NULL)
+						ereport(auto_explain_log_level,
+								(errmsg("duration: %.3f ms  ref: %s  plan omitted: statement uses %s, whose contents cannot be redacted",
+										msec, token, omitted),
+								 errhidestmt(true),
+								 errhidecontext(true)));
+					else
+						ereport(auto_explain_log_level,
+								(errmsg("duration: %.3f ms  ref: %s  plan:\n%s",
+										msec, token, es->str->data),
+								 errhidestmt(true),
+								 errhidecontext(true)));
 				}
 				PG_FINALLY();
 				{

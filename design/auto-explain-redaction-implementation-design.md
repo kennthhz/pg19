@@ -721,6 +721,17 @@ Recording these so a later reviewer does not re-litigate them:
   removes. The companion entry carrying token → statement is emitted at
   `DEBUG` level so an operator can route it to a trusted destination
   separately; auto_explain does not attempt to route it itself.
+- **Table-function stub (FR-101, added post-T23).** Under redaction, a
+  statement whose plan uses `XMLTABLE` or `JSON_TABLE` gets
+  `duration: %.3f ms  ref: %s  plan omitted: statement uses %s, whose contents
+  cannot be redacted` instead of a plan. `plan_omission_reason()` decides it
+  before `ExplainBeginOutput()`, from a `TableFuncScan` in the plan-state tree
+  (`planstate_tree_walker`, so init plans and sub plans are covered) or, as a
+  backstop, an `RTE_TABLEFUNC` entry in `plannedstmt->rtable`. The range table
+  cannot be the primary test: `add_rte_to_flat_rtable()` clears
+  `rte->tablefunc`. The stub reuses the token, the companion entry,
+  `hide_query_id()` and `errhidecontext(true)`. Interactive `EXPLAIN (REDACT)`
+  is unaffected.
 
 ## 5. Correctness notes and edge cases
 

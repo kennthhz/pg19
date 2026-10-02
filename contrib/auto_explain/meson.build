@@ -33,6 +33,7 @@ tests += {
       't/003_redact_scan.pl',
       't/004_redact_allow_schemas.pl',
       't/005_redact_query_id.pl',
+      't/006_redact_table_functions.pl',
     ],
   },
 }

@@ -334,6 +334,7 @@ has a test in §10.
 | FR-98 | Names and values that reach output through a *second*, non-primary code path, and are therefore missed by a fix applied only at the primary path: (a) the `COLLATE` and `USING` decorations appended to sort keys, which are assembled from a raw collation-name and a raw operator-name lookup **after** expression deparsing has finished; (b) collation names attached by an explicit `COLLATE` expression and by an `ON CONFLICT` inference element; (c) operator-class names, including their schema qualification, printed for an inference element; (d) constants read directly out of the node datum by the SQL-syntax function printer — the `EXTRACT(<field> FROM …)` field. ~~`IS <form> NORMALIZED`, `NORMALIZE(…, <form>)`~~ *(rev. T14: the two normalization forms are **deliberately kept**. They read like the same pattern, and they are not: the form is a grammar keyword, so no user-derived string can reach those lines. Measured, both variants are syntax errors. Same footing as the built-in operator names FR-19 exempts.)* | per FR-19 / FR-20 / FR-21 as applicable; `opc1` for operator classes |
 | FR-99 | Sequence names. A serial/identity default is printed as `nextval('<sequence>')` in an `INSERT` target list. *(Amends FR-10's object list, which did not name sequences.)* | per FR-10 (`t1`); note the pseudonym is emitted **inside** a quoted literal, so the surrounding `nextval('…')` shape must be preserved (FR-61) |
 | FR-100 | The `CONTEXT` a redacted record's `ereport()` carries in addition to its message *(rev. context leak, post-T23)*. Under `log_nested_statements` a nested plan is written while the caller's error-context callbacks are active, and PL/pgSQL's attaches the nested statement's SQL **verbatim** — real table and column names, literal values — and the name of the function running it. It reached the `CONTEXT:` line of stderr (and of syslog and eventlog, which are written from the same buffer), the context column of csvlog and the `context` field of jsonlog. auto_explain's own warnings (FR-73, FR-75 and the allowlist warning) carried the same text: they are written just before the session's first redacted record, so when that record is nested they sit inside the same context stack. | **omitted**: `errhidecontext(true)` beside `errhidestmt(true)` (FR-70) on the redacted record's `ereport()` and in `warn_redaction_conflict()`. **Kept** on the DEBUG1 companion entry (FR-76), deliberately: it already holds the statement and is meant to be routed somewhere trusted, and its context adds nothing it does not already disclose. **Kept** on unredacted records: off mode is unchanged (FR-62). *Cost:* a redacted nested plan no longer says which function ran it. The mitigation is the reference token: the companion entry pairs it with the nested statement's text and keeps its own `CONTEXT`, which is the same information, routed to a trusted destination. *Not covered:* the client. `send_message_to_frontend()` does not test `hide_ctx`, so at an `auto_explain.log_level` the client is sent (`info` always; `notice` and `warning` at the default `client_min_messages`) the session receives `CONTEXT`. That is its own statement, sent to the user who wrote it, so it discloses nothing; recorded, not changed. *(Found during the query-identifier fix, reading a jsonlog record. No test caught it and the spec named no such path: `plan_record()` in the TAP helpers keeps only the tab-indented lines after a record's first line, and a `CONTEXT:` line starts with the log_line_prefix, so it was never examined. Tests: §10.2, FR-100.)* |
+| FR-101 | The plan of a statement that uses `XMLTABLE` or `JSON_TABLE`, in auto_explain's log *(rev. table-function stub, post-T23)*. The table function's deparse is all user data — namespace URIs and prefixes, row and column paths, path labels, column names and defaults — and FR-95/FR-96's collapse is the only thing between it and the log. | **record replaced by a stub**: under `auto_explain.log_redact` no plan is generated for such a statement, and the record reads `duration: <ms>  ref: <token>  plan omitted: statement uses XMLTABLE, whose contents cannot be redacted` (or `JSON_TABLE`), in that one form whatever `log_format` is. The stub keeps the duration, so a slow statement still leaves a trace, and the token, so the FR-76 companion entry still names it. It is written with the query identifier cleared (FR-37) and without `CONTEXT` (FR-100), like the record it replaces; the FR-73/FR-75 warnings still fire. *Detection*: a `TableFuncScan` anywhere in the plan-state tree (so through a view, a subquery, a CTE, an init plan or a sub plan), or, as a backstop, an `RTE_TABLEFUNC` entry in the final range table — which survives a scan the planner removed, and then the stub says `XMLTABLE or JSON_TABLE` because setrefs.c clears `rte->tablefunc` when it flattens the range table. A statement run inside such a function is a nested statement and is judged on its own plan. *Scope*: auto_explain only. Interactive `EXPLAIN (REDACT)` keeps the collapse: its output goes to the user who ran the statement. Off mode is unchanged (FR-62). *Why*: the collapse is leak-proof by inspection today, but it is one guard in a deparse that future changes can extend; leaving the plan out means none of it is ever built for a log that is kept and shipped. *Given up*: the plan shape of these statements in the log. Tests: §10.2, FR-101. |
 
 ### 5.3 Items that must be preserved
 
@@ -823,10 +824,17 @@ name. The fixture schema needs one more column for this entry, `zcol_xml xml`
 -- Filter is the same node and the same guard.
 SELECT xmlconcat(zcol_xml, zcol_xml) FROM zcustomers;
 -- XMLTABLE: needs VERBOSE (the Table Function Call property)
-SELECT * FROM XMLTABLE(XMLNAMESPACES ('http://x' AS zns_secret),
-                       '/r' PASSING zcol_xml
-                       COLUMNS zxcol_secret text PATH '.');
+SELECT * FROM zcustomers,
+       XMLTABLE(XMLNAMESPACES ('http://x' AS zns_secret),
+                '/r' PASSING zcol_xml
+                COLUMNS zxcol_secret text PATH '.');
 ```
+*(rev. table-function stub: the fixture used to read `FROM XMLTABLE(… PASSING
+zcol_xml …)` with no table in `FROM`, which does not parse — `zcol_xml` names
+no column in scope. The regression file asserts the placeholder with
+`PASSING (NULL::xml)` instead, which needs no fixture table; a bare
+`PASSING NULL::xml` is a syntax error, since `PASSING` takes a restricted
+expression.)*
 Assert: no `zns_secret`, no `zxcol_secret` — and, since the construct is
 collapsed rather than rewritten name by name, assert the placeholder: the
 first prints exactly `XMLEXPR(...)`, the second `XMLTABLE(...)`. There is no
@@ -1383,6 +1391,27 @@ nested statement's context (the entry after the last of them is that
 statement's companion, whose context names the function), have no context
 either. 002_redact.pl's FR-2 test scans whole entries with its `zsec_`
 markers, against an unredacted partner whose `CONTEXT` carries the nested SQL.
+
+**FR-101 — stub record for `XMLTABLE`/`JSON_TABLE`.** [V]
+*(rev. table-function stub, post-T23.)* Fixture: 006_redact_table_functions.pl.
+The `XMLTABLE` fixtures read an empty table: without libxml the function raises
+an error the first time it is evaluated, even over `NULL`, and a failed
+statement never reaches `ExecutorEnd`. Assert, for `XMLTABLE` and
+`JSON_TABLE` reached directly, through a view, a subquery kept by `OFFSET 0`, a
+materialized CTE, a correlated sub plan, an init plan, under
+`log_format = json`, and inside a PL/pgSQL function under
+`log_nested_statements`: exactly one record, in the stub form, naming the
+function, with no plan text and no `zsec` fixture name anywhere in the log
+chunk. A scan the planner removed (`WHERE false`) gives the stub naming
+`XMLTABLE or JSON_TABLE`. Partners in the same configuration: a statement with
+no table function gets its full redacted plan; the outer statement of the
+nested case gets its plan; the DEBUG1 companion pairs the stub's token with
+the statement; interactive `EXPLAIN (REDACT, VERBOSE)` still prints
+`Table Function Call: XMLTABLE(...)` and `JSON_TABLE(...)`; with redaction off
+the full plan and the fixture names are logged. Falsified: with detection
+disabled, 32 of the 66 assertions fail. The regression file asserts the
+interactive placeholders too, each against an unredacted partner that names
+the fixture — no test asserted them before.
 
 ### 10.3 Mode matrix
 

@@ -2290,6 +2290,30 @@ already reached the log, whereas redaction prevents it being written. Also note
 the residual risks in requirements §9 that no scanner addresses: row counts,
 timings and plan shape are not PII-shaped and will pass any DLP tool untouched.
 
+
+#### T24 — Stub record for `XMLTABLE`/`JSON_TABLE` *(added post-T23, by user decision)*
+
+**Goal.** FR-101: under `auto_explain.log_redact`, a statement whose plan uses
+`XMLTABLE` or `JSON_TABLE` gets no plan in the log, only
+`duration: … ref: <token>  plan omitted: statement uses XMLTABLE, whose
+contents cannot be redacted`. Chosen over a silent skip so that a slow
+statement still leaves a trace and the companion entry can still name it.
+auto_explain only; interactive `EXPLAIN (REDACT)` keeps the T13 collapse.
+
+**Done.** `plan_omission_reason()` in auto_explain.c walks the plan-state tree
+for a `TableFuncScan`, with the final range table's `RTE_TABLEFUNC` entries as
+a backstop. The range table alone could not do it: `add_rte_to_flat_rtable()`
+clears `rte->tablefunc`, so the range table cannot tell the two functions
+apart, and reading `rte->tablefunc->functype` there would dereference NULL.
+The decision is made before `ExplainBeginOutput()`, so an omitted plan is never
+built. The off-mode path only gained an indentation level.
+
+**Tests.** New 006_redact_table_functions.pl (see requirements §10.2 FR-101),
+falsified by disabling the detection; and the interactive placeholders in
+explain_redact.sql, which no test asserted before.
+
+**Revert.** Safe: the record goes back to the collapsed plan.
+
 ---
 
 ## 4. Dependency summary
@@ -2358,6 +2382,7 @@ moves: T20 must precede **T21b** specifically, since T21b is what first enters
 
 | Revert | Effect on output | Safe? |
 |---|---|---|
+| T24 | stub record goes back to the collapsed plan | yes |
 | T23 | docs only | yes |
 | T22 | allowlisted schemas re-redact | yes — strictly safer |
 | T21c | verification removed; output unchanged | yes, but do not — it leaves T21b in place with its assurance gone; revert T21b instead |

@@ -548,10 +548,33 @@ LOG:  duration: 3.651 ms  plan:
      <function>JSON_TABLE</function> as <literal>XMLTABLE(...)</literal> and
      <literal>JSON_TABLE(...)</literal>.  Nothing inside them is shown,
      because the element, path and column names they contain are chosen by
-     the user.
+     the user.  This is how <command>EXPLAIN (REDACT)</command> shows them;
+     <filename>auto_explain</filename> does not log such a plan at all, as
+     described next.
     </para>
    </listitem>
   </itemizedlist>
+
+  <para>
+   The plan of a statement that uses <function>XMLTABLE</function> or
+   <function>JSON_TABLE</function> anywhere, including through a view, a
+   subquery or a <literal>WITH</literal> query, is not logged.  A short record
+   is written in its place, with the duration and the reference described
+   below:
+  </para>
+
+<screen><![CDATA[
+LOG:  duration: 812.402 ms  ref: 5d0e3b1f9a2c4e67  plan omitted: statement uses XMLTABLE, whose contents cannot be redacted
+]]></screen>
+
+  <para>
+   The record has this form whatever <varname>auto_explain.log_format</varname>
+   is set to.  It names <literal>XMLTABLE or JSON_TABLE</literal> when the
+   planner removed the table function's scan and can no longer say which it
+   was.  A statement that runs inside such a function, logged under
+   <varname>auto_explain.log_nested_statements</varname>, is judged on its own
+   plan.
+  </para>
 
   <para>
    Objects in <literal>pg_catalog</literal> and
