@@ -34,6 +34,7 @@ tests += {
       't/004_redact_allow_schemas.pl',
       't/005_redact_query_id.pl',
       't/006_redact_table_functions.pl',
+      't/007_redact_log_file.pl',
     ],
   },
 }

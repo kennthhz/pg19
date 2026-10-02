@@ -386,7 +386,9 @@ LOAD 'auto_explain';
        <xref linkend="guc-log-min-messages"/> is <literal>debug1</literal> or
        lower, the log also receives the text of every statement whose plan
        was redacted (see <xref linkend="auto-explain-redaction"/>).  Review
-       these settings before relying on redaction.
+       these settings before relying on redaction.  To share redacted plans,
+       set <varname>auto_explain.redact_log_file</varname> and share that file
+       rather than the server log.
       </para>
      </warning>
      <para>
@@ -436,14 +438,72 @@ LOAD 'auto_explain';
      </para>
     </listitem>
    </varlistentry>
+
+   <varlistentry id="auto-explain-configuration-parameters-redact-log-file">
+    <term>
+     <varname>auto_explain.redact_log_file</varname> (<type>string</type>)
+     <indexterm>
+      <primary><varname>auto_explain.redact_log_file</varname> configuration parameter</primary>
+     </indexterm>
+    </term>
+    <listitem>
+     <para>
+      <varname>auto_explain.redact_log_file</varname> names a file that
+      redacted plans are written to instead of the server log.  A relative
+      path is relative to the data directory.  The file contains only the
+      redacted records, so unlike the server log it can be shared, for
+      example with a support team: failed statements, error messages, the
+      <literal>DEBUG1</literal> reference messages and the per-line fields
+      such as user and database name stay in the server log.  The default is
+      empty, which writes redacted plans to the server log.  The parameter
+      has no effect unless <varname>auto_explain.log_redact</varname> is on;
+      unredacted plans always go to the server log.
+     </para>
+     <para>
+      Each record is one line holding a JSON object with the fields
+      <literal>timestamp</literal> (in UTC), <literal>ref</literal> (the
+      reference described in <xref linkend="auto-explain-redaction"/>),
+      <literal>duration_ms</literal>, and either <literal>plan</literal>,
+      the redacted plan as a string in the format set by
+      <varname>auto_explain.log_format</varname>, or
+      <literal>plan_omitted</literal>, the reason the plan was left out:
+     </para>
+<programlisting>
+{"timestamp":"2026-10-02T23:13:20.102Z","ref":"e6d6d30211e932ce","duration_ms":0.011,"plan":"Seq Scan on t1  (cost=0.00..25.88 rows=6 width=32) (actual time=0.008..0.008 rows=1.00 loops=1)\n  Filter: (t1_c2 = ?::text)"}
+</programlisting>
+     <para>
+      <varname>auto_explain.log_level</varname> does not apply to the file:
+      every redacted record is written to it.  The file is created with the
+      permissions set by <xref linkend="guc-log-file-mode"/>, and is opened
+      for each record, so it can be rotated by renaming it; the next record
+      creates a new file.  Records from concurrent sessions are appended with
+      one write each, which keeps them whole on a local file system; a
+      network file system may not guarantee this.  If a record cannot be
+      written, it is dropped, not written to the server log, and a message
+      saying so is written to the server log, once until a write succeeds
+      again.  While this parameter is set, the messages about
+      <varname>log_statement</varname>,
+      <varname>log_min_duration_statement</varname> and
+      <literal>DEBUG1</literal> logging described in
+      <xref linkend="auto-explain-redaction"/> are not written, because those
+      settings no longer affect the log that holds the redacted plans.
+     </para>
+     <para>
+      This parameter can only be set in the <filename>postgresql.conf</filename>
+      file or on the server command line.  A session able to change it could
+      make the server write a file of its choosing.
+     </para>
+    </listitem>
+   </varlistentry>
   </variablelist>
 
   <para>
    In ordinary usage, these parameters are set
    in <filename>postgresql.conf</filename>, although superusers can alter them
    on-the-fly within their own sessions.  The exceptions are
-   <varname>auto_explain.log_redact</varname> and
-   <varname>auto_explain.redact_allow_schemas</varname>, which can only be
+   <varname>auto_explain.log_redact</varname>,
+   <varname>auto_explain.redact_allow_schemas</varname> and
+   <varname>auto_explain.redact_log_file</varname>, which can only be
    set in the configuration file or on the server command line.
    Typical usage might be:
   </para>

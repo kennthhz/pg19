@@ -12,7 +12,9 @@
  */
 #include "postgres.h"
 
+#include <fcntl.h>
 #include <limits.h>
+#include <unistd.h>
 
 #include "access/parallel.h"
 #include "commands/defrem.h"
@@ -25,9 +27,14 @@
 #include "nodes/nodeFuncs.h"
 #include "nodes/value.h"
 #include "parser/scansup.h"
+#include "pgtime.h"
+#include "postmaster/syslogger.h"
+#include "storage/fd.h"
 #include "tcop/tcopprot.h"
 #include "utils/backend_status.h"
 #include "utils/guc.h"
+#include "utils/json.h"
+#include "utils/timestamp.h"
 #include "utils/varlena.h"
 
 PG_MODULE_MAGIC_EXT(
@@ -48,6 +55,7 @@ static bool auto_explain_log_timing = true;
 static bool auto_explain_log_settings = false;
 static bool auto_explain_log_redact = false;
 static char *auto_explain_redact_allow_schemas = NULL;
+static char *auto_explain_redact_log_file = NULL;
 static int	auto_explain_log_format = EXPLAIN_FORMAT_TEXT;
 static int	auto_explain_log_level = LOG;
 static bool auto_explain_log_nested_statements = false;
@@ -112,6 +120,13 @@ static bool warned_allow_public = false;
  */
 static bool warned_extension_options = false;
 
+/*
+ * FR-102: set when a write to auto_explain.redact_log_file fails, so that the
+ * failure is reported once rather than once per record; cleared by the next
+ * successful write and by a change of the setting.
+ */
+static bool warned_redact_log_file = false;
+
 static const struct config_enum_entry format_options[] = {
 	{"text", EXPLAIN_FORMAT_TEXT, false},
 	{"xml", EXPLAIN_FORMAT_XML, false},
@@ -172,6 +187,12 @@ static void restore_query_id(int64 saved_query_id);
 static void emit_reference_entry(const char *token, const char *query_text);
 static void warn_redaction_conflict(const char *setting, const char *why);
 static void check_logging_envelope(void);
+static void assign_redact_log_file(const char *newval, void *extra);
+static bool redact_log_file_enabled(void);
+static void write_redacted_record(double msec, const char *token,
+								  const char *plan, const char *omitted);
+static void write_redact_log_file(double msec, const char *token,
+								  const char *plan, const char *omitted);
 static bool find_table_function(PlanState *planstate, const char **found);
 static const char *plan_omission_reason(QueryDesc *queryDesc);
 static void apply_extension_options(ExplainState *es,
@@ -290,6 +311,24 @@ _PG_init(void)
 							   GUC_LIST_INPUT,
 							   check_redact_allow_schemas,
 							   assign_redact_allow_schemas,
+							   NULL);
+
+	/*
+	 * FR-102.  PGC_SIGHUP for the reasons log_redact is (D9), and one more: a
+	 * session able to set it could make the server write a file of its
+	 * choosing, and could point the shareable log at a file it reads.
+	 */
+	DefineCustomStringVariable("auto_explain.redact_log_file",
+							   "File that redacted plans are written to instead of the server log.",
+							   "Empty, the default, writes them to the server log. "
+							   "A relative path is relative to the data directory. "
+							   "The file holds nothing but redacted records.",
+							   &auto_explain_redact_log_file,
+							   "",
+							   PGC_SIGHUP,
+							   0,
+							   NULL,
+							   assign_redact_log_file,
 							   NULL);
 
 	DefineCustomBoolVariable("auto_explain.log_verbose",
@@ -721,6 +760,194 @@ check_logging_envelope(void)
 }
 
 /*
+ * FR-102: a log that holds nothing but redacted records.
+ *
+ * The server log cannot be handed to a third party however well the plan
+ * records in it are redacted: the same stream carries the statement text of
+ * every failed statement (log_min_error_statement, on by default), error
+ * messages quoting data values, the companion entries, and an envelope of user,
+ * database, application and client address on every line.  Filtering it
+ * afterwards moves the security boundary into a script, and matching on the
+ * message text is defeated by RAISE LOG.  So when auto_explain.redact_log_file
+ * is set, redacted records are written there and only there, by this module,
+ * and the file contains nothing it did not write.
+ *
+ * One JSON object per line.  The fields are the record's own and nothing else:
+ * the time (UTC, so the session's TimeZone does not reach the file), the
+ * reference token, the duration, and either the plan or the reason it was left
+ * out.  JSON rather than the server log's text because a record must stay one
+ * record: an allowlisted object name may contain a newline, and in a
+ * line-oriented text file that would let a name forge the start of a record.
+ *
+ * Each record is opened, appended with a single write() and closed.  O_APPEND
+ * makes the offset atomic, and on a local file system one write() is not
+ * interleaved with another backend's, so concurrent records do not mix.  This
+ * is not guaranteed on network file systems, which is documented.  Reopening
+ * per record costs two system calls on a path that just formatted a whole
+ * plan, and it means rotation needs no signal: once the file is renamed, the
+ * next record creates a new one.
+ *
+ * A failed write drops the record.  It is never written to the server log
+ * instead: an operator who set this has said the server log is not where
+ * plans go, and falling back would put them there exactly when something is
+ * already wrong.  The failure itself is reported to the server log, once
+ * until a write succeeds again.
+ */
+static void
+assign_redact_log_file(const char *newval, void *extra)
+{
+	warned_redact_log_file = false;
+}
+
+static bool
+redact_log_file_enabled(void)
+{
+	return auto_explain_redact_log_file != NULL &&
+		auto_explain_redact_log_file[0] != '\0';
+}
+
+static void
+write_redact_log_file(double msec, const char *token,
+					  const char *plan, const char *omitted)
+{
+	const char *path = auto_explain_redact_log_file;
+	TimestampTz now = GetCurrentTimestamp();
+	pg_time_t	stamp = timestamptz_to_time_t(now);
+	char		ts[64];
+	StringInfoData buf;
+	int			fd;
+	ssize_t		rc;
+
+	pg_strftime(ts, sizeof(ts), "%Y-%m-%dT%H:%M:%S", pg_gmtime(&stamp));
+
+	initStringInfo(&buf);
+	appendStringInfo(&buf,
+					 "{\"timestamp\":\"%s.%03dZ\",\"ref\":\"%s\",\"duration_ms\":%.3f,",
+					 ts, (int) ((now % USECS_PER_SEC) / 1000), token, msec);
+	if (omitted != NULL)
+	{
+		appendStringInfoString(&buf, "\"plan_omitted\":");
+		escape_json(&buf,
+					psprintf("statement uses %s, whose contents cannot be redacted",
+							 omitted));
+	}
+	else
+	{
+		appendStringInfoString(&buf, "\"plan\":");
+		escape_json(&buf, plan);
+	}
+	appendStringInfoString(&buf, "}\n");
+
+	fd = OpenTransientFilePerm(path, O_WRONLY | O_APPEND | O_CREAT | PG_BINARY,
+							   Log_file_mode);
+	if (fd >= 0)
+	{
+		errno = 0;
+		rc = write(fd, buf.data, buf.len);
+		if (rc == buf.len)
+		{
+			if (CloseTransientFile(fd) == 0)
+			{
+				warned_redact_log_file = false;
+				return;
+			}
+		}
+		else
+		{
+			int			save_errno = (rc < 0) ? errno : ENOSPC;
+
+			CloseTransientFile(fd);
+			errno = save_errno;
+		}
+	}
+
+	if (!warned_redact_log_file)
+	{
+		warned_redact_log_file = true;
+		ereport(LOG,
+				(errcode_for_file_access(),
+				 errmsg("could not write to auto_explain.redact_log_file \"%s\": %m",
+						path),
+				 errdetail("The redacted plan was not logged. Further failures are not reported until a write succeeds."),
+				 errhidestmt(true),
+				 errhidecontext(true)));
+	}
+}
+
+/*
+ * Write one redacted record: the companion entry to the server log, and the
+ * record either to auto_explain.redact_log_file or to the server log.
+ * omitted, when set, names the table function that kept the plan out
+ * (FR-101) and plan is unused.
+ */
+static void
+write_redacted_record(double msec, const char *token,
+					  const char *plan, const char *omitted)
+{
+	int64		saved_query_id;
+
+	if (redact_log_file_enabled())
+	{
+		write_redact_log_file(msec, token, plan, omitted);
+		return;
+	}
+
+	/*
+	 * FR-37: the record's line carries no query identifier.  See
+	 * hide_query_id().  The companion entry keeps its identifier: it holds
+	 * the whole statement, from which the identifier follows.
+	 *
+	 * FR-100: nor any CONTEXT.  Under log_nested_statements the record is
+	 * written while the caller's error-context callbacks are active, and
+	 * PL/pgSQL's attaches the nested statement's SQL, verbatim, and the name
+	 * of the function running it -- the very text the plan withholds, on the
+	 * CONTEXT: line and in the context field of csvlog and jsonlog.
+	 * errhidestmt() alone does not cover it.  The flag reaches every server
+	 * log destination: syslog and eventlog are written from the same buffer
+	 * as stderr.  It does not reach the client, since
+	 * send_message_to_frontend() ignores it, so at a log_level the client is
+	 * sent (info always; notice and warning at the default
+	 * client_min_messages) the session still gets CONTEXT.  That is its own
+	 * statement, sent to the user who wrote it.
+	 *
+	 * The cost: a redacted nested plan no longer says which function ran it.
+	 * The reference token is the mitigation.  The companion entry pairs it
+	 * with the nested statement's text and keeps its own CONTEXT, so the same
+	 * information is there, written at DEBUG1 for routing somewhere trusted.
+	 *
+	 * Neither is needed for redact_log_file: the file has no envelope and no
+	 * CONTEXT to clear.
+	 */
+	saved_query_id = hide_query_id();
+	PG_TRY();
+	{
+		/*
+		 * FR-101: the stub keeps the duration and the token, so a slow
+		 * statement still leaves a trace and the companion entry still names
+		 * it.  It is written in this one form whatever log_format is, because
+		 * there is no plan to format.
+		 */
+		if (omitted != NULL)
+			ereport(auto_explain_log_level,
+					(errmsg("duration: %.3f ms  ref: %s  plan omitted: statement uses %s, whose contents cannot be redacted",
+							msec, token, omitted),
+					 errhidestmt(true),
+					 errhidecontext(true)));
+		else
+			ereport(auto_explain_log_level,
+					(errmsg("duration: %.3f ms  ref: %s  plan:\n%s",
+							msec, token, plan),
+					 errhidestmt(true),
+					 errhidecontext(true)));
+	}
+	PG_FINALLY();
+	{
+		restore_query_id(saved_query_id);
+	}
+	PG_END_TRY();
+}
+
+/*
  * FR-101: statements whose plan is not written under redaction.
  *
  * XMLTABLE and JSON_TABLE are the one construct whose redacted form says
@@ -901,7 +1128,14 @@ explain_ExecutorEnd(QueryDesc *queryDesc)
 			 */
 			if (es->redact)
 			{
-				check_logging_envelope();
+				/*
+				 * FR-102: with redact_log_file set, the redacted records are
+				 * not in the server log, so the settings that put statements
+				 * there no longer sit beside them.  The other two warnings
+				 * are about what the record itself contains and still apply.
+				 */
+				if (!redact_log_file_enabled())
+					check_logging_envelope();
 				warn_allowlisted_public();
 			}
 
@@ -918,68 +1152,11 @@ explain_ExecutorEnd(QueryDesc *queryDesc)
 			if (es->redact)
 			{
 				char	   *token = make_reference_token();
-				int64		saved_query_id;
 
 				emit_reference_entry(token, queryDesc->sourceText);
-
-				/*
-				 * FR-37: the record's line carries no query identifier.  See
-				 * hide_query_id().  The companion entry above keeps its
-				 * identifier: it holds the whole statement, from which the
-				 * identifier follows.
-				 *
-				 * FR-100: nor any CONTEXT.  Under log_nested_statements the
-				 * record is written while the caller's error-context
-				 * callbacks are active, and PL/pgSQL's attaches the nested
-				 * statement's SQL, verbatim, and the name of the function
-				 * running it -- the very text the plan withholds, on the
-				 * CONTEXT: line and in the context field of csvlog and
-				 * jsonlog.  errhidestmt() alone does not cover it.  The flag
-				 * reaches every server log destination: syslog and eventlog
-				 * are written from the same buffer as stderr.  It does not
-				 * reach the client, since send_message_to_frontend() ignores
-				 * it, so at a log_level the client is sent (info always;
-				 * notice and warning at the default client_min_messages) the
-				 * session still gets CONTEXT.  That is its own statement,
-				 * sent to the user who wrote it.
-				 *
-				 * The cost: a redacted nested plan no longer says which
-				 * function ran it.  The reference token is the mitigation.
-				 * The companion entry pairs it with the nested statement's
-				 * text and keeps its own CONTEXT, so the same information is
-				 * there, written at DEBUG1 for routing somewhere trusted.
-				 *
-				 * The unredacted record below keeps its CONTEXT: off mode is
-				 * unchanged (FR-62).
-				 */
-				saved_query_id = hide_query_id();
-				PG_TRY();
-				{
-					/*
-					 * FR-101: the stub keeps the duration and the token, so a
-					 * slow statement still leaves a trace and the companion
-					 * entry still names it.  It is written in this one form
-					 * whatever log_format is, because there is no plan to
-					 * format.
-					 */
-					if (omitted != NULL)
-						ereport(auto_explain_log_level,
-								(errmsg("duration: %.3f ms  ref: %s  plan omitted: statement uses %s, whose contents cannot be redacted",
-										msec, token, omitted),
-								 errhidestmt(true),
-								 errhidecontext(true)));
-					else
-						ereport(auto_explain_log_level,
-								(errmsg("duration: %.3f ms  ref: %s  plan:\n%s",
-										msec, token, es->str->data),
-								 errhidestmt(true),
-								 errhidecontext(true)));
-				}
-				PG_FINALLY();
-				{
-					restore_query_id(saved_query_id);
-				}
-				PG_END_TRY();
+				write_redacted_record(msec, token,
+									  omitted ? NULL : es->str->data,
+									  omitted);
 			}
 			else
 				ereport(auto_explain_log_level,

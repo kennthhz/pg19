@@ -2314,6 +2314,26 @@ explain_redact.sql, which no test asserted before.
 
 **Revert.** Safe: the record goes back to the collapsed plan.
 
+#### T25 — `auto_explain.redact_log_file` *(added post-T23, by user decision)*
+
+**Goal.** FR-102: a file holding only redacted records, to be shared with
+support instead of the server log. Chosen over filtering the server log
+afterwards, which puts the security boundary in a script and matches on
+message text that `RAISE LOG` can imitate.
+
+**Done.** `write_redacted_record()` now writes every redacted record (plan
+or stub) either to the server log, as before, or through
+`write_redact_log_file()` to the file. JSON lines; open, one `write()`,
+close per record; drop and report once on failure. The companion entry and
+the warnings stay in the server log; the FR-75 envelope warnings are skipped
+in file mode.
+
+**Tests.** New 007_redact_log_file.pl (see requirements §10.2 FR-102).
+
+**Revert.** Safe in the sense of §1.1 only if the operator stops sharing the
+file: reverting sends redacted records back to the server log, which is not
+shareable.
+
 ---
 
 ## 4. Dependency summary
@@ -2382,6 +2402,7 @@ moves: T20 must precede **T21b** specifically, since T21b is what first enters
 
 | Revert | Effect on output | Safe? |
 |---|---|---|
+| T25 | redacted records go back to the server log | yes, but the shared file stops being written |
 | T24 | stub record goes back to the collapsed plan | yes |
 | T23 | docs only | yes |
 | T22 | allowlisted schemas re-redact | yes — strictly safer |

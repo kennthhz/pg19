@@ -732,6 +732,14 @@ Recording these so a later reviewer does not re-litigate them:
   `rte->tablefunc`. The stub reuses the token, the companion entry,
   `hide_query_id()` and `errhidecontext(true)`. Interactive `EXPLAIN (REDACT)`
   is unaffected.
+- **Separate redacted log (FR-102, added post-T23).**
+  `auto_explain.redact_log_file`: when set, `write_redacted_record()` sends
+  the record to `write_redact_log_file()` instead of `ereport()`. One JSON
+  line per record (`escape_json`), `OpenTransientFilePerm(O_APPEND | O_CREAT,
+  Log_file_mode)`, a single `write()`, `CloseTransientFile()`. On failure the
+  record is dropped and one `LOG` is written to the server log until the next
+  success (latch re-armed by the assign hook). `hide_query_id()` and
+  `errhidecontext()` are not needed for the file, which has no envelope.
 
 ## 5. Correctness notes and edge cases
 
