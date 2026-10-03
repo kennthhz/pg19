@@ -520,8 +520,10 @@ a commit series, but the option must not become visible until the last commit.
 - Reject `REDACT` + `SERIALIZE` and `REDACT` + any extension-registered option
   with an `ERROR` (FR-72/FR-29).
 - Notices: FR-75 (one-time-per-session when `log_statement`,
-  `log_min_duration_statement` or a `%q` `log_line_prefix` is active) and
-  FR-73 (extension options skipped).
+  `log_min_duration_statement` or DEBUG1 logging is active) and
+  FR-73 (extension options skipped). *(rev. cleanup, post-T25: the `%q`
+  `log_line_prefix` trigger was dropped in T23. `%q` prints nothing; see
+  requirements FR-75 and FR-37 for `%Q`.)*
 - Keep `errhidestmt(true)` (FR-70).
 
 **Tests.** This is where the §10 catalog earns its keep. Every §10.2 fixture,
@@ -600,9 +602,10 @@ avoids a second initdb and the suite's own parallel groups are left intact.
   `PG_REGRESS` are.
 - The scan reads **only** auto_explain's plan records, not the log file. Three
   other things put user names into the same file: `PostgreSQL::Test::Cluster`
-  defaults (`log_statement = all` and a `%q` prefix, both overridden here and the
-  override asserted), the error messages the suite provokes on purpose, and T05's
-  companion entries.
+  defaults (`log_statement = all`, overridden here and the override asserted),
+  the error messages the suite provokes on purpose, and T05's companion entries.
+  *(rev. cleanup, post-T25: this also listed Cluster.pm's `%q` prefix. `%q`
+  prints nothing, so it put no names in the file.)*
 
 **The allowlist stayed empty**, which was the point. One false positive appeared
 and was fixed without weakening the oracle: `Conflict Resolution` can print
@@ -1885,9 +1888,9 @@ step 1 and step 2 are now separate commits rather than two bullets. There are
 **two distinct `redact` fields** in `ruleutils.c`, on two different structs, set
 by two different functions. Writing one does not write the other.
 
-| | `deparse_namespace.redact` (ruleutils.c:146) | `deparse_context.redact` (ruleutils.c:220) |
+| | `deparse_namespace.redact` (ruleutils.c:220) | `deparse_context.redact` (ruleutils.c:146) |
 |---|---|---|
-| set by | `deparse_context_for_plan_tree_redacted()` only — `dpns->redact = redact` at **:3890**, and `select_rtable_names_for_explain_redacted()` at **:4013** | `deparse_expression_pretty()` only, from its parameter — `context.redact = redact` at **:3780**, which is what `deparse_expression_redacted()` (`:3730`) passes |
+| set by | `deparse_context_for_plan_tree_redacted()` (`dpns->redact = redact`) and `select_rtable_names_for_explain_redacted()` (on its local `dpns`); cleared by `set_deparse_for_query()`'s memset | `deparse_expression_pretty()`, from its parameter — what `deparse_expression_redacted()` passes; also `get_query_def()`, from its parameter, and since T21b `get_window_frame_options_for_explain()`, which builds its own context and recovers the map with `deparse_context_redaction()`. Set to NULL in `pg_get_triggerdef_worker()` and `make_ruledef()` |
 | installed when | the deparse **context is built**, before any expression is deparsed | each **individual expression** is deparsed |
 | read for | relation aliases (**:3960–3968**, **:4150–4159**) and **column names**, via `explain_redact_column()` at **:4783–4799** | every leaf emitter T09–T14 and T19 landed: constants, function names, operators, types, collations, sub-plan names, window names |
 | owned by | **T21a** | **T21b** |
@@ -1938,6 +1941,13 @@ and that it is a latent hazard nonetheless. Whoever does T21a must read that
 comment before deciding the guard's placement, because the guard and this hazard
 interact: a namespace that has had its handle memset away no longer looks
 redacting to any check that tests the namespace.
+*(rev. cleanup, post-T25: line numbers in this section are as of T21a and have
+moved; the table above now names functions instead. The struct lines were
+swapped — `deparse_context.redact` is the earlier of the two — and the memset
+is in `set_deparse_for_query()` at about `:4353` now. "Only" was wrong for both
+writers: the table lists them all. "Nothing in the backend calls either" was
+true at T21a and stopped being true at T21b, when explain.c's expression call
+sites were converted.)*
 
 **Decide or defer before starting.** Two spec questions are recorded as
 unresolved in the requirements, and T21 is where each stops being theoretical.
@@ -2191,7 +2201,31 @@ negative control, because `<` is text's `lt_opr` and `show_sortorder_options()`
 prints `USING` only for an operator that is neither `lt_opr` nor `gt_opr`, so
 `ORDER BY x USING <` prints no decoration in either mode and an assertion on it
 is vacuous. The reachable exempt control is `~<~` (text_pattern_ops, in
-`pg_catalog`), which T21b smoke-tested.)*
+`pg_catalog`), which T21b smoke-tested.
+
+Two more things whoever resumes T21c needs, both from the T21b notes
+(`design/.t21b-notes.md`):
+- *The node-label limit.* Item 1's "own-surface" accounting matches a fixture's
+  marker to a property label and asks whether that label is present in the
+  redacted record. That cannot work for a marker on a node line (`Seq Scan on
+  zsec_customers`), where the label is the name itself: T21b found 10 of 30
+  rows like this and checked them by reading the redacted line instead. A
+  standing version of the sweep has to treat node lines separately. The same
+  limit applies to the tripwire in text format, which never sees node labels,
+  relation names or index names because explain.c writes them straight to
+  `es->str`; the other three formats do pass them through the property
+  writers.
+- *Measuring the diff.* The T21b notes say `regression.diffs` is "capped by
+  pg_regress at 26 hunks". It is not capped. pg_regress writes it with
+  `diff -U3`, which merges changes closer than three lines into one hunk; a
+  plain `diff` of the same files shows 68 separate changes. Count changed lines,
+  not hunks.
+
+Informally, the adversarial probe of 2026-10-02 (requirements §9, "Constants
+echoed by row counts") ran 135 query shapes with expressions live in all four
+formats, including a user-defined collation in a sort key, and found no leak
+the T21c items would have caught. That is evidence, not a discharge: none of it
+is committed as a test.)*
 
 **Goal.** Discharge everything the plan has been accumulating against T21. Adds
 tests only; changes no behavior. Splitting it out is not bookkeeping — it is the

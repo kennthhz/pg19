@@ -928,10 +928,9 @@ ExplainPrintPlan(ExplainState *es, QueryDesc *queryDesc)
 	 * property print as an alias, and it is also what the deparse-context
 	 * call just below builds its context from.  So every expression
 	 * eventually printed through that context refers to relations by whatever
-	 * this list holds.  Expression output is still suppressed today, which is
-	 * the only reason a real alias here would have been harmless; leaving it
-	 * real would turn into a live leak the moment T21b re-enables
-	 * expressions.
+	 * this list holds.  Expressions are printed under redaction, so a real
+	 * alias left here would reach every Filter, Output and key that names the
+	 * relation.
 	 */
 	if (es->redact)
 	{
@@ -3259,14 +3258,11 @@ show_sort_group_keys(PlanState *planstate, const char *qlabel,
  * sites, because one of its callers is pg_get_indexdef() and DDL must never
  * redact.
  *
- * THE GUARD IS DORMANT AS LANDED, and that is a property of the surface rather
- * than an oversight.  The only caller, show_sort_group_keys(), returns early
- * under redaction because a decoration is appended to the deparsed key string,
- * and there is no printing " COLLATE coll1" without the expression it decorates.
- * The expression is T21's surface.  So this function is not reached under
- * redaction today and T20 changes no output; T21 is the task that makes it
- * observable.  It has to land first all the same, because the moment T21 lifts
- * that return an unguarded version here would print a real collation name.
+ * The only caller is show_sort_group_keys(), which appends this decoration to
+ * the deparsed key, so the guard is reached whenever a redacted sort key is
+ * printed.  T20 landed it while that caller still returned early under
+ * redaction; T21b lifted the return, and from then on an unguarded version here
+ * would have printed a real collation or operator name.
  *
  * Exemption is not tested separately because explain_redact_name() decides it and
  * answers with the real name when it applies.  That is what keeps the useful

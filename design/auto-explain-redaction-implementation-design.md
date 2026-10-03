@@ -503,8 +503,8 @@ New in v1.2:
   `rte->eref->aliasname` fallback at explain.c:5042 as `ExplainTargetRel`.
   Route both through layer C.
 - **`show_sortorder_options()` — post-deparse decorations (FR-98a).**
-  explain.c:2866 appends `COLLATE <get_collation_name(collation)>` and 2881
-  appends `USING <get_opname(sortOperator)>` onto the already-deparsed sort-key
+  explain.c:3319 appends `COLLATE <collation name>` and 3341
+  appends `USING <operator name>` onto the already-deparsed sort-key
   string. These run in explain.c *after* `deparse_expression()` returns, so no
   ruleutils-side change reaches them. `get_opname` also bypasses
   `generate_operator_name`, which is FR-19's hook. Both are `elog(ERROR)` on
@@ -704,8 +704,12 @@ Recording these so a later reviewer does not re-litigate them:
      that lands mid-statement cannot produce a half-redacted record: the next
      record simply formats under the new setting.
 - One-time-per-session `LOG` notice when `log_statement`,
-  `log_min_duration_statement`, or a `%q`-bearing `log_line_prefix` would
-  leak unredacted information into the same stream (FR-75).
+  `log_min_duration_statement`, or DEBUG1 logging (the companion entries)
+  would put unredacted statement text into the same stream (FR-75).
+  *(rev. cleanup, post-T25: this said a `%q`-bearing `log_line_prefix`. `%q`
+  prints nothing; it only marks where the prefix stops for non-session
+  processes. The escape that carried something was `%Q`, handled on the
+  record's own line by FR-37 rather than warned about.)*
 - auto_explain never sets `es->serialize` (FR-72).
 - **Correlation token (FR-76).** `errhidestmt(true)` strips the `STATEMENT:`
   line, and the existing comment in `explain_ExecutorEnd` says the module
@@ -740,6 +744,25 @@ Recording these so a later reviewer does not re-litigate them:
   record is dropped and one `LOG` is written to the server log until the next
   success (latch re-armed by the assign hook). `hide_query_id()` and
   `errhidecontext()` are not needed for the file, which has no envelope.
+- **Post-T23 fixes to the server-log record (FR-37, FR-100, FR-73).**
+  - *Query identifier.* `%Q` and the csvlog/jsonlog `query_id` field read the
+    backend's current identifier when a line is written, so the record's line
+    carried the identifier the plan withholds. `hide_query_id()` /
+    `restore_query_id()` clear it around the record's `ereport()` and around
+    each warning, restoring in `PG_FINALLY`. They use a new core function,
+    `pgstat_set_my_query_id()` in backend_status.c, rather than
+    `pgstat_report_query_id()`, which does nothing when `track_activities`
+    is off and so could not clear an identifier stored before it was turned
+    off. Writing `MyBEEntry` from contrib was rejected.
+  - *CONTEXT.* `errhidecontext(true)` on the record and the warnings: under
+    `log_nested_statements`, PL/pgSQL's error-context callback attached the
+    nested statement's SQL and the function name. The DEBUG1 companion keeps
+    its CONTEXT, which is how an operator recovers the function. The client
+    still receives CONTEXT at a `log_level` it is sent, since
+    `send_message_to_frontend()` ignores the flag.
+  - *Warning latches.* Each warning is latched by a file-scope static, re-armed
+    by the relevant setting's assign hook, so a reload that changes the
+    setting is reported again; `log_extension_options` gained one.
 
 ## 5. Correctness notes and edge cases
 

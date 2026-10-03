@@ -303,8 +303,7 @@ INSERT INTO zsec_fixtures (fr, note, opts, zsec_expect, qry) VALUES
 -- because a column name in a plan is worth pinning, but it is an FR-12 fixture
 -- wearing an FR-93 label.  Reaching get_rte_attribute_name() needs a whole-row
 -- Var of type RECORD behind an enclosing Var; that shape is exercised in
--- src/test/modules/test_explain_redact, which is the only place a layer-B guard
--- executes at all until T21b.
+-- src/test/modules/test_explain_redact, which calls the deparse directly.
 ('FR-93', 'whole-row field reference', 'COSTS OFF, VERBOSE', 'zsec_ssn',
  'SELECT (zsec_c).zsec_ssn FROM zsec_customers zsec_c'),
 -- NB: the "composite field assignment" fixture is NOT here.  T01 could find no
@@ -314,15 +313,13 @@ INSERT INTO zsec_fixtures (fr, note, opts, zsec_expect, qry) VALUES
 -- negative-control section.
 -- FR-96: JSON path and PASSING labels.
 --
--- READ THE REDACTED VERDICT FOR THESE TWO ROWS AS "NO SIGNAL", NOT AS "VERIFIED".
--- Both labels live inside an expression property, and T04 suppresses every
--- expression property wholesale until T15-T21, so the sweep below greps a plan
--- from which the marker is absent because nothing was printed at all.  The
--- unredacted rows in the positive-control phase are genuine -- the marker is
--- found there -- but the inverted rows are vacuous, and T13 made no attempt to
--- fix that here because the fix is a change to the sweep's design, which belongs
--- to its own task.  Demonstrated immediately after the sweep rather than merely
--- asserted.  The real coverage for FR-95/FR-96 is
+-- Both labels live inside an expression property.  Until T21b every expression
+-- property was suppressed under redaction, so these two inverted rows grepped a
+-- plan with nothing in it and carried no signal.  *(rev. cleanup, post-T25: they
+-- are genuine now.  The property is printed under redaction, collapsed to
+-- JSON_TABLE(...) and JSONEXPR(...), so the marker is absent from a property
+-- that is there.  The placeholders themselves are asserted near the end of this
+-- file.)*  The deparse-level coverage for FR-95/FR-96 is
 -- src/test/modules/test_explain_redact, which deparses the expression directly
 -- and can therefore see the XMLEXPR(...) / JSONEXPR(...) placeholder that proves
 -- the construct was collapsed rather than blanked.
@@ -915,13 +912,13 @@ SELECT f.fr,
  FR-99  | nextval sequence name         | clean
 (30 rows)
 
--- The two FR-96 rows in that result read "clean" and carry no signal, for the
--- reason recorded at their catalog entries.  Shown rather than claimed: the
--- property that would carry each label is printed without REDACT and is absent
--- with it, so the sweep had nothing to grep either way.  Both counts must be
--- non-zero on the left and zero on the right; a zero on the left would mean the
--- fixture had stopped reaching the property for some unrelated reason, which
--- would make the right-hand zero mean nothing.
+-- The two FR-96 rows in that result read "clean".  *(rev. cleanup, post-T25:
+-- this note used to say they carry no signal, and the two counts below used to
+-- read non-zero on the left and zero on the right, because the property that
+-- carries each label was absent under REDACT.  Since T21b both counts are 1: the
+-- property is printed in both modes, collapsed under REDACT, so "clean" means
+-- the label is absent from a property that is present.  A zero on the left
+-- would mean the fixture had stopped reaching the property.)*
 --
 -- This was the same vacuity as 33 other inverted rows of this file -- the 28
 -- sweep rows above plus the FR-16 index, two FR-92 and parallel-plan rows below
@@ -950,8 +947,10 @@ SELECT f.fr,
 -- in a Filter or Output.  The rest wait on the task that owns their surface:
 -- T17 for FR-14 and FR-18, T18 for FR-17, T19 for FR-90 and
 -- FR-91 *(rev. T19: both landed, see below)*, T20 for FR-98a, T21 for FR-12,
--- FR-20, FR-21, FR-46, FR-93, FR-97, FR-98d, FR-99 and FR-13b.  The two FR-96 rows are collapsed by design and
--- will stay vacuous here for good; their real coverage is the test module.
+-- FR-20, FR-21, FR-46, FR-93, FR-97, FR-98d, FR-99 and FR-13b.  The two FR-96 rows are collapsed by design.
+-- *(rev. cleanup, post-T25: T21b printed expressions, so the rows that waited
+-- on T21 now grep a printed property, and so do the two FR-96 rows -- see the
+-- note above the counts below.)*
 --
 -- T16 converted two more *(rev. T16)*, which are the two this file holds for
 -- FR-16:
@@ -3384,14 +3383,12 @@ SELECT lbls AS subplan_name_pseudonyms,
 -- becomes an InitPlan, the correlated one a SubPlan, and they take different
 -- plan_ids and therefore different spN.
 --
--- WHAT IS NOT OBSERVABLE HERE, stated rather than quietly skipped.  The other
--- printer of a non-CTE sub-plan's name is ruleutils.c, inside a deparsed
--- expression -- "(InitPlan sp1).col1" in a Filter -- and every expression
--- property is still suppressed, so the label and the reference cannot appear in
--- one record until T21.  The agreement is covered where it can be covered today:
--- src/test/modules/test_explain_redact deparses the expression directly and sees
--- the reference.  What this fixture covers is the label, and that two sub-plans
--- do not collide.
+-- The other printer of a non-CTE sub-plan's name is ruleutils.c, inside a
+-- deparsed expression -- "(InitPlan sp1).col1" in an Index Cond, "(SubPlan sp2)"
+-- in a Filter.  *(rev. cleanup, post-T25: this note said the reference could not
+-- appear beside the label until T21, because expressions were suppressed.  They
+-- are printed now, so the check below also asserts that each label and its
+-- reference carry the same pseudonym.)*
 --
 SELECT * FROM zsec_plan('SELECT zsec_id FROM zsec_customers zsec_c WHERE zsec_bal > (SELECT max(zsec_amt) FROM zsec_orders) AND zsec_bal > (SELECT max(zsec_amt) FROM zsec_orders zsec_o WHERE zsec_o.zsec_id = zsec_c.zsec_id)', 'COSTS OFF, REDACT');
                   zsec_plan                  
@@ -3415,6 +3412,14 @@ SELECT CASE
          WHEN (regexp_match(b, 'InitPlan (sp[0-9]+)'))[1]
               = (regexp_match(b, 'SubPlan (sp[0-9]+)'))[1]
            THEN 'FAIL: two sub-plans share one pseudonym'
+         -- Labels are read from their own lines, references from inside an
+         -- expression, so neither side of each comparison can match the other.
+         WHEN (regexp_match(b, '(?n)^\s*InitPlan (sp[0-9]+)$'))[1]
+              IS DISTINCT FROM (regexp_match(b, '\(InitPlan (sp[0-9]+)\)\.col1'))[1]
+           THEN 'FAIL: InitPlan reference does not match its label'
+         WHEN (regexp_match(b, '(?n)^\s*SubPlan (sp[0-9]+)$'))[1]
+              IS DISTINCT FROM (regexp_match(b, '\(SubPlan (sp[0-9]+)\)'))[1]
+           THEN 'FAIL: SubPlan reference does not match its label'
          ELSE 'ok: InitPlan ' || (regexp_match(b, 'InitPlan (sp[0-9]+)'))[1]
               || ' and SubPlan ' || (regexp_match(b, 'SubPlan (sp[0-9]+)'))[1]
               || ' are distinct'

@@ -3722,11 +3722,9 @@ deparse_expression(Node *expr, List *dpcontext,
  * Passing NULL is well defined and means "do not redact", which makes this a
  * safe drop-in wherever the caller may or may not be redacting.
  *
- * Nothing in the tree calls this yet.  The substitution the RedactCtx enables
- * is added one emission site at a time in later work, and EXPLAIN goes on
- * suppressing expressions outright until all of those sites are done -- so this
- * entry point exists ahead of its callers deliberately, and adding it changes
- * no output.
+ * EXPLAIN calls this for every expression property it prints (show_expression,
+ * the plan's target list, sort and group keys), passing NULL when it is not
+ * redacting.
  */
 char *
 deparse_expression_redacted(Node *expr, List *dpcontext,
@@ -4219,11 +4217,19 @@ set_rtable_names(deparse_namespace *dpns, List *parent_namespaces,
 		 *
 		 * This has to happen here rather than after the loop, and the reason
 		 * is the uniquifier immediately below: it appends _1, _2 to break
-		 * ties between colliding names.  Substituting afterwards would either
-		 * collide with an already-assigned pseudonym or leave a name like
-		 * "t1_1", which carries a fragment of nothing and invites the reader
-		 * to think the suffix means something.  Substituting first makes the
-		 * uniquifier a no-op, because generated names cannot collide (FR-47).
+		 * ties between colliding names.  Substituting afterwards would run it
+		 * over the real names, so its suffixes would follow their collisions
+		 * rather than the pseudonyms', and a real name that happened to look
+		 * like a pseudonym could collide with one.  Substituting first means
+		 * it only ever sees pseudonyms.
+		 *
+		 * It is not a no-op, though.  Two unaliased range-table entries for
+		 * the same relation -- one written directly and one reached through a
+		 * view, say -- are keyed by the same OID and both get "t1", and the
+		 * uniquifier then names the second "t1_1".  That discloses nothing:
+		 * the suffix is derived from the pseudonym, and unredacted output
+		 * prints the same shape ("zsec_t_1").  Aliases and non-relation
+		 * entries are keyed by range-table index and do not collide (FR-47).
 		 *
 		 * Two different pseudonym kinds, and the split is what keeps this
 		 * consistent with the relation name printed separately by
@@ -11951,10 +11957,6 @@ get_windowfunc_expr_helper(WindowFunc *wfunc, deparse_context *context,
 					 * this "OVER wN" and show_window_def()'s "Window: wN" the
 					 * same number for the same window.  See
 					 * redact_window_name().
-					 *
-					 * Dormant until T21: an "Output" list is a deparsed
-					 * expression and is still suppressed, so nothing prints
-					 * here in a redacted EXPLAIN yet.
 					 */
 					if (context->redact != NULL)
 						appendStringInfoString(buf,
@@ -12310,9 +12312,9 @@ get_coercion_expr(Node *arg, deparse_context *context,
 	/*
 	 * Never emit resulttype(arg) functional notation. A pg_proc entry could
 	 * take precedence, and a resulttype in pg_temp would require schema
-	 * qualification that redact_format_type(, context->redact) would usually
-	 * omit. We've standardized on arg::resulttype, but CAST(arg AS
-	 * resulttype) notation would work fine.
+	 * qualification that format_type_with_typemod() would usually omit. We've
+	 * standardized on arg::resulttype, but CAST(arg AS resulttype) notation
+	 * would work fine.
 	 */
 	appendStringInfo(buf, "::%s",
 					 redact_format_type(resulttype, resulttypmod, context->redact));
@@ -12560,10 +12562,9 @@ get_const_expr(Const *constval, deparse_context *context, int showtype)
 	 * type itself and a cast inserted here would land in the middle of its
 	 * output. The type information survives either way.
 	 *
-	 * The type and collation names printed below are still the real ones;
-	 * they are separate objects with their own requirement (FR-20) and are
-	 * pseudonymized in T11.  Nothing is exposed in the meantime, since
-	 * EXPLAIN suppresses expressions entirely until T21.
+	 * The type and collation names printed below are separate objects with
+	 * their own requirement (FR-20): redact_format_type() and
+	 * get_const_collation() substitute pseudonyms for user-defined ones.
 	 */
 	if (context->redact != NULL)
 	{
