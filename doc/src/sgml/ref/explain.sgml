@@ -329,7 +329,8 @@ ROLLBACK;
       pseudonyms such as <literal>t1</literal>, <literal>a1</literal>,
       <literal>t1_c2</literal> and <literal>i1</literal>, and their schemas
       are not shown.  Every constant is replaced by <literal>?</literal>
-      followed by its type, as in <literal>?::integer</literal>.  The query
+      followed by its type, as in <literal>?::integer</literal>, and types are
+      shown without their length or precision.  The query
       identifier, the settings shown by <literal>SETTINGS</literal>, and any
       output supplied by extensions or foreign data wrappers are left out.
       Names of objects in <literal>pg_catalog</literal> and

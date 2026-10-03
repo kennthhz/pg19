@@ -805,6 +805,9 @@ SELECT what,
        test_redact_deparse(qry, true)  AS redacted
   FROM (VALUES
     -- Negative controls: these must not change.
+    -- Except the typmod: (rev. typmod leak, post-T25) the core type name is
+    -- kept but "(10)" is dropped under redaction, because a typmod is a number
+    -- the user wrote and it reached the plan outside any Const.
     ('core type + typmod', 'SELECT c_second::varchar(10) FROM zsec_c'),
     ('core collation',     'SELECT c_second < (''x'' COLLATE "C") FROM zsec_c'),
     ('core array type',    'SELECT c_first = ANY (ARRAY[1,2]) FROM zsec_c'),
@@ -826,7 +829,7 @@ SELECT what,
 ---------------------+----------------------------------------------------------------------------+----------------------------------------------
  core array type     | (zsec_c.c_first = ANY ('{1,2}'::integer[]))                                | (t1.t1_c1 = ANY (?::integer[]))
  core collation      | (zsec_c.c_second < 'x'::text COLLATE "C")                                  | (t1.t1_c2 < ?::text COLLATE "C")
- core type + typmod  | (zsec_c.c_second)::character varying(10)                                   | (t1.t1_c2)::character varying(10)
+ core type + typmod  | (zsec_c.c_second)::character varying(10)                                   | (t1.t1_c2)::character varying
  same type twice     | ((zsec_c.c_enum2 = 'a'::zsec_enum2) OR (zsec_c.c_enum2 = 'b'::zsec_enum2)) | ((t1.t1_c6 = ?::ty1) OR (t1.t1_c6 = ?::ty1))
  user collation      | (zsec_c.c_second < 'x'::text COLLATE zsec_coll2)                           | (t1.t1_c2 < ?::text COLLATE coll1)
  user composite cast | ROW(zsec_c.c_first, zsec_c.c_second)::zsec_pair                            | ROW(t1.t1_c1, t1.t1_c2)::ty1

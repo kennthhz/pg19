@@ -2777,6 +2777,23 @@ SELECT count(*) > 0 AS serialize_alone_still_works
  WHERE l LIKE '%Serialize%';
 
 --
+-- FR-21, typmods (rev. typmod leak, post-T25): a length or precision written
+-- in a cast reaches the plan through the type label, not as a Const, so it
+-- printed under redaction until the adversarial probe found it.  The marker is
+-- a number, so zsec_leaks() cannot see it.  zsec_plan() turns digits into N, so
+-- the redacted line must show each type with no "(N" after it, while the same
+-- plan unredacted must show all three typmods.  The timestamp case is there
+-- because its typmod sits in the middle of the label.
+--
+SELECT l AS typmod_redacted
+  FROM zsec_plan($q$SELECT zsec_ssn::varchar(31337), zsec_bal::numeric(987,3), now()::timestamp(3) with time zone FROM zsec_customers$q$,
+                 'COSTS OFF, VERBOSE, REDACT') AS l
+ WHERE l LIKE '%Output:%';
+SELECT count(*) AS typmod_plain_prints_digits
+  FROM zsec_plan($q$SELECT zsec_ssn::varchar(31337), zsec_bal::numeric(987,3), now()::timestamp(3) with time zone FROM zsec_customers$q$,
+                 'COSTS OFF, VERBOSE') AS l
+ WHERE l LIKE '%character varying(N)%' AND l LIKE '%numeric(N,N)%' AND l LIKE '%timestamp(N) with time zone%';
+--
 -- FR-95/FR-96, interactive EXPLAIN: the table-function call is collapsed to its
 -- keyword.  Nothing above asserted the placeholder itself -- the sweep rows only
 -- show the markers absent -- so a guard that blanked the call, or dropped the

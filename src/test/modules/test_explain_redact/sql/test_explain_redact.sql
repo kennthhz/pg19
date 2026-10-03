@@ -579,6 +579,9 @@ SELECT what,
        test_redact_deparse(qry, true)  AS redacted
   FROM (VALUES
     -- Negative controls: these must not change.
+    -- Except the typmod: (rev. typmod leak, post-T25) the core type name is
+    -- kept but "(10)" is dropped under redaction, because a typmod is a number
+    -- the user wrote and it reached the plan outside any Const.
     ('core type + typmod', 'SELECT c_second::varchar(10) FROM zsec_c'),
     ('core collation',     'SELECT c_second < (''x'' COLLATE "C") FROM zsec_c'),
     ('core array type',    'SELECT c_first = ANY (ARRAY[1,2]) FROM zsec_c'),

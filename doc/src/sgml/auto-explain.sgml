@@ -594,8 +594,10 @@ LOG:  duration: 3.651 ms  plan:
     <para>
      Every constant, including <literal>NULL</literal>, <literal>true</literal>
      and <literal>false</literal>, is replaced by <literal>?</literal>
-     followed by its type, as in <literal>?::text</literal>.  Parameter
-     symbols such as <literal>$1</literal> are shown as they are.
+     followed by its type, as in <literal>?::text</literal>.  A type is shown
+     without its length or precision, so a cast to
+     <type>varchar(20)</type> appears as <literal>character varying</literal>.
+     Parameter symbols such as <literal>$1</literal> are shown as they are.
     </para>
    </listitem>
    <listitem>
@@ -774,7 +776,10 @@ LOG:  duration: 0.210 ms  ref: 3674e079c7cb48e4  plan:
    <listitem>
     <para>
      Estimated row counts and widths, which are derived from the statistics
-     collected about the data.
+     collected about the data.  Some estimates are computed from constants in
+     the query instead, and then reveal them: the estimate for
+     <literal>generate_series(1, 5000)</literal> is 5000 rows, and the
+     estimate for <literal>LIMIT 5000</literal> is at most 5000 rows.
     </para>
    </listitem>
    <listitem>
@@ -782,7 +787,9 @@ LOG:  duration: 0.210 ms  ref: 3674e079c7cb48e4  plan:
      With <varname>auto_explain.log_analyze</varname>, actual row counts and
      timings.  These can confirm a guess: a reader who suspects the value
      hidden behind <literal>(a1_c3 = ?::text)</literal> can learn from the
-     row counts whether matching rows exist.
+     row counts whether matching rows exist.  Like estimates, an actual row
+     count can equal a constant in the query, as for
+     <literal>generate_series(1, 5000)</literal>.
     </para>
    </listitem>
    <listitem>

@@ -12333,10 +12333,17 @@ get_coercion_expr(Node *arg, deparse_context *context,
  * it is PostgreSQL's name, and a reader who could not look it up would be no
  * better off.
  *
- * The typmod goes with the pseudonym: there is no "ty1(10)".  A pseudonym stands
- * for the type as an object, and a length or precision is a property of the
- * declaration rather than of the name.  Exempt types keep theirs, so
- * "character varying(10)" still prints in full.
+ * The typmod is never printed under redaction, for exempt types too: there is
+ * no "ty1(10)", and *(rev. typmod leak, post-T25)* no "character varying(10)"
+ * either -- it prints as "character varying".  A typmod is a number, and it is
+ * usually one the user wrote: varchar(31337) in a cast reaches the plan
+ * through the type label, not as a Const, so FR-21 never saw it.  Exempt types
+ * kept theirs until the adversarial probe found exactly that.  The label is
+ * dropped rather than written as "(?)" because format_type_extended() does not
+ * always put the typmod at the end -- "timestamp(3) with time zone",
+ * "interval day to second(3)" -- and the type with no typmod reads correctly in
+ * every case.  The loss: a length coercion, varchar(10) applied to varchar,
+ * now reads as a cast to the same type.
  *
  * One consequence worth knowing: an array of a user-defined type has its own OID
  * in the user's schema, so it redacts to a plain "ty1" and the reader loses the
@@ -12346,8 +12353,12 @@ get_coercion_expr(Node *arg, deparse_context *context,
 static char *
 redact_format_type(Oid typid, int32 typmod, struct RedactCtx *redact)
 {
-	if (redact != NULL && !explain_redact_exempt(redact, REDACT_TYPE, typid))
-		return pstrdup(explain_redact_name(redact, REDACT_TYPE, typid));
+	if (redact != NULL)
+	{
+		if (!explain_redact_exempt(redact, REDACT_TYPE, typid))
+			return pstrdup(explain_redact_name(redact, REDACT_TYPE, typid));
+		return format_type_with_typemod(typid, -1);
+	}
 
 	return format_type_with_typemod(typid, typmod);
 }
